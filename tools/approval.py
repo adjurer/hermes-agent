@@ -179,7 +179,7 @@ _CMDPOS = (
     r'(?:^|[;&|\n`]|\$\()'         # start position
     r'\s*'                          # optional whitespace
     r'(?:sudo\s+(?:-[^\s]+\s+)*)?'  # optional sudo with flags
-    r'(?:env\s+(?:\w+=\S*\s+)*)?'   # optional env with VAR=VAL pairs
+    r'(?:env\s+(?:(?:-[^\s]+\s+)|(?:\w+=\S*\s+))*)?'  # optional env flags/VAR=VAL pairs
     r'(?:(?:exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
     r'\s*'
 )
@@ -210,7 +210,7 @@ HARDLINE_PATTERNS = [
     # the currently running gateway agent mid-turn. They are intentionally
     # blocked even in yolo/approvals-off mode; use the platform /restart hook
     # or run lifecycle maintenance outside the agent instead.
-    (_CMDPOS + r'hermes\s+gateway\s+(start|stop|restart)\b', "hermes gateway lifecycle command (kills running agents)"),
+    (_CMDPOS + r'(?:[^\s;&|]*/)?hermes\s+gateway\s+(start|stop|restart)\b', "hermes gateway lifecycle command (kills running agents)"),
     (_CMDPOS + r'launchctl\s+.*\b(kickstart|stop|bootout|remove|unload)\b.*\bai\.hermes\.gateway\b', "launchctl hermes gateway lifecycle command (kills running agents)"),
 ]
 

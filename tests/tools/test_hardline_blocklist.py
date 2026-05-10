@@ -91,6 +91,8 @@ _HARDLINE_BLOCK = [
     "hermes gateway start",
     "hermes gateway stop",
     "hermes gateway restart",
+    "/Users/tbd/.local/bin/hermes gateway restart",
+    "env -i HOME=/Users/tbd PATH=/Users/tbd/.local/bin:/usr/bin /Users/tbd/.local/bin/hermes gateway restart",
     "launchctl kickstart -k gui/501/ai.hermes.gateway",
     "launchctl stop gui/501/ai.hermes.gateway",
     "launchctl bootout gui/501/ai.hermes.gateway",

@@ -2405,6 +2405,11 @@ def _get_restart_drain_timeout() -> float:
     return parse_restart_drain_timeout(raw)
 
 
+def _get_launchd_exit_timeout() -> int:
+    """Return launchd's graceful-exit budget for gateway shutdowns."""
+    return max(120, int(_get_restart_drain_timeout()) + 30)
+
+
 def systemd_install(force: bool = False, system: bool = False, run_as_user: str | None = None):
     if system:
         _require_root_for_system_service("install")
@@ -2747,6 +2752,7 @@ def generate_launchd_plist() -> str:
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
+    exit_timeout = _get_launchd_exit_timeout()
     profile_arg = _profile_arg(hermes_home)
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
@@ -2815,6 +2821,12 @@ def generate_launchd_plist() -> str:
     
     <key>KeepAlive</key>
     <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>{exit_timeout}</integer>
     
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
@@ -2940,7 +2952,8 @@ def launchd_stop():
             pass  # Already unloaded — nothing to stop.
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    timeout = float(_get_launchd_exit_timeout())
+    _wait_for_gateway_exit(timeout=timeout, force_after=timeout)
     print("✓ Service stopped")
 
 def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.0) -> bool:

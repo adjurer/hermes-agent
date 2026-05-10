@@ -658,7 +658,27 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_stop()
 
         assert len(wait_called) == 1
-        assert wait_called[0] == {"timeout": 10.0, "force_after": 5.0}
+        assert wait_called[0]["timeout"] >= 120.0
+        assert wait_called[0]["force_after"] == wait_called[0]["timeout"]
+
+    def test_launchd_stop_uses_configured_grace_budget(self, monkeypatch):
+        wait_called = []
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 180.0)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda **kwargs: wait_called.append(kwargs),
+        )
+
+        gateway_cli.launchd_stop()
+
+        assert wait_called == [{"timeout": 210.0, "force_after": 210.0}]
 
     def test_launchd_status_reports_local_stale_plist_when_unloaded(self, tmp_path, monkeypatch, capsys):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
@@ -1648,6 +1668,17 @@ class TestProfileArg:
         plist = gateway_cli.generate_launchd_plist()
         assert "<string>--profile</string>" in plist
         assert "<string>mybot</string>" in plist
+
+    def test_launchd_plist_includes_restart_damping_and_exit_timeout(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 90.0)
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>ThrottleInterval</key>" in plist
+        assert "<integer>30</integer>" in plist
+        assert "<key>ExitTimeOut</key>" in plist
+        assert "<integer>120</integer>" in plist
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
