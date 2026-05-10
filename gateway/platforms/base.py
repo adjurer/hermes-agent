@@ -109,6 +109,28 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
     return True
 
 
+def filter_existing_media_files(items, platform_name: str = "Platform"):
+    """Return only real MEDIA files, skipping placeholders and stale paths."""
+    valid = []
+    for media_path, is_voice in items:
+        path_text = str(media_path).strip()
+        expanded = os.path.expanduser(path_text)
+        looks_placeholder = (
+            path_text.startswith(("/path/", "/path/to/"))
+            or "/..." in path_text
+            or "<" in path_text
+            or ">" in path_text
+        )
+        if looks_placeholder:
+            logger.info("[%s] Skipping placeholder MEDIA path: %s", platform_name, path_text)
+            continue
+        if not os.path.isfile(expanded):
+            logger.info("[%s] Skipping missing MEDIA file: %s", platform_name, path_text)
+            continue
+        valid.append((expanded, is_voice))
+    return valid
+
+
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
 
@@ -3015,7 +3037,7 @@ class BasePlatformAdapter(ABC):
                 from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
-                for media_path, is_voice in media_files:
+                for media_path, is_voice in filter_existing_media_files(media_files, self.name):
                     _ext = Path(media_path).suffix.lower()
                     if (_ext in _IMAGE_EXTS
                             and not is_voice

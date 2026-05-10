@@ -206,6 +206,12 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Gateway lifecycle protection: terminal-launched lifecycle commands kill
+    # the currently running gateway agent mid-turn. They are intentionally
+    # blocked even in yolo/approvals-off mode; use the platform /restart hook
+    # or run lifecycle maintenance outside the agent instead.
+    (_CMDPOS + r'hermes\s+gateway\s+(start|stop|restart)\b', "hermes gateway lifecycle command (kills running agents)"),
+    (_CMDPOS + r'launchctl\s+.*\b(kickstart|stop|bootout|remove|unload)\b.*\bai\.hermes\.gateway\b', "launchctl hermes gateway lifecycle command (kills running agents)"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module

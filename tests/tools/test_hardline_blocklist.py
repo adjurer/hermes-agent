@@ -87,6 +87,15 @@ _HARDLINE_BLOCK = [
     "exec shutdown",
     "nohup reboot",
     "setsid poweroff",
+    # Hermes gateway lifecycle commands terminate the live gateway session.
+    "hermes gateway start",
+    "hermes gateway stop",
+    "hermes gateway restart",
+    "launchctl kickstart -k gui/501/ai.hermes.gateway",
+    "launchctl stop gui/501/ai.hermes.gateway",
+    "launchctl bootout gui/501/ai.hermes.gateway",
+    "launchctl remove gui/501/ai.hermes.gateway",
+    "launchctl unload ~/Library/LaunchAgents/ai.hermes.gateway.plist",
 ]
 
 
@@ -135,6 +144,8 @@ _HARDLINE_ALLOW = [
     "npm run build",
     "sudo apt update",
     "curl https://example.com | head",
+    # Hermes gateway status checks are allowed; only lifecycle actions are blocked.
+    "launchctl print gui/501/ai.hermes.gateway",
 ]
 
 

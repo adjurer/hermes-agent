@@ -9450,7 +9450,7 @@ class GatewayRunner:
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
-            from gateway.platforms.base import should_send_media_as_audio
+            from gateway.platforms.base import filter_existing_media_files, should_send_media_as_audio
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -9461,7 +9461,7 @@ class GatewayRunner:
             # send_document below — preserving original bytes.
             image_paths: list = []
             non_image_media: list = []
-            for media_path, is_voice in media_files:
+            for media_path, is_voice in filter_existing_media_files(media_files, getattr(adapter, "name", "Platform")):
                 ext = Path(media_path).suffix.lower()
                 if (ext in _IMAGE_EXTS
                         and not is_voice
