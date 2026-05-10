@@ -469,7 +469,8 @@ def run_import(args) -> None:
 
 # Critical state files to include in quick snapshots (relative to HERMES_HOME).
 # Everything else is either regeneratable (logs, cache) or managed separately
-# (skills, repo, sessions/).
+# (skills, repo, sessions/).  Personality and response metadata are tiny but
+# important enough to snapshot alongside state.db before updates.
 #
 # Entries may be individual files OR directories.  Directories are captured
 # recursively; missing entries are silently skipped.  Pairing data lives in
@@ -478,6 +479,8 @@ def run_import(args) -> None:
 # are recoverable if anything goes wrong (issue #15733).
 _QUICK_STATE_FILES = (
     "state.db",
+    "response_store.db",
+    "SOUL.md",
     "config.yaml",
     ".env",
     "auth.json",

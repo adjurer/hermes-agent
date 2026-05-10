@@ -7099,11 +7099,15 @@ def _run_pre_update_backup(args) -> None:
     by default because the zip can add minutes to every update on large
     HERMES_HOME directories.  The ``--backup`` flag on ``hermes update``
     opts in for a single run; ``--no-backup`` forces it off when config
-    has it enabled.  Never raises — a backup failure should not block the
-    update itself.
+    has it enabled.  By default this is best-effort for interactive users; in
+    automation, ``--require-backup`` makes any backup failure stop the update.
     """
+    require_backup = bool(getattr(args, "require_backup", False))
     # CLI flags win over config.  --no-backup beats --backup if both are set.
     if getattr(args, "no_backup", False):
+        if require_backup:
+            print("✗ Pre-update backup is required but --no-backup was specified.")
+            raise SystemExit(1)
         print("◆ Pre-update backup: skipped (--no-backup)")
         print()
         return
@@ -7133,10 +7137,11 @@ def _run_pre_update_backup(args) -> None:
     try:
         from hermes_cli.backup import create_pre_update_backup
     except Exception as exc:
-        print(
-            f"⚠ Pre-update backup: could not load backup module ({exc}); continuing update."
-        )
+        suffix = "stopping update." if require_backup else "continuing update."
+        print(f"⚠ Pre-update backup: could not load backup module ({exc}); {suffix}")
         print()
+        if require_backup:
+            raise SystemExit(1)
         return
 
     print("◆ Creating pre-update backup...")
@@ -7145,6 +7150,10 @@ def _run_pre_update_backup(args) -> None:
         out_path = create_pre_update_backup(keep=int(keep))
     except Exception as exc:  # defensive — helper already swallows, but just in case
         print(f"  ⚠ Backup failed: {exc}")
+        if require_backup:
+            print("  Update stopped because --require-backup is set.")
+            print()
+            raise SystemExit(1)
         print("  Continuing with update.")
         print()
         return
@@ -7152,6 +7161,11 @@ def _run_pre_update_backup(args) -> None:
     elapsed = _time.monotonic() - t0
 
     if out_path is None:
+        if require_backup:
+            print("  ✗ Backup skipped (no files found or write failed).")
+            print("  Update stopped because --require-backup is set.")
+            print()
+            raise SystemExit(1)
         print("  ⚠ Backup skipped (no files found or write failed); continuing update.")
         print()
         return
@@ -11226,6 +11240,12 @@ Examples:
         action="store_true",
         default=False,
         help="Force a pre-update backup for this run (off by default; overrides updates.pre_update_backup)",
+    )
+    update_parser.add_argument(
+        "--require-backup",
+        action="store_true",
+        default=False,
+        help="Abort the update if the pre-update backup cannot be created (for automation).",
     )
     update_parser.add_argument(
         "--yes",
