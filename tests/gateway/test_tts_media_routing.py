@@ -56,6 +56,26 @@ def _media_file(tmp_path, name: str) -> str:
     return str(path)
 
 
+class _RunnerStub:
+    def _thread_metadata_for_source(self, source, reply_to_message_id=None):
+        return GatewayRunner._thread_metadata_for_source(
+            self,
+            source,
+            reply_to_message_id,
+        )
+
+    def _reply_anchor_for_event(self, event):
+        return GatewayRunner._reply_anchor_for_event(event)
+
+
+def _thread_metadata():
+    return {
+        "thread_id": "topic-1",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "msg-1",
+    }
+
+
 @pytest.mark.asyncio
 async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tmp_path):
     adapter = _MediaRoutingAdapter()
@@ -131,7 +151,7 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
     )
 
     await GatewayRunner._deliver_media_from_response(
-        object(),
+        _RunnerStub(),
         f"MEDIA:{media_path}",
         event,
         adapter,
@@ -140,7 +160,7 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
         file_path=media_path,
-        metadata={"thread_id": "topic-1"},
+        metadata=_thread_metadata(),
     )
     adapter.send_voice.assert_not_awaited()
 
@@ -161,7 +181,7 @@ async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_doc
     )
 
     await GatewayRunner._deliver_media_from_response(
-        object(),
+        _RunnerStub(),
         f"MEDIA:{media_path}",
         event,
         adapter,
@@ -170,7 +190,7 @@ async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_doc
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
         file_path=media_path,
-        metadata={"thread_id": "topic-1"},
+        metadata=_thread_metadata(),
     )
     adapter.send_voice.assert_not_awaited()
 
@@ -193,7 +213,7 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
     )
 
     await GatewayRunner._deliver_media_from_response(
-        object(),
+        _RunnerStub(),
         f"MEDIA:{media_path}",
         event,
         adapter,
@@ -202,6 +222,6 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=media_path,
-        metadata={"thread_id": "topic-1"},
+        metadata=_thread_metadata(),
     )
     adapter.send_document.assert_not_awaited()
