@@ -20,6 +20,28 @@ class TestGatewayPidState:
         assert isinstance(payload["argv"], list)
         assert payload["argv"]
 
+    def test_process_start_time_uses_macos_ps_fallback(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(status.Path, "read_text", lambda self, **kw: (_ for _ in ()).throw(FileNotFoundError()))
+        monkeypatch.setattr(
+            status.subprocess,
+            "check_output",
+            lambda *a, **kw: "Sun May 10 10:20:30 2026\n",
+        )
+
+        assert status.get_process_start_time(123) is not None
+
+    def test_process_cmdline_uses_macos_ps_fallback(self, monkeypatch):
+        monkeypatch.setattr(status.sys, "platform", "darwin")
+        monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError()))
+        monkeypatch.setattr(
+            status.subprocess,
+            "check_output",
+            lambda *a, **kw: "python -m hermes_cli.main gateway run\n",
+        )
+
+        assert status._read_process_cmdline(123) == "python -m hermes_cli.main gateway run"
+
     def test_write_pid_file_is_atomic_against_concurrent_writers(self, tmp_path, monkeypatch):
         """Regression: two concurrent --replace invocations must not both win.
 

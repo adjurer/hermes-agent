@@ -324,6 +324,8 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
         if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "origin/main..HEAD", "--count"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
         if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]"]:
@@ -373,6 +375,8 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
         if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "origin/main..HEAD", "--count"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
         if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -441,6 +445,7 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
+    local_commit_count="0",
     ff_only_fails=False,
     reset_fails=False,
     fetch_fails=False,
@@ -461,6 +466,8 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
+            if "origin/main..HEAD" in joined:
+                return SimpleNamespace(stdout=f"{local_commit_count}\n", stderr="", returncode=0)
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "--ff-only" in joined:
             if ff_only_fails:
@@ -495,6 +502,29 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
+
+
+def test_cmd_update_blocks_when_local_commits_exist(monkeypatch, tmp_path, capsys):
+    """Local commits must not be reset away when upstream commits are pending."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(
+        commit_count="3",
+        local_commit_count="1",
+        ff_only_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
+    assert len(reset_calls) == 0
+
+    out = capsys.readouterr().out
+    assert "Update blocked" in out
+    assert "Refusing to reset or overwrite local Hermes hardening" in out
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
