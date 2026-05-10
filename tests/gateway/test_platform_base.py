@@ -10,6 +10,7 @@ from gateway.platforms.base import (
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
+    filter_existing_media_files,
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
@@ -328,6 +329,23 @@ class TestExtractMedia:
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
+
+
+class TestFilterExistingMediaFiles:
+    def test_keeps_real_file_and_skips_missing_or_placeholder(self, tmp_path):
+        real = tmp_path / "speech.ogg"
+        real.write_bytes(b"audio")
+
+        filtered = filter_existing_media_files(
+            [
+                (str(real), True),
+                ("/path/to/file.xlsx", False),
+                ("/tmp/missing-file.ogg", False),
+            ],
+            "Test",
+        )
+
+        assert filtered == [(str(real), True)]
 
 
 # ---------------------------------------------------------------------------
@@ -676,4 +694,3 @@ class TestProxyKwargsForAiohttp:
             sess_kw, req_kw = proxy_kwargs_for_aiohttp("http://proxy:8080")
             assert sess_kw == {}
             assert req_kw == {"proxy": "http://proxy:8080"}
-

@@ -408,8 +408,10 @@ def write_runtime_status(
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     payload.setdefault("platforms", {})
-    payload.setdefault("kind", _GATEWAY_KIND)
+    current_record = _build_pid_record()
+    payload["kind"] = _GATEWAY_KIND
     payload["pid"] = os.getpid()
+    payload["argv"] = current_record.get("argv", [])
     payload["start_time"] = _get_process_start_time(os.getpid())
     payload["updated_at"] = _utc_now_iso()
 
