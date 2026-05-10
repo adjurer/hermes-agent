@@ -115,7 +115,24 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
         return int(stat_path.read_text().split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
-        return None
+        pass
+
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.check_output(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            if not output:
+                return None
+            started = datetime.strptime(output, "%a %b %d %H:%M:%S %Y")
+            return int(started.timestamp())
+        except (subprocess.SubprocessError, ValueError, OSError):
+            return None
+
+    return None
 
 
 def get_process_start_time(pid: int) -> Optional[int]:
@@ -129,11 +146,24 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     try:
         raw = cmdline_path.read_bytes()
     except (FileNotFoundError, PermissionError, OSError):
-        return None
+        raw = b""
 
-    if not raw:
-        return None
-    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    if raw:
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.check_output(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            ).strip()
+            return output or None
+        except (subprocess.SubprocessError, OSError):
+            return None
+
+    return None
 
 
 def _looks_like_gateway_process(pid: int) -> bool:
