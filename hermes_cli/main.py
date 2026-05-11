@@ -124,7 +124,7 @@ def _apply_profile_override() -> None:
 
     # 1. Check for explicit -p / --profile flag
     for i, arg in enumerate(argv):
-        if arg in ("--profile", "-p") and i + 1 < len(argv):
+        if arg in {"--profile", "-p"} and i + 1 < len(argv):
             profile_name = argv[i + 1]
             consume = 2
             break
@@ -192,7 +192,7 @@ def _apply_profile_override() -> None:
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0:
             for i, arg in enumerate(argv):
-                if arg in ("--profile", "-p"):
+                if arg in {"--profile", "-p"}:
                     start = i + 1  # +1 because argv is sys.argv[1:]
                     sys.argv = sys.argv[:start] + sys.argv[start + consume :]
                     break
@@ -505,8 +505,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
 
                 # Compute visible area
                 visible_rows = max_y - 4  # header + col header + blank + footer
-                if visible_rows < 1:
-                    visible_rows = 1
+                visible_rows = max(visible_rows, 1)
 
                 # Clamp cursor and scroll
                 if not filtered:
@@ -518,8 +517,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                 else:
                     if cursor >= len(filtered):
                         cursor = len(filtered) - 1
-                    if cursor < 0:
-                        cursor = 0
+                    cursor = max(cursor, 0)
                     if cursor < scroll_offset:
                         scroll_offset = cursor
                     elif cursor >= scroll_offset + visible_rows:
@@ -569,13 +567,13 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                 stdscr.refresh()
                 key = stdscr.getch()
 
-                if key in (curses.KEY_UP,):
+                if key in {curses.KEY_UP,}:
                     if filtered:
                         cursor = (cursor - 1) % len(filtered)
-                elif key in (curses.KEY_DOWN,):
+                elif key in {curses.KEY_DOWN,}:
                     if filtered:
                         cursor = (cursor + 1) % len(filtered)
-                elif key in (curses.KEY_ENTER, 10, 13):
+                elif key in {curses.KEY_ENTER, 10, 13}:
                     if filtered:
                         result_holder[0] = filtered[cursor]["id"]
                     return
@@ -589,7 +587,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                     else:
                         # Second Esc exits
                         return
-                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                elif key in {curses.KEY_BACKSPACE, 127, 8}:
                     if search_text:
                         search_text = search_text[:-1]
                         if search_text:
@@ -628,7 +626,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
     while True:
         try:
             val = input(f"\n  Select [1-{len(sessions)}]: ").strip()
-            if not val or val.lower() in ("q", "quit", "exit"):
+            if not val or val.lower() in {"q", "quit", "exit"}:
                 return None
             idx = int(val) - 1
             if 0 <= idx < len(sessions):
@@ -1305,7 +1303,7 @@ def _launch_tui(
         except KeyboardInterrupt:
             code = 130
 
-        if code in (0, 130):
+        if code in {0, 130}:
             _print_tui_exit_summary(resume_session_id, active_session_file)
     finally:
         try:
@@ -1405,7 +1403,7 @@ def cmd_chat(args):
             reply = input("Run setup now? [Y/n] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             reply = "n"
-        if reply in ("", "y", "yes"):
+        if reply in {"", "y", "yes"}:
             cmd_setup(args)
             return
         print()
@@ -1585,7 +1583,7 @@ def cmd_whatsapp(args):
             response = input("\n  Update allowed users? [y/N] ").strip()
         except (EOFError, KeyboardInterrupt):
             response = "n"
-        if response.lower() in ("y", "yes"):
+        if response.lower() in {"y", "yes"}:
             if wa_mode == "bot":
                 phone = input(
                     "  Phone numbers that can message the bot (comma-separated): "
@@ -1660,7 +1658,7 @@ def cmd_whatsapp(args):
             ).strip()
         except (EOFError, KeyboardInterrupt):
             response = "n"
-        if response.lower() in ("y", "yes"):
+        if response.lower() in {"y", "yes"}:
             shutil.rmtree(session_dir, ignore_errors=True)
             session_dir.mkdir(parents=True, exist_ok=True)
             print("  ✓ Session cleared")
@@ -2014,7 +2012,7 @@ def select_provider_and_model(args=None):
         _model_flow_bedrock(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
-    elif selected_provider in (
+    elif selected_provider in {
         "gemini",
         "deepseek",
         "xai",
@@ -2034,18 +2032,18 @@ def select_provider_and_model(args=None):
         "ollama-cloud",
         "tencent-tokenhub",
         "lmstudio",
-    ) or _is_profile_api_key_provider(selected_provider):
+    } or _is_profile_api_key_provider(selected_provider):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
     # ── Post-switch cleanup: clear stale OPENAI_BASE_URL ──────────────
     # When the user switches to a named provider (anything except "custom"),
     # a leftover OPENAI_BASE_URL in ~/.hermes/.env can poison auxiliary
     # clients that use provider:auto. Clear it proactively.  (#5161)
-    if selected_provider not in (
+    if selected_provider not in {
         "custom",
         "cancel",
         "remove-custom",
-    ) and not selected_provider.startswith("custom:"):
+    } and not selected_provider.startswith("custom:"):
         _clear_stale_openai_base_url()
 
 
@@ -2171,7 +2169,7 @@ def _reset_aux_to_auto() -> int:
             entry = {}
             aux[task] = entry
         changed = False
-        if entry.get("provider") not in (None, "", "auto"):
+        if entry.get("provider") not in {None, "", "auto"}:
             entry["provider"] = "auto"
             changed = True
         for field in ("model", "base_url", "api_key"):
@@ -3082,7 +3080,7 @@ def _model_flow_custom(config):
             _add_v1 = input("  Add /v1? [Y/n]: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             _add_v1 = "n"
-        if _add_v1 in ("", "y", "yes"):
+        if _add_v1 in {"", "y", "yes"}:
             effective_url = effective_url.rstrip("/") + "/v1"
             if base_url:
                 base_url = effective_url
@@ -3126,7 +3124,7 @@ def _model_flow_custom(config):
         if len(detected_models) == 1:
             print(f"  Detected model: {detected_models[0]}")
             confirm = input("  Use this model? [Y/n]: ").strip().lower()
-            if confirm in ("", "y", "yes"):
+            if confirm in {"", "y", "yes"}:
                 model_name = detected_models[0]
             else:
                 model_name = input("Model name (e.g. gpt-4, llama-3-70b): ").strip()
@@ -3959,7 +3957,7 @@ def _model_flow_copilot(config, current_model=""):
         api_key = creds.get("api_key", "")
         source = creds.get("source", "")
     else:
-        if source in ("GITHUB_TOKEN", "GH_TOKEN"):
+        if source in {"GITHUB_TOKEN", "GH_TOKEN"}:
             print(f"  GitHub token: {api_key[:8]}... ✓ ({source})")
         elif source == "gh auth token":
             print("  GitHub token: ✓ (from `gh auth token`)")
@@ -5279,7 +5277,7 @@ def cmd_slack(args):
                  command registered as a first-class slash.
     """
     sub = getattr(args, "slack_command", None)
-    if sub in (None, ""):
+    if sub in {None, ""}:
         # No subcommand — print usage hint.
         print(
             "usage: hermes slack <subcommand>\n"
@@ -5426,7 +5424,7 @@ def _clear_bytecode_cache(root: Path) -> int:
         dirnames[:] = [
             d
             for d in dirnames
-            if d not in ("venv", ".venv", "node_modules", ".git", ".worktrees")
+            if d not in {"venv", ".venv", "node_modules", ".git", ".worktrees"}
         ]
         if os.path.basename(dirpath) == "__pycache__":
             try:
@@ -5549,6 +5547,8 @@ def _run_npm_install_deterministic(
             cwd=cwd,
             capture_output=capture_output,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if ci_result.returncode == 0:
@@ -5561,6 +5561,8 @@ def _run_npm_install_deterministic(
         cwd=cwd,
         capture_output=capture_output,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -5597,12 +5599,50 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         if fatal:
             print("  Run manually:  cd web && npm install && npm run build")
         return False
-    r2 = subprocess.run([npm, "run", "build"], cwd=web_dir, capture_output=True)
+    # First attempt
+    r2 = subprocess.run(
+        [npm, "run", "build"],
+        cwd=web_dir,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if r2.returncode != 0:
+        # Retry once after a short delay — covers boot-time races on Windows
+        # (antivirus scanning Node.js binaries, npm cache not ready, transient
+        # I/O when launched via Scheduled Task at logon). See issue #23817.
+        _time.sleep(3)
+        r2 = subprocess.run(
+            [npm, "run", "build"],
+            cwd=web_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+    if r2.returncode != 0:
+        stderr_preview = (r2.stderr or "").strip()
+        stderr_tail = "\n  ".join(stderr_preview.splitlines()[-10:]) if stderr_preview else ""
+        dist_dir = web_dir.parent / "hermes_cli" / "web_dist"
+        dist_index = dist_dir / "index.html"
+
+        # If a stale dist exists, serve it as a fallback instead of failing.
+        # A stale UI is far better than no UI for non-interactive callers
+        # (Windows Scheduled Tasks, CI) — issue #23817.
+        if dist_index.exists():
+            print("  ⚠ Web UI build failed — serving stale dist as fallback")
+            if stderr_tail:
+                print(f"  Build error:\n  {stderr_tail}")
+            return True
+
         print(
             f"  {'✗' if fatal else '⚠'} Web UI build failed"
             + ("" if fatal else " (hermes web will not be available)")
         )
+        if stderr_tail:
+            print(f"  Build error:\n  {stderr_tail}")
         if fatal:
             print("  Run manually:  cd web && npm install && npm run build")
         return False
@@ -5921,8 +5961,8 @@ def _kill_stale_dashboard_processes(
 
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")
-    for pid, reason in failed:
-        print(f"    ✗ failed to stop PID {pid}: {reason}")
+    for pid, err_msg in failed:
+        print(f"    ✗ failed to stop PID {pid}: {err_msg}")
 
     if killed:
         print("  Restart the dashboard when you're ready:")
@@ -6179,7 +6219,7 @@ def _restore_stashed_changes(
             response = input_fn("Restore local changes now? [Y/n]", "y")
         else:
             response = input().strip().lower()
-        if response not in ("", "y", "yes"):
+        if response not in {"", "y", "yes"}:
             print("Skipped restoring local changes.")
             print("Your changes are still preserved in git stash.")
             print(f"Restore manually with: git stash apply {stash_ref}")
@@ -6422,7 +6462,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             print()
             response = "n"
 
-        if response in ("", "y", "yes"):
+        if response in {"", "y", "yes"}:
             print("→ Adding upstream remote...")
             if _add_upstream_remote(git_cmd, cwd):
                 print(
@@ -7495,7 +7535,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
-            if current_branch not in ("main", "HEAD"):
+            if current_branch not in {"main", "HEAD"}:
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
                     cwd=PROJECT_ROOT,
@@ -7814,7 +7854,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 except EOFError:
                     response = "n"
 
-            if response in ("", "y", "yes", "auto"):
+            if response in {"", "y", "yes", "auto"}:
                 print()
                 # Gateway mode, --yes, and non-interactive update contexts
                 # (dashboard / web server actions) cannot prompt for API keys.
@@ -8875,7 +8915,7 @@ def cmd_profile(args):
                         answer = input("\nProceed with install? [y/N] ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
                         answer = ""
-                    if answer not in ("y", "yes"):
+                    if answer not in {"y", "yes"}:
                         print("Install cancelled.")
                         return
 
@@ -8934,7 +8974,7 @@ def cmd_profile(args):
                     answer = input("\nProceed? [y/N] ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     answer = ""
-                if answer not in ("y", "yes"):
+                if answer not in {"y", "yes"}:
                     print("Update cancelled.")
                     return
 
@@ -9124,9 +9164,24 @@ def cmd_dashboard(args):
         print(f"Import error: {e}")
         sys.exit(1)
 
-    if "HERMES_WEB_DIST" not in os.environ:
+    if "HERMES_WEB_DIST" not in os.environ and not getattr(args, "skip_build", False):
         if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
+    elif getattr(args, "skip_build", False):
+        # --skip-build trusts the caller to have pre-built the web UI.
+        # Verify the dist actually exists; otherwise the server will start
+        # and serve 404s with no obvious cause (issue #23817).
+        _dist_root = (
+            Path(os.environ["HERMES_WEB_DIST"])
+            if "HERMES_WEB_DIST" in os.environ
+            else PROJECT_ROOT / "hermes_cli" / "web_dist"
+        )
+        if not (_dist_root / "index.html").exists():
+            print(f"✗ --skip-build was passed but no web dist found at: {_dist_root}")
+            print("  Pre-build first:  cd web && npm install && npm run build")
+            print("  Or drop --skip-build to build automatically.")
+            sys.exit(1)
+        print(f"→ Skipping web UI build (--skip-build); using dist at {_dist_root}")
 
     from hermes_cli.web_server import start_server
 
@@ -10707,9 +10762,9 @@ Examples:
             mem_dir = get_hermes_home() / "memories"
             target = getattr(args, "target", "all")
             files_to_reset = []
-            if target in ("all", "memory"):
+            if target in {"all", "memory"}:
                 files_to_reset.append(("MEMORY.md", "agent notes"))
-            if target in ("all", "user"):
+            if target in {"all", "user"}:
                 files_to_reset.append(("USER.md", "user profile"))
 
             # Check what exists
@@ -10820,7 +10875,7 @@ Examples:
 
     def cmd_tools(args):
         action = getattr(args, "tools_action", None)
-        if action in ("list", "disable", "enable"):
+        if action in {"list", "disable", "enable"}:
             from hermes_cli.tools_config import tools_disable_enable_command
 
             tools_disable_enable_command(args)
@@ -11029,7 +11084,7 @@ Examples:
     def _confirm_prompt(prompt: str) -> bool:
         """Prompt for y/N confirmation, safe against non-TTY environments."""
         try:
-            return input(prompt).strip().lower() in ("y", "yes")
+            return input(prompt).strip().lower() in {"y", "yes"}
         except (EOFError, KeyboardInterrupt):
             return False
 
@@ -11607,6 +11662,15 @@ Examples:
         help=(
             "Expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket). "
             "Alternatively set HERMES_DASHBOARD_TUI=1."
+        ),
+    )
+    dashboard_parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help=(
+            "Skip the web UI build step and serve the existing dist directly. "
+            "Useful for non-interactive contexts (Windows Scheduled Tasks, CI) "
+            "where npm may not be available. Pre-build with: cd web && npm run build"
         ),
     )
     # Lifecycle flags — mutually exclusive with each other and with the

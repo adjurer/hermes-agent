@@ -582,7 +582,7 @@ def _looks_like_image(data: bytes) -> bool:
         return True
     if data[:3] == b"\xff\xd8\xff":
         return True
-    if data[:6] in (b"GIF87a", b"GIF89a"):
+    if data[:6] in {b"GIF87a", b"GIF89a"}:
         return True
     if data[:2] == b"BM":
         return True
@@ -881,7 +881,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     # Sanitize: strip directory components, null bytes, and control characters
     safe_name = Path(filename).name if filename else "document"
     safe_name = safe_name.replace("\x00", "").strip()
-    if not safe_name or safe_name in (".", ".."):
+    if not safe_name or safe_name in {".", ".."}:
         safe_name = "document"
     cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
     filepath = cache_dir / cached_name
@@ -2815,7 +2815,7 @@ class BasePlatformAdapter(ABC):
                 # and preserve ordering of queued follow-ups.  Route those
                 # through the dedicated handoff path that serializes
                 # cancellation + runner response + pending drain.
-                if cmd in ("stop", "new", "reset"):
+                if cmd in {"stop", "new", "reset"}:
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
                     except Exception as e:
