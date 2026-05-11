@@ -861,6 +861,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     chat_id       TEXT NOT NULL,
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
+    notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1084,6 +1085,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_events_run "
             "ON task_events(run_id, id)"
         )
+
+    notify_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone() is not None
+    if notify_table_exists:
+        notify_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+        }
+        if "notifier_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -1997,16 +2010,69 @@ def release_stale_claims(
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
-    Returns the number of stale claims reclaimed.  Safe to call often.
+    A stale-by-TTL claim whose host-local worker PID is still alive is
+    *extended* (with a ``claim_extended`` event) instead of being
+    reclaimed. Reclaiming a live worker mid-flight produces the spawn-
+    then-immediately-reclaim loop seen on slow models that spend longer
+    than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM
+    call (#23025): no tool calls means no ``kanban_heartbeat``, even
+    though the subprocess is healthy. ``enforce_max_runtime`` and
+    ``detect_crashed_workers`` remain the upper bounds for genuinely
+    wedged or dead workers.
+
+    Returns the number of stale claims actually reclaimed (live-pid
+    extensions don't count). Safe to call often.
     """
     now = int(time.time())
     reclaimed = 0
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL AND claim_expires < ?",
+        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "FROM tasks "
+        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "  AND claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
+        lock = row["claim_lock"] or ""
+        host_local = lock.startswith(host_prefix)
+        if host_local and row["worker_pid"] and _pid_alive(row["worker_pid"]):
+            new_expires = now + int(DEFAULT_CLAIM_TTL_SECONDS)
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET claim_expires = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND claim_lock IS ? "
+                    "  AND claim_expires IS NOT NULL "
+                    "  AND claim_expires < ?",
+                    (new_expires, row["id"], row["claim_lock"], now),
+                )
+                if cur.rowcount != 1:
+                    continue
+                run_id = _current_run_id(conn, row["id"])
+                if run_id is not None:
+                    conn.execute(
+                        "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                        (new_expires, run_id),
+                    )
+                _append_event(
+                    conn, row["id"], "claim_extended",
+                    {
+                        "reason": "pid_alive",
+                        "worker_pid": int(row["worker_pid"]),
+                        "claim_lock": row["claim_lock"],
+                        "claim_expires_was": int(row["claim_expires"]),
+                        "claim_expires_now": new_expires,
+                        "last_heartbeat_at": (
+                            int(row["last_heartbeat_at"])
+                            if row["last_heartbeat_at"] is not None
+                            else None
+                        ),
+                    },
+                    run_id=run_id,
+                )
+            continue
+
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
         )
@@ -2026,7 +2092,20 @@ def release_stale_claims(
                 error=f"stale_lock={row['claim_lock']}",
                 metadata=termination,
             )
-            payload = {"stale_lock": row["claim_lock"]}
+            payload = {
+                "stale_lock": row["claim_lock"],
+                "worker_pid": (
+                    int(row["worker_pid"])
+                    if row["worker_pid"] is not None else None
+                ),
+                "claim_expires": int(row["claim_expires"]),
+                "last_heartbeat_at": (
+                    int(row["last_heartbeat_at"])
+                    if row["last_heartbeat_at"] is not None else None
+                ),
+                "now": now,
+                "host_local": host_local,
+            }
             payload.update(termination)
             _append_event(
                 conn, row["id"], "reclaimed",
@@ -4275,6 +4354,7 @@ def add_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
@@ -4283,10 +4363,10 @@ def add_notify_sub(
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, now),
+            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
         )
 
 
@@ -4368,6 +4448,57 @@ def unseen_events_for_sub(
     return max_id, out
 
 
+def claim_unseen_events_for_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen notification events for one subscription.
+
+    Returns ``(old_cursor, new_cursor, events)``. When events are returned,
+    ``kanban_notify_subs.last_event_id`` has already been advanced to
+    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
+    notifier's read/claim step single-owner across multiple gateway watcher
+    processes pointed at the same board DB: concurrent watchers serialize on
+    SQLite's writer lock, and only the first process sees and claims a given
+    event range.
+
+    Callers should send the claimed events, then either leave the cursor at
+    ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
+    failed before any terminal unsubscribe removed the row.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        new_cursor, events = unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            kinds=kinds,
+        )
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+        )
+        return old_cursor, new_cursor, events
+
+
 def advance_notify_cursor(
     conn: sqlite3.Connection,
     *,
@@ -4383,6 +4514,35 @@ def advance_notify_cursor(
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
+
+
+def rewind_notify_cursor(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    claimed_cursor: int,
+    old_cursor: int,
+) -> bool:
+    """Undo a notification claim when delivery fails.
+
+    The CAS guard only rewinds if no later notifier advanced the row after our
+    claim. This keeps retry behavior for transient send failures without
+    clobbering newer progress.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (
+                int(old_cursor), task_id, platform, chat_id, thread_id or "",
+                int(claimed_cursor),
+            ),
+        )
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
