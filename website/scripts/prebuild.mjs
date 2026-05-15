@@ -24,6 +24,9 @@ const websiteDir = resolve(scriptDir, "..");
 const extractScript = join(scriptDir, "extract-skills.py");
 const llmsScript = join(scriptDir, "generate-llms-txt.py");
 const outputFile = join(websiteDir, "src", "data", "skills.json");
+const repoRoot = resolve(websiteDir, "..");
+const venvPython = join(repoRoot, "venv", "bin", "python");
+const pythonCommand = existsSync(venvPython) ? venvPython : "python3";
 
 function writeEmptyFallback(reason) {
   mkdirSync(dirname(outputFile), { recursive: true });
@@ -39,9 +42,9 @@ function runPython(script, label) {
     console.warn(`[prebuild] ${label} skipped (script missing)`);
     return false;
   }
-  const r = spawnSync("python3", [script], { stdio: "inherit", cwd: websiteDir });
+  const r = spawnSync(pythonCommand, [script], { stdio: "inherit", cwd: websiteDir });
   if (r.error && r.error.code === "ENOENT") {
-    console.warn(`[prebuild] ${label} skipped (python3 not found)`);
+    console.warn(`[prebuild] ${label} skipped (${pythonCommand} not found)`);
     return false;
   }
   if (r.status !== 0) {
@@ -55,12 +58,12 @@ function runPython(script, label) {
 if (!existsSync(extractScript)) {
   writeEmptyFallback("extract script missing");
 } else {
-  const r = spawnSync("python3", [extractScript], {
+  const r = spawnSync(pythonCommand, [extractScript], {
     stdio: "inherit",
     cwd: websiteDir,
   });
   if (r.error && r.error.code === "ENOENT") {
-    writeEmptyFallback("python3 not found");
+    writeEmptyFallback(`${pythonCommand} not found`);
   } else if (r.status !== 0) {
     writeEmptyFallback(`extract-skills.py exited with status ${r.status}`);
   }
