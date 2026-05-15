@@ -10,6 +10,7 @@ from gateway.platforms.base import (
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
+    SUPPORTED_DOCUMENT_TYPES,
     filter_existing_media_files,
     safe_url_for_log,
     utf16_len,
@@ -329,6 +330,19 @@ class TestExtractMedia:
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
+
+    def test_media_tag_supports_korean_document_paths(self):
+        content = "Docs\nMEDIA:/tmp/기초비례최종/보고서.hwp\nMEDIA:/tmp/기초비례최종/서식.hwpx"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/tmp/기초비례최종/보고서.hwp", False),
+            ("/tmp/기초비례최종/서식.hwpx", False),
+        ]
+        assert cleaned == "Docs"
+
+    def test_supported_document_types_include_hwp_and_hwpx(self):
+        assert SUPPORTED_DOCUMENT_TYPES[".hwp"] == "application/x-hwp"
+        assert SUPPORTED_DOCUMENT_TYPES[".hwpx"] == "application/hwp+zip"
 
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from
