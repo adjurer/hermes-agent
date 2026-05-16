@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -349,6 +350,41 @@ class TestSendTelegramMediaDelivery:
         assert "error" in result
         assert "No deliverable text or media remained" in result["error"]
         bot.send_message.assert_not_awaited()
+
+    def test_sends_korean_markdown_document_as_utf8_sig(self, tmp_path, monkeypatch):
+        doc_path = tmp_path / unicodedata.normalize("NFD", "한글보고서.md")
+        doc_path.write_bytes("# 제목\n한글 내용".encode("cp949"))
+
+        captured = {}
+
+        async def _capture_document(**kwargs):
+            captured["filename"] = kwargs["filename"]
+            captured["payload"] = kwargs["document"].read()
+            return SimpleNamespace(message_id=9)
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock()
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock(side_effect=_capture_document)
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "",
+                media_files=[(str(doc_path), False)],
+            )
+        )
+
+        assert result["success"] is True
+        assert captured["filename"] == "한글보고서.md"
+        assert captured["payload"].startswith(b"\xef\xbb\xbf")
+        assert captured["payload"].decode("utf-8-sig") == "# 제목\n한글 내용"
+        assert doc_path.read_bytes() == "# 제목\n한글 내용".encode("cp949")
 
 
 # ---------------------------------------------------------------------------

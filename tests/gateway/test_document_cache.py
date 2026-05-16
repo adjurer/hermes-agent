@@ -7,6 +7,7 @@ Covers: get_document_cache_dir, cache_document_from_bytes,
 
 import os
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,10 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_document_from_bytes,
     cleanup_document_cache,
+    decode_text_document_bytes,
     get_document_cache_dir,
+    normalize_document_filename,
+    prepare_outbound_document_for_send,
 )
 
 # ---------------------------------------------------------------------------
@@ -98,6 +102,62 @@ class TestCacheDocumentFromBytes:
         path = cache_document_from_bytes(b"data", None)
         assert "document" in os.path.basename(path)
 
+    def test_korean_filename_is_nfc_normalized(self):
+        decomposed = unicodedata.normalize("NFD", "한글보고서.md")
+        path = cache_document_from_bytes(b"data", decomposed)
+        basename = os.path.basename(path)
+        assert "한글보고서.md" in basename
+        assert basename == unicodedata.normalize("NFC", basename)
+
+
+class TestDocumentEncoding:
+    def test_decode_cp949_korean_markdown(self):
+        text, encoding = decode_text_document_bytes("# 제목\n한글 내용".encode("cp949"))
+        assert text == "# 제목\n한글 내용"
+        assert encoding == "cp949"
+
+    def test_decode_utf16_korean_markdown(self):
+        text, encoding = decode_text_document_bytes("# 제목\n한글 내용".encode("utf-16"))
+        assert text == "# 제목\n한글 내용"
+        assert encoding == "utf-16"
+
+    def test_normalize_filename_strips_control_characters(self):
+        assert normalize_document_filename("보고서\n\t.md") == "보고서.md"
+
+    def test_prepare_outbound_text_document_uses_utf8_sig_copy(self, tmp_path):
+        decomposed_name = unicodedata.normalize("NFD", "한글보고서.md")
+        source = tmp_path / decomposed_name
+        source.write_bytes("# 제목\n한글 내용".encode("cp949"))
+
+        send_path, display_name = prepare_outbound_document_for_send(source)
+
+        assert display_name == "한글보고서.md"
+        assert send_path != str(source)
+        sent_bytes = Path(send_path).read_bytes()
+        assert sent_bytes.startswith(b"\xef\xbb\xbf")
+        assert sent_bytes.decode("utf-8-sig") == "# 제목\n한글 내용"
+        assert source.read_bytes() == "# 제목\n한글 내용".encode("cp949")
+
+    def test_prepare_outbound_binary_document_does_not_reencode(self, tmp_path):
+        source = tmp_path / unicodedata.normalize("NFD", "계약서.hwp")
+        source.write_bytes(b"\xd0\xcf\x11\xe0binary-hwp")
+
+        send_path, display_name = prepare_outbound_document_for_send(source)
+
+        assert send_path == str(source)
+        assert display_name == "계약서.hwp"
+        assert source.read_bytes() == b"\xd0\xcf\x11\xe0binary-hwp"
+
+    def test_prepare_outbound_json_does_not_add_bom(self, tmp_path):
+        source = tmp_path / "data.json"
+        source.write_bytes('{"name":"한글"}'.encode("utf-8"))
+
+        send_path, display_name = prepare_outbound_document_for_send(source)
+
+        assert send_path == str(source)
+        assert display_name == "data.json"
+        assert source.read_bytes() == '{"name":"한글"}'.encode("utf-8")
+
 
 # ---------------------------------------------------------------------------
 # TestCleanupDocumentCache
@@ -151,7 +211,7 @@ class TestSupportedDocumentTypes:
 
     @pytest.mark.parametrize(
         "ext",
-        [".pdf", ".md", ".txt", ".zip", ".docx", ".xlsx", ".pptx"],
+        [".pdf", ".md", ".markdown", ".txt", ".zip", ".docx", ".xlsx", ".pptx"],
     )
     def test_expected_extensions_present(self, ext):
         assert ext in SUPPORTED_DOCUMENT_TYPES

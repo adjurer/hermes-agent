@@ -12,6 +12,7 @@ import asyncio
 import importlib
 import os
 import sys
+import unicodedata
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -228,6 +229,25 @@ class TestDocumentDownloadBlock:
         await adapter._handle_media_message(update, MagicMock())
         event = adapter.handle_message.call_args[0][0]
         assert "# Title" in event.text
+
+    @pytest.mark.asyncio
+    async def test_korean_cp949_markdown_injects_without_mojibake(self, adapter):
+        content = "# 제목\n한글 내용".encode("cp949")
+        file_obj = _make_file_obj(content)
+        decomposed_name = unicodedata.normalize("NFD", "한글보고서.md")
+        doc = _make_document(
+            file_name=decomposed_name, mime_type="text/markdown",
+            file_size=len(content), file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert "[Content of 한글보고서.md]" in event.text
+        assert "# 제목" in event.text
+        assert "한글 내용" in event.text
+        assert "����" not in event.text
 
     @pytest.mark.asyncio
     async def test_caption_preserved_with_injection(self, adapter):
@@ -629,6 +649,32 @@ class TestSendDocument:
         assert result.success is True
         call_kwargs = connected_adapter._bot.send_document.call_args[1]
         assert call_kwargs["filename"] == "clean_data.csv"
+
+    @pytest.mark.asyncio
+    async def test_send_document_normalizes_korean_text_attachment(self, connected_adapter, tmp_path):
+        decomposed_name = unicodedata.normalize("NFD", "한글보고서.md")
+        test_file = tmp_path / decomposed_name
+        test_file.write_bytes("# 제목\n한글 내용".encode("cp949"))
+
+        captured = {}
+
+        async def _capture_send_document(**kwargs):
+            captured["filename"] = kwargs["filename"]
+            captured["payload"] = kwargs["document"].read()
+            return SimpleNamespace(message_id=104)
+
+        connected_adapter._bot.send_document = AsyncMock(side_effect=_capture_send_document)
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+        )
+
+        assert result.success is True
+        assert captured["filename"] == "한글보고서.md"
+        assert captured["payload"].startswith(b"\xef\xbb\xbf")
+        assert captured["payload"].decode("utf-8-sig") == "# 제목\n한글 내용"
+        assert test_file.read_bytes() == "# 제목\n한글 내용".encode("cp949")
 
     @pytest.mark.asyncio
     async def test_send_document_file_not_found(self, connected_adapter):

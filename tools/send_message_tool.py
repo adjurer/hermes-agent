@@ -856,26 +856,33 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
             ext = os.path.splitext(media_path)[1].lower()
             try:
-                with open(media_path, "rb") as f:
-                    if ext in _IMAGE_EXTS and not force_document:
+                if ext in _IMAGE_EXTS and not force_document:
+                    with open(media_path, "rb") as f:
                         last_msg = await bot.send_photo(
                             chat_id=int_chat_id, photo=f, **thread_kwargs
                         )
-                    elif ext in _VIDEO_EXTS:
+                elif ext in _VIDEO_EXTS:
+                    with open(media_path, "rb") as f:
                         last_msg = await bot.send_video(
                             chat_id=int_chat_id, video=f, **thread_kwargs
                         )
-                    elif ext in _VOICE_EXTS and is_voice:
+                elif ext in _VOICE_EXTS and is_voice:
+                    with open(media_path, "rb") as f:
                         last_msg = await bot.send_voice(
                             chat_id=int_chat_id, voice=f, **thread_kwargs
                         )
-                    elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                    with open(media_path, "rb") as f:
                         last_msg = await bot.send_audio(
                             chat_id=int_chat_id, audio=f, **thread_kwargs
                         )
-                    else:
+                else:
+                    from gateway.platforms.base import prepare_outbound_document_for_send
+
+                    send_path, display_name = prepare_outbound_document_for_send(media_path)
+                    with open(send_path, "rb") as f:
                         last_msg = await bot.send_document(
-                            chat_id=int_chat_id, document=f, **thread_kwargs
+                            chat_id=int_chat_id, document=f, filename=display_name, **thread_kwargs
                         )
             except Exception as e:
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")

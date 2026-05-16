@@ -73,9 +73,13 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
+    decode_text_document_bytes,
+    normalize_document_filename,
+    prepare_outbound_document_for_send,
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
+    TEXT_DOCUMENT_EXTS,
     utf16_len,
 )
 from gateway.platforms.telegram_network import (
@@ -3283,7 +3287,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
 
-            display_name = file_name or os.path.basename(file_path)
+            send_path, display_name = prepare_outbound_document_for_send(file_path, file_name)
             _thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata)
             thread_kwargs = self._thread_kwargs_for_send(
@@ -3293,7 +3297,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
             )
 
-            with open(file_path, "rb") as f:
+            with open(send_path, "rb") as f:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_document,
                     {
@@ -4307,7 +4311,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 # Determine file extension
                 ext = ""
-                original_filename = doc.file_name or ""
+                original_filename = normalize_document_filename(doc.file_name or "", fallback="")
                 if original_filename:
                     _, ext = os.path.splitext(original_filename)
                     ext = ext.lower()
@@ -4404,19 +4408,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
-                if ext in {".md", ".txt"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                if ext in TEXT_DOCUMENT_EXTS and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                     try:
-                        text_content = raw_bytes.decode("utf-8")
-                        display_name = original_filename or f"document{ext}"
-                        display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                        text_content, detected_encoding = decode_text_document_bytes(raw_bytes)
+                        display_name = normalize_document_filename(original_filename or f"document{ext}")
                         injection = f"[Content of {display_name}]:\n{text_content}"
                         if event.text:
                             event.text = f"{injection}\n\n{event.text}"
                         else:
                             event.text = injection
-                    except UnicodeDecodeError:
+                        logger.debug("[Telegram] Injected text document content decoded as %s", detected_encoding)
+                    except Exception:
                         logger.warning(
-                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
+                            "[Telegram] Could not decode text document, skipping content injection",
                             exc_info=True,
                         )
 

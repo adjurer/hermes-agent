@@ -13430,7 +13430,9 @@ class GatewayRunner:
 
         if notify_mode == "off" and not agent_notify:
             # Still wait for the process to exit so we can log it, but don't
-            # push any messages to the user.
+            # push any messages to the user. ``notify_on_complete`` is an
+            # internal agent continuation path, so it must still run even when
+            # user-facing background-process notifications are disabled.
             while True:
                 await asyncio.sleep(interval)
                 session = process_registry.get(session_id)

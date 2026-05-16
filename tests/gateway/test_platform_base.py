@@ -340,7 +340,18 @@ class TestExtractMedia:
         ]
         assert cleaned == "Docs"
 
-    def test_supported_document_types_include_hwp_and_hwpx(self):
+    def test_media_tag_supports_markdown_document_paths(self):
+        content = "Docs\nMEDIA:/tmp/candidate_roster.md\nMEDIA:/tmp/report.markdown"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/tmp/candidate_roster.md", False),
+            ("/tmp/report.markdown", False),
+        ]
+        assert cleaned == "Docs"
+
+    def test_supported_document_types_include_markdown_hwp_and_hwpx(self):
+        assert SUPPORTED_DOCUMENT_TYPES[".md"] == "text/markdown"
+        assert SUPPORTED_DOCUMENT_TYPES[".markdown"] == "text/markdown"
         assert SUPPORTED_DOCUMENT_TYPES[".hwp"] == "application/x-hwp"
         assert SUPPORTED_DOCUMENT_TYPES[".hwpx"] == "application/hwp+zip"
 

@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -837,6 +838,7 @@ DOCUMENT_CACHE_DIR = get_hermes_dir("cache/documents", "document_cache")
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
     ".md": "text/markdown",
+    ".markdown": "text/markdown",
     ".txt": "text/plain",
     ".csv": "text/csv",
     ".log": "text/plain",
@@ -855,11 +857,115 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
+TEXT_DOCUMENT_EXTS = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".csv",
+        ".log",
+        ".json",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+    }
+)
+
+OUTBOUND_TEXT_NORMALIZE_EXTS = frozenset({".md", ".markdown", ".txt", ".csv", ".log"})
+
+_TEXT_DOCUMENT_ENCODINGS = (
+    "utf-8-sig",
+    "utf-8",
+    "cp949",
+    "euc-kr",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+)
+
+
+def _text_document_encoding_order(data: bytes) -> tuple[str, ...]:
+    """Choose a strict decode order based on BOM/null-byte hints."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return ("utf-16", "utf-16-le", "utf-16-be", "utf-8-sig", "utf-8", "cp949", "euc-kr")
+    sample = data[:512]
+    if sample.count(b"\x00") > max(2, len(sample) // 10):
+        return ("utf-16", "utf-16-le", "utf-16-be", "utf-8-sig", "utf-8", "cp949", "euc-kr")
+    return _TEXT_DOCUMENT_ENCODINGS
+
 
 def get_document_cache_dir() -> Path:
     """Return the document cache directory, creating it if it doesn't exist."""
     DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return DOCUMENT_CACHE_DIR
+
+
+def normalize_document_filename(filename: str | os.PathLike | None, fallback: str = "document") -> str:
+    """Return a safe, NFC-normalized filename for user-visible documents."""
+    fallback_name = unicodedata.normalize("NFC", str(fallback or "document")).strip() or "document"
+    safe_name = Path(str(filename or "")).name
+    safe_name = safe_name.replace("\x00", "")
+    safe_name = "".join(ch for ch in safe_name if ch.isprintable() and ch not in "\r\n\t")
+    safe_name = unicodedata.normalize("NFC", safe_name).strip()
+    if not safe_name or safe_name in {".", ".."}:
+        safe_name = fallback_name
+    return safe_name
+
+
+def is_text_document_path(path_or_name: str | os.PathLike | None) -> bool:
+    """Return True for document extensions that are safe to decode/re-encode."""
+    return Path(str(path_or_name or "")).suffix.lower() in TEXT_DOCUMENT_EXTS
+
+
+def decode_text_document_bytes(data: bytes) -> tuple[str, str]:
+    """Decode Korean-friendly text documents without assuming UTF-8 only."""
+    last_error: UnicodeDecodeError | None = None
+    for encoding in _text_document_encoding_order(data):
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def prepare_outbound_document_for_send(
+    file_path: str | os.PathLike,
+    file_name: str | os.PathLike | None = None,
+) -> tuple[str, str]:
+    """Prepare an attachment path and display name for reliable document sending.
+
+    Binary documents are returned untouched. Text-like documents are copied into
+    the document cache as UTF-8 with BOM so Korean content opens consistently in
+    clients that otherwise guess legacy encodings.
+    """
+    display_name = normalize_document_filename(file_name or os.path.basename(str(file_path)))
+    source_path = Path(file_path)
+    ext = Path(display_name).suffix.lower() or source_path.suffix.lower()
+    if ext not in OUTBOUND_TEXT_NORMALIZE_EXTS:
+        return str(source_path), display_name
+
+    raw = source_path.read_bytes()
+    try:
+        text, encoding = decode_text_document_bytes(raw)
+    except UnicodeDecodeError:
+        logger.warning("Could not decode outbound text document, sending original bytes: %s", source_path)
+        return str(source_path), display_name
+    normalized_text = unicodedata.normalize("NFC", text)
+    encoded = normalized_text.encode("utf-8-sig")
+    if raw == encoded and encoding == "utf-8-sig":
+        return str(source_path), display_name
+
+    cache_dir = get_document_cache_dir()
+    outbound_name = f"send_{uuid.uuid4().hex[:12]}_{display_name}"
+    outbound_path = cache_dir / outbound_name
+    if not outbound_path.resolve().is_relative_to(cache_dir.resolve()):
+        raise ValueError(f"Path traversal rejected: {file_name!r}")
+    outbound_path.write_bytes(encoded)
+    return str(outbound_path), display_name
 
 
 def cache_document_from_bytes(data: bytes, filename: str) -> str:
@@ -880,11 +986,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
         ValueError: If the sanitized path escapes the cache directory.
     """
     cache_dir = get_document_cache_dir()
-    # Sanitize: strip directory components, null bytes, and control characters
-    safe_name = Path(filename).name if filename else "document"
-    safe_name = safe_name.replace("\x00", "").strip()
-    if not safe_name or safe_name in {".", ".."}:
-        safe_name = "document"
+    safe_name = normalize_document_filename(filename)
     cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
     filepath = cache_dir / cached_name
     # Final safety check: ensure path stays inside cache dir
@@ -2151,7 +2253,7 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|hwp|hwpx|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|hwp|hwpx|docx?|xlsx?|pptx?|md|markdown|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$)|\S+)[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
