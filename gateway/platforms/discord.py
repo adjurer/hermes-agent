@@ -568,11 +568,35 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
+        self._voice_auto_follow_leave_tasks: Dict[int, asyncio.Task] = {}
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        # Optional hands-free Discord VC mode: when an allowed user joins an
+        # allowed voice channel, follow them without requiring /voice join.
+        self._voice_auto_follow: bool = os.getenv("DISCORD_VOICE_AUTO_FOLLOW", "").lower() in {"1", "true", "yes", "on"}
+        self._voice_auto_follow_user_ids: set = {
+            _clean_discord_id(uid) for uid in os.getenv("DISCORD_VOICE_AUTO_FOLLOW_USERS", "").split(",")
+            if uid.strip()
+        }
+        self._voice_auto_follow_channel_ids: set = {
+            _clean_discord_id(ch) for ch in os.getenv("DISCORD_VOICE_AUTO_FOLLOW_CHANNELS", "").split(",")
+            if ch.strip()
+        }
+        self._voice_auto_follow_text_channel_id: str = _clean_discord_id(
+            os.getenv("DISCORD_VOICE_AUTO_FOLLOW_TEXT_CHANNEL")
+            or os.getenv("DISCORD_HOME_CHANNEL")
+            or os.getenv("DISCORD_ALLOWED_CHANNELS", "").split(",")[0]
+        )
+        try:
+            self._voice_auto_follow_leave_delay_seconds = max(
+                0.0,
+                float(os.getenv("DISCORD_VOICE_AUTO_FOLLOW_LEAVE_DELAY_SECONDS", "20")),
+            )
+        except ValueError:
+            self._voice_auto_follow_leave_delay_seconds = 20.0
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -814,14 +838,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
-                # Only track channels where the bot is connected
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
+                """Track voice channel join/leave events and optional auto-follow."""
                 # Ignore the bot itself
                 if member == adapter_self._client.user:
                     return
@@ -833,6 +850,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     and after.channel is not None
                     and before.channel != after.channel
                 )
+
+                if adapter_self._voice_auto_follow and (joined or switched or left):
+                    await adapter_self._handle_voice_auto_follow(member, before, after)
+
+                # Only track channels where the bot is connected
+                bot_guild_ids = set(adapter_self._voice_clients.keys())
+                if not bot_guild_ids:
+                    return
+                guild_id = member.guild.id
+                if guild_id not in bot_guild_ids:
+                    return
 
                 if joined or left or switched:
                     logger.info(
@@ -1887,6 +1915,121 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Voice channel methods (join / leave / play)
     # ------------------------------------------------------------------
+
+    def _is_voice_auto_follow_user(self, member) -> bool:
+        """Return True when a member is allowed to trigger VC auto-follow."""
+        if getattr(member, "bot", False):
+            return False
+        user_id = str(getattr(member, "id", ""))
+        follow_users = self._voice_auto_follow_user_ids or self._allowed_user_ids
+        if follow_users and user_id not in follow_users:
+            return False
+        guild = getattr(member, "guild", None)
+        return self._is_allowed_user(user_id, author=member, guild=guild, is_dm=False)
+
+    def _is_voice_auto_follow_channel(self, channel) -> bool:
+        """Return True when a voice channel is in the optional allow-list."""
+        if channel is None:
+            return False
+        allowed_channels = self._voice_auto_follow_channel_ids
+        return not allowed_channels or str(getattr(channel, "id", "")) in allowed_channels
+
+    def _cancel_voice_auto_follow_leave(self, guild_id: int) -> None:
+        task = self._voice_auto_follow_leave_tasks.pop(guild_id, None)
+        if task:
+            task.cancel()
+
+    def _schedule_voice_auto_follow_leave(self, guild_id: int, channel_id: int) -> None:
+        """Leave a followed VC after a short grace period if still connected."""
+        self._cancel_voice_auto_follow_leave(guild_id)
+
+        async def _leave_later():
+            try:
+                await asyncio.sleep(self._voice_auto_follow_leave_delay_seconds)
+                vc = self._voice_clients.get(guild_id)
+                if vc and vc.is_connected() and getattr(vc.channel, "id", None) == channel_id:
+                    await self.leave_voice_channel(guild_id)
+                    text_ch_id = self._voice_auto_follow_text_channel_id
+                    if self._on_voice_disconnect and text_ch_id:
+                        try:
+                            self._on_voice_disconnect(str(text_ch_id))
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning("Voice auto-follow leave failed: %s", e, exc_info=True)
+
+        self._voice_auto_follow_leave_tasks[guild_id] = asyncio.ensure_future(_leave_later())
+
+    async def _handle_voice_auto_follow(self, member, before, after) -> None:
+        """Join/leave a VC automatically for an allowed user and channel."""
+        if not self._voice_auto_follow or not self._client:
+            return
+        if not self._is_voice_auto_follow_user(member):
+            return
+
+        guild = getattr(member, "guild", None)
+        if guild is None:
+            return
+        guild_id = guild.id
+        before_channel = getattr(before, "channel", None)
+        after_channel = getattr(after, "channel", None)
+        moved_or_joined = after_channel is not None and before_channel != after_channel
+        left_or_moved = before_channel is not None and before_channel != after_channel
+
+        if moved_or_joined and self._is_voice_auto_follow_channel(after_channel):
+            self._cancel_voice_auto_follow_leave(guild_id)
+            if not self._voice_auto_follow_text_channel_id:
+                logger.warning("Discord voice auto-follow enabled but no text channel is configured")
+                return
+
+            runner = getattr(self, "gateway_runner", None)
+            if runner:
+                self._voice_input_callback = getattr(runner, "_handle_voice_channel_input", None)
+                self._on_voice_disconnect = getattr(runner, "_handle_voice_timeout_cleanup", None)
+
+            try:
+                success = await self.join_voice_channel(after_channel)
+            except Exception as e:
+                logger.warning("Discord voice auto-follow join failed: %s", e, exc_info=True)
+                return
+            if not success:
+                return
+
+            text_ch_id = int(self._voice_auto_follow_text_channel_id)
+            self._voice_text_channels[guild_id] = text_ch_id
+            self._voice_sources[guild_id] = {
+                "platform": Platform.DISCORD.value,
+                "chat_id": str(text_ch_id),
+                "chat_name": getattr(self._client.get_channel(text_ch_id), "name", str(text_ch_id)),
+                "chat_type": "channel",
+                "user_id": str(member.id),
+                "user_name": getattr(member, "display_name", str(member.id)),
+                "thread_id": None,
+                "chat_topic": None,
+                "guild_id": str(guild_id),
+            }
+            if runner:
+                try:
+                    runner._voice_mode[runner._voice_key(Platform.DISCORD, str(text_ch_id))] = "all"
+                    runner._save_voice_modes()
+                    runner._set_adapter_auto_tts_enabled(self, str(text_ch_id), enabled=True)
+                except Exception:
+                    logger.debug("Failed to update runner voice mode for auto-follow", exc_info=True)
+            logger.info(
+                "Discord voice auto-follow joined %s (%s) for user %s in guild %s",
+                getattr(after_channel, "name", after_channel.id),
+                after_channel.id,
+                member.id,
+                guild_id,
+            )
+            return
+
+        if left_or_moved:
+            vc = self._voice_clients.get(guild_id)
+            if vc and vc.is_connected() and getattr(vc.channel, "id", None) == getattr(before_channel, "id", None):
+                self._schedule_voice_auto_follow_leave(guild_id, before_channel.id)
 
     async def join_voice_channel(self, channel) -> bool:
         """Join a Discord voice channel. Returns True on success."""
