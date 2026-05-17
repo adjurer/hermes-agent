@@ -1,11 +1,12 @@
-#!/usr/bin/env python3
-"""
-Hermes Agent CLI launcher.
+#!/bin/sh
+set -eu
 
-This wrapper should behave like the installed `hermes` command, including
-subcommands such as `gateway`, `cron`, and `doctor`.
-"""
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x "$SCRIPT_DIR/venv/bin/python3" ]; then
+  PYTHON="$SCRIPT_DIR/venv/bin/python3"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
 
-if __name__ == "__main__":
-    from hermes_cli.main import main
-    main()
+cd "$SCRIPT_DIR"
+exec "$PYTHON" -m hermes_cli.main "$@"

@@ -119,6 +119,12 @@ def _get_process_start_time(pid: int) -> Optional[int]:
 
     if sys.platform == "darwin":
         try:
+            import psutil
+
+            return int(psutil.Process(pid).create_time())
+        except Exception:
+            pass
+        try:
             output = subprocess.check_output(
                 ["ps", "-o", "lstart=", "-p", str(pid)],
                 text=True,
