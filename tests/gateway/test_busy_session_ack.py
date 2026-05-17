@@ -38,6 +38,15 @@ from gateway.platforms.base import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _isolate_local_gateway_config(monkeypatch):
+    """Keep these unit tests independent from the operator's live config.yaml."""
+    import gateway.run as _gr
+
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", raising=False)
+    monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+
+
 def _make_event(text="hello", chat_id="123", platform_val="telegram"):
     """Build a minimal MessageEvent."""
     source = SessionSource(

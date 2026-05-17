@@ -38,6 +38,15 @@ async def test_safe_disconnect_calls_adapter_disconnect(bare_runner):
 
 
 @pytest.mark.asyncio
+async def test_safe_disconnect_returns_true_on_clean_disconnect(bare_runner):
+    """Callers can distinguish a clean shutdown from a tolerated failure."""
+    adapter = MagicMock()
+    adapter.disconnect = AsyncMock(return_value=None)
+
+    assert await bare_runner._safe_adapter_disconnect(adapter, Platform.TELEGRAM) is True
+
+
+@pytest.mark.asyncio
 async def test_safe_disconnect_swallows_exceptions(bare_runner):
     """An exception in adapter.disconnect() must not propagate — the
     caller is already on an error path."""
@@ -45,7 +54,7 @@ async def test_safe_disconnect_swallows_exceptions(bare_runner):
     adapter.disconnect = AsyncMock(side_effect=RuntimeError("partial init"))
 
     # Must NOT raise
-    await bare_runner._safe_adapter_disconnect(adapter, Platform.TELEGRAM)
+    assert await bare_runner._safe_adapter_disconnect(adapter, Platform.TELEGRAM) is False
 
     adapter.disconnect.assert_awaited_once()
 
@@ -73,7 +82,21 @@ async def test_safe_disconnect_times_out_and_continues(bare_runner, monkeypatch,
     adapter.disconnect = AsyncMock(side_effect=hang)
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
-        await bare_runner._safe_adapter_disconnect(adapter, Platform.FEISHU)
+        assert await bare_runner._safe_adapter_disconnect(adapter, Platform.FEISHU) is False
 
     adapter.disconnect.assert_awaited_once()
     assert "Timed out after 0.0s while disconnecting feishu adapter" in caplog.text
+
+
+def test_background_review_summary_gate_defaults_off(monkeypatch):
+    """Gateway review summaries stay quiet unless explicitly enabled."""
+    monkeypatch.delenv("HERMES_GATEWAY_REVIEW_SUMMARY", raising=False)
+
+    assert GatewayRunner._background_review_summary_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_background_review_summary_gate_accepts_truthy_values(monkeypatch, value):
+    monkeypatch.setenv("HERMES_GATEWAY_REVIEW_SUMMARY", value)
+
+    assert GatewayRunner._background_review_summary_enabled() is True

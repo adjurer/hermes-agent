@@ -1596,7 +1596,7 @@ class GatewayRunner:
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
             )
 
-    async def _safe_adapter_disconnect(self, adapter, platform) -> None:
+    async def _safe_adapter_disconnect(self, adapter, platform) -> bool:
         """Call adapter.disconnect() defensively, swallowing any error.
 
         Used when adapter.connect() failed or raised — the adapter may
@@ -1605,7 +1605,8 @@ class GatewayRunner:
         as "Unclosed client session" warnings at process exit.
 
         Must tolerate partial-init state and never raise, since callers
-        use it inside error-handling blocks.
+        use it inside error-handling blocks. Returns True when the adapter
+        completed disconnect() cleanly, otherwise False.
         """
         timeout = self._adapter_disconnect_timeout_secs()
         try:
@@ -1613,18 +1614,43 @@ class GatewayRunner:
                 await adapter.disconnect()
             else:
                 await asyncio.wait_for(adapter.disconnect(), timeout=timeout)
+            return True
         except asyncio.TimeoutError:
             logger.warning(
                 "Timed out after %.1fs while disconnecting %s adapter; continuing shutdown",
                 timeout,
                 platform.value if platform is not None else "adapter",
             )
+            return False
         except Exception as e:
             logger.debug(
                 "Defensive %s disconnect after failed connect raised: %s",
                 platform.value if platform is not None else "adapter",
                 e,
             )
+            return False
+
+    @staticmethod
+    def _background_review_summary_enabled() -> bool:
+        return os.getenv("HERMES_GATEWAY_REVIEW_SUMMARY", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _normalize_telegram_notifications_mode(raw) -> Optional[str]:
+        if raw in {None, ""}:
+            return None
+        if isinstance(raw, bool):
+            return "all" if raw else "important"
+        mode = str(raw).strip().lower()
+        if mode in {"1", "true", "yes", "on", "all"}:
+            return "all"
+        if mode in {"0", "false", "no", "off", "silent", "important"}:
+            return "important"
+        return mode
 
     def _adapter_disconnect_timeout_secs(self) -> float:
         """Return the per-adapter disconnect timeout used during shutdown."""
@@ -1960,7 +1986,7 @@ class GatewayRunner:
         existing = self.adapters.get(adapter.platform)
         if existing is adapter:
             try:
-                await adapter.disconnect()
+                await self._safe_adapter_disconnect(adapter, adapter.platform)
             finally:
                 self.adapters.pop(adapter.platform, None)
                 self.delivery_router.adapters = self.adapters
@@ -5048,19 +5074,17 @@ class GatewayRunner:
                     await adapter.cancel_background_tasks()
                 except Exception as e:
                     logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
-                try:
-                    await adapter.disconnect()
+                if await self._safe_adapter_disconnect(adapter, platform):
                     logger.info(
                         "✓ %s disconnected (%.2fs)",
                         platform.value,
                         time.monotonic() - _adapter_started_at,
                     )
-                except Exception as e:
-                    logger.error(
-                        "✗ %s disconnect error after %.2fs: %s",
+                else:
+                    logger.warning(
+                        "✗ %s disconnect did not complete cleanly after %.2fs; continuing shutdown",
                         platform.value,
                         time.monotonic() - _adapter_started_at,
-                        e,
                     )
             logger.info(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
@@ -5226,8 +5250,7 @@ class GatewayRunner:
                 try:
                     _gw_cfg = _load_gateway_config()
                     _raw = cfg_get(_gw_cfg, "display", "platforms", "telegram", "notifications")
-                    if _raw not in {None, ""}:
-                        _notify_mode = str(_raw).strip().lower()
+                    _notify_mode = self._normalize_telegram_notifications_mode(_raw) or ""
                 except Exception:
                     pass
             _notify_mode = _notify_mode or "important"
@@ -15176,9 +15199,14 @@ class GatewayRunner:
                 for queued in pending:
                     _deliver_bg_review_message(queued)
 
-            # Background review delivery — send "💾 Memory updated" etc. to user
+            # Background review delivery — send "💾 Memory updated" etc. to user.
+            # yuri/MacServer operations keep this quiet by default for clean
+            # Telegram/Discord transcripts; set HERMES_GATEWAY_REVIEW_SUMMARY=true
+            # to surface the compact review summary again.
             def _bg_review_send(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
+                    return
+                if not self._background_review_summary_enabled():
                     return
                 if not _bg_review_release.is_set():
                     with _bg_review_pending_lock:
