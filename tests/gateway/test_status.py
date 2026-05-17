@@ -352,6 +352,31 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
 
+    def test_write_runtime_status_starting_clears_stale_platforms(self, tmp_path, monkeypatch):
+        """A fresh boot should not report removed connectors as still connected."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "pid": 99999,
+            "kind": "hermes-gateway",
+            "platforms": {
+                "feishu": {
+                    "state": "connected",
+                    "error_code": None,
+                    "error_message": None,
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            },
+            "updated_at": "2025-01-01T00:00:00Z",
+        }))
+
+        status.write_runtime_status(gateway_state="starting")
+
+        payload = status.read_runtime_status()
+        assert payload["gateway_state"] == "starting"
+        assert payload["platforms"] == {}
+
     def test_write_runtime_status_explicit_none_clears_stale_fields(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

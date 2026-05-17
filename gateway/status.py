@@ -561,6 +561,11 @@ def write_runtime_status(
 
     if gateway_state is not _UNSET:
         payload["gateway_state"] = gateway_state
+        if gateway_state == "starting" and platform is _UNSET:
+            # A fresh gateway boot must not inherit platform health from a
+            # previous configuration. Otherwise a removed connector can keep
+            # showing as connected in gateway_state.json until another restart.
+            payload["platforms"] = {}
     if exit_reason is not _UNSET:
         payload["exit_reason"] = exit_reason
     if restart_requested is not _UNSET:
