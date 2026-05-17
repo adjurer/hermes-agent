@@ -2594,6 +2594,20 @@ class GatewayRunner:
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
+        try:
+            from gateway.display_config import resolve_display_setting
+
+            _busy_cfg = _load_gateway_config()
+            _busy_platform_key = _platform_config_key(event.source.platform)
+            _busy_notifications = resolve_display_setting(
+                _busy_cfg,
+                _busy_platform_key,
+                "notifications",
+            )
+            if _busy_notifications is not None and not is_truthy_value(_busy_notifications, default=True):
+                busy_ack_enabled = False
+        except Exception:
+            pass
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
@@ -14854,6 +14868,21 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            try:
+                from gateway.display_config import resolve_display_setting
+
+                _status_notifications = resolve_display_setting(
+                    user_config,
+                    platform_key,
+                    "notifications",
+                )
+                if _status_notifications is not None and not is_truthy_value(
+                    _status_notifications,
+                    default=True,
+                ):
+                    return
+            except Exception:
+                pass
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(
