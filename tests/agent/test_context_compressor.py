@@ -376,6 +376,30 @@ class TestSummaryFallbackToMainModel:
         # Not flagged as fallen back — the retry condition was never met
         assert getattr(c, "_summary_model_fallen_back", False) is False
 
+    def test_no_main_retry_when_compression_provider_is_explicit(self):
+        """A user-pinned auxiliary.compression.provider is a hard routing
+        choice. If that provider fails, do not burn another slow main-model
+        compression attempt."""
+        err = TimeoutError("aux compression timed out")
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                summary_model_override="explicit-aux-model",
+                quiet_mode=True,
+            )
+
+        with (
+            patch("agent.context_compressor._compression_provider_is_explicit", return_value=True),
+            patch("agent.context_compressor.call_llm", side_effect=err) as mock_call,
+        ):
+            result = c._generate_summary(self._msgs())
+
+        assert mock_call.call_count == 1
+        assert mock_call.call_args_list[0].kwargs.get("model") == "explicit-aux-model"
+        assert result is None
+        assert getattr(c, "_summary_model_fallen_back", False) is False
+
     def test_fallback_only_happens_once_per_compressor(self):
         """If the retry-on-main ALSO fails, don't loop forever — enter
         cooldown like the normal failure path."""

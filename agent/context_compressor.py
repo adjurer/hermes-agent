@@ -76,6 +76,18 @@ _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 
+def _compression_provider_is_explicit() -> bool:
+    """Return True when auxiliary.compression.provider is user-pinned."""
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+
+        task_config = _get_auxiliary_task_config("compression")
+    except Exception:  # noqa: BLE001 - config availability should not break compression.
+        return False
+    provider = str(task_config.get("provider") or "").strip().lower()
+    return bool(provider and provider != "auto")
+
+
 def _content_length_for_budget(raw_content: Any) -> int:
     """Return the effective char-length of a message's content for token budgeting.
 
@@ -1023,6 +1035,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
                 and self.summary_model
                 and self.summary_model != self.model
+                and not _compression_provider_is_explicit()
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 if _is_json_decode:
@@ -1048,6 +1061,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if (
                 self.summary_model
                 and self.summary_model != self.model
+                and not _compression_provider_is_explicit()
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
