@@ -34,11 +34,119 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive integer environment setting with a safe default."""
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _tavily_budget_state_path() -> Path:
+    configured = os.getenv("TAVILY_BUDGET_STATE_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    return home / "state" / "tavily_budget.json"
+
+
+def _read_tavily_budget_state() -> Dict[str, Any]:
+    import json
+
+    path = _tavily_budget_state_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - budget telemetry must not break web.
+        logger.warning("Could not read Tavily budget state %s: %s", path, exc)
+        return {}
+
+
+def _write_tavily_budget_state(state: Dict[str, Any]) -> None:
+    import json
+
+    path = _tavily_budget_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _current_budget_keys() -> tuple[str, str]:
+    return time.strftime("%Y-%m"), time.strftime("%Y-%m-%d")
+
+
+def _estimate_tavily_credits(endpoint: str, payload: Dict[str, Any], response: Dict[str, Any] | None = None) -> int:
+    name = endpoint.strip("/").lower()
+    if name == "search":
+        depth = str(payload.get("search_depth") or "basic").lower()
+        return 2 if depth == "advanced" else 1
+    if name == "extract":
+        if response is not None:
+            return max(1, len(response.get("results") or []))
+        urls = payload.get("urls") or []
+        return max(1, len(urls if isinstance(urls, list) else [urls]))
+    if name == "crawl":
+        if response is not None:
+            return max(1, len(response.get("results") or []))
+        return max(1, int(payload.get("limit") or 1))
+    return 1
+
+
+def _check_tavily_budget(endpoint: str, payload: Dict[str, Any]) -> int:
+    monthly_cap = _env_int("TAVILY_MONTHLY_CREDIT_CAP", 900)
+    daily_cap = _env_int("TAVILY_DAILY_CREDIT_CAP", 30)
+    estimated = _estimate_tavily_credits(endpoint, payload)
+    month_key, day_key = _current_budget_keys()
+    state = _read_tavily_budget_state()
+    month_used = int((state.get("months") or {}).get(month_key, 0))
+    day_used = int((state.get("days") or {}).get(day_key, 0))
+    if month_used + estimated > monthly_cap:
+        raise RuntimeError(
+            f"Tavily monthly budget cap would be exceeded "
+            f"({month_used}+{estimated}>{monthly_cap}). Ask the user before using more."
+        )
+    if day_used + estimated > daily_cap:
+        raise RuntimeError(
+            f"Tavily daily budget cap would be exceeded "
+            f"({day_used}+{estimated}>{daily_cap}). Ask the user before using more."
+        )
+    return estimated
+
+
+def _record_tavily_budget(endpoint: str, payload: Dict[str, Any], response: Dict[str, Any]) -> None:
+    credits = _estimate_tavily_credits(endpoint, payload, response)
+    month_key, day_key = _current_budget_keys()
+    state = _read_tavily_budget_state()
+    months = state.setdefault("months", {})
+    days = state.setdefault("days", {})
+    endpoints = state.setdefault("endpoints", {})
+    endpoint_name = endpoint.strip("/").lower()
+    months[month_key] = int(months.get(month_key, 0)) + credits
+    days[day_key] = int(days.get(day_key, 0)) + credits
+    endpoints[endpoint_name] = int(endpoints.get(endpoint_name, 0)) + credits
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    _write_tavily_budget_state(state)
 
 
 def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -59,6 +167,13 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     base_url = os.getenv("TAVILY_BASE_URL", "https://api.tavily.com")
     payload = dict(payload)  # don't mutate caller's dict
+    endpoint_name = endpoint.strip("/").lower()
+    if endpoint_name in {"crawl", "map", "research"} and not _env_bool("TAVILY_ALLOW_EXPENSIVE", False):
+        raise RuntimeError(
+            f"Tavily {endpoint_name} is disabled by TAVILY_ALLOW_EXPENSIVE=0 "
+            "to preserve the free monthly credit budget."
+        )
+    _check_tavily_budget(endpoint_name, payload)
     payload["api_key"] = api_key
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
@@ -69,7 +184,9 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     response = httpx.post(url, json=payload, headers=headers, timeout=60)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+    _record_tavily_budget(endpoint_name, payload, data)
+    return data
 
 
 def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]:
@@ -170,12 +287,14 @@ class TavilyWebSearchProvider(WebSearchProvider):
             if is_interrupted():
                 return {"success": False, "error": "Interrupted"}
 
-            logger.info("Tavily search: '%s' (limit=%d)", query, limit)
+            max_results = min(limit, _env_int("TAVILY_MAX_SEARCH_RESULTS", 3), 20)
+            logger.info("Tavily search: '%s' (limit=%d, capped=%d)", query, limit, max_results)
             raw = _tavily_request(
                 "search",
                 {
                     "query": query,
-                    "max_results": min(limit, 20),
+                    "max_results": max_results,
+                    "search_depth": os.getenv("TAVILY_SEARCH_DEPTH", "basic"),
                     "include_raw_content": False,
                     "include_images": False,
                 },
@@ -200,6 +319,13 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 return [
                     {"url": u, "error": "Interrupted", "title": ""} for u in urls
                 ]
+
+            max_urls = _env_int("TAVILY_MAX_EXTRACT_URLS", 3)
+            if len(urls) > max_urls:
+                raise RuntimeError(
+                    f"Tavily extract is capped at {max_urls} URL(s) per call "
+                    "to preserve the free monthly credit budget."
+                )
 
             logger.info("Tavily extract: %d URL(s)", len(urls))
             raw = _tavily_request(
@@ -238,9 +364,21 @@ class TavilyWebSearchProvider(WebSearchProvider):
             if is_interrupted():
                 return {"results": [{"url": url, "title": "", "content": "", "error": "Interrupted"}]}
 
+            if not _env_bool("TAVILY_ALLOW_EXPENSIVE", False):
+                return {
+                    "results": [
+                        {
+                            "url": url,
+                            "title": "",
+                            "content": "",
+                            "error": "Tavily crawl is disabled by TAVILY_ALLOW_EXPENSIVE=0 to preserve the free monthly credit budget.",
+                        }
+                    ]
+                }
+
             instructions = kwargs.get("instructions")
             depth = kwargs.get("depth", "basic")
-            limit = kwargs.get("limit", 20)
+            limit = min(int(kwargs.get("limit", 20)), _env_int("TAVILY_MAX_CRAWL_PAGES", 5))
 
             logger.info("Tavily crawl: %s (depth=%s, limit=%d)", url, depth, limit)
             payload: Dict[str, Any] = {
