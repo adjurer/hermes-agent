@@ -5972,6 +5972,8 @@ class GatewayRunner:
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
 
+        event = self._coerce_natural_model_switch_event(event)
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -9304,6 +9306,48 @@ class GatewayRunner:
             lines.append(t("gateway.model.session_only_hint"))
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _natural_model_switch_command(message: str) -> str:
+        text = str(message or "").strip()
+        if not text or text.startswith("/"):
+            return ""
+
+        lowered = text.lower()
+        normalized = re.sub(r"[\s._-]+", "", lowered)
+        normalized = re.sub(r"[.!?。！？,，~…]+$", "", normalized)
+
+        main_target = r"(?:gpt(?:55|5)?|codex|코덱스|기본모델|메인모델|주모델)"
+        switch_verb = r"(?:모델)?(?:전환|변경|바꿔|바꿔줘|스위칭|복귀|돌아와|돌아가|switch|change|use)"
+        polite_tail = r"(?:해줘|해|해주세요|줘|주세요)?"
+
+        main_patterns = (
+            rf"^(?:다시|기본|메인)?{main_target}(?:모델)?(?:로|으로)?{switch_verb}{polite_tail}$",
+            rf"^(?:다시|기본|메인)?{main_target}(?:모델)?(?:로|으로)?$",
+            rf"^모델(?:을|은)?{main_target}(?:로|으로)?{switch_verb}{polite_tail}$",
+            rf"^(?:완료후|끝나면|마치면)?(?:다시)?모델(?:을|은)?{main_target}(?:로|으로)?{switch_verb}{polite_tail}$",
+            rf"^(?:완료후|끝나면|마치면)?모델(?:을|은)?(?:다시)?{main_target}(?:로|으로)?{switch_verb}{polite_tail}$",
+            rf"^(?:완료후|끝나면|마치면)?(?:다시)?(?:기본모델|메인모델|주모델)(?:로|으로)?(?:복귀|돌아와|돌아가|전환|변경){polite_tail}$",
+        )
+        if any(re.match(pattern, normalized) for pattern in main_patterns):
+            return "/model gpt-5.5 --provider openai-codex"
+
+        return ""
+
+    def _coerce_natural_model_switch_event(self, event: MessageEvent) -> MessageEvent:
+        command_text = self._natural_model_switch_command(getattr(event, "text", ""))
+        if not command_text:
+            return event
+        logger.info(
+            "Coerced natural model switch text to command: %r -> %s",
+            getattr(event, "text", ""),
+            command_text,
+        )
+        return dataclasses.replace(
+            event,
+            text=command_text,
+            message_type=MessageType.COMMAND,
+        )
 
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
@@ -15352,7 +15396,7 @@ class GatewayRunner:
                         # whitelist and rationale.
                         entry = _build_replay_entry(role, content, msg)
                         agent_history.append(entry)
-            
+
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.

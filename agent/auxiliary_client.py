@@ -931,6 +931,34 @@ class AsyncCodexAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+class _AsyncSyncCompletionsAdapter:
+    """Async wrapper for sync OpenAI-compatible auxiliary clients."""
+
+    def __init__(self, sync_completions: Any):
+        self._sync = sync_completions
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncSyncChatShim:
+    def __init__(self, adapter: _AsyncSyncCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncSyncAuxiliaryClient:
+    """Async facade for sync clients that already expose chat.completions."""
+
+    def __init__(self, sync_client: Any):
+        self._real_client = sync_client
+        self.chat = _AsyncSyncChatShim(
+            _AsyncSyncCompletionsAdapter(sync_client.chat.completions)
+        )
+        self.api_key = getattr(sync_client, "api_key", "")
+        self.base_url = getattr(sync_client, "base_url", "")
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -2458,6 +2486,27 @@ def _try_payment_fallback(
                        "custom": "local/custom", "local/custom": "local/custom"}
     skip_chain_labels = {_alias_to_label.get(s, s) for s in skip_labels}
 
+    # The generic chain intentionally omits Codex because guessing a Codex
+    # model is brittle. If the user's main model is explicitly Codex, however,
+    # we already have the exact configured model and OAuth credentials. Use it
+    # as the safety net for soft auxiliary optimizations like Gemini OAuth.
+    if main_provider and _normalize_chain_label(main_provider) not in skip_chain_labels:
+        main_label = _normalize_chain_label(main_provider)
+        main_model = _read_main_model()
+        if (
+            main_label == "openai-codex"
+            and main_model
+            and not _is_provider_unhealthy(main_label)
+        ):
+            client, model = resolve_provider_client(main_provider, main_model)
+            if client is not None:
+                logger.info(
+                    "Auxiliary %s: %s on %s — falling back to main provider %s (%s)",
+                    task or "call", reason, failed_provider, main_label,
+                    model or main_model,
+                )
+                return client, model or main_model, main_label
+
     tried = []
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
@@ -2616,6 +2665,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 
         if isinstance(sync_client, GeminiNativeClient):
             return AsyncGeminiNativeClient(sync_client), model
+    except ImportError:
+        pass
+    try:
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        if isinstance(sync_client, GeminiCloudCodeClient):
+            return AsyncSyncAuxiliaryClient(sync_client), model
     except ImportError:
         pass
     try:
@@ -3201,6 +3257,30 @@ def resolve_provider_client(
             return resolve_provider_client("nous", model, async_mode)
         if provider == "openai-codex":
             return resolve_provider_client("openai-codex", model, async_mode)
+        if provider == "google-gemini-cli":
+            try:
+                from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+                from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials
+
+                creds = resolve_gemini_oauth_runtime_credentials()
+            except Exception as exc:
+                logger.warning(
+                    "resolve_provider_client: google-gemini-cli requested "
+                    "but Gemini OAuth credentials are unavailable: %s", exc
+                )
+                return None, None
+
+            final_model = _normalize_resolved_model(
+                model or "gemini-3-flash-preview", provider
+            )
+            client = GeminiCloudCodeClient(
+                api_key=str(creds.get("api_key", "")),
+                base_url=str(creds.get("base_url", "")) or "cloudcode-pa://google",
+                project_id=str(creds.get("project_id", "")),
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)
@@ -4397,7 +4477,17 @@ def call_llm(
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
-        is_auto = resolved_provider in {"auto", "", None}
+        # Gemini OAuth is useful as an auxiliary cost/speed backend, but the
+        # Code Assist endpoint can return short capacity throttles. Treat that
+        # explicit provider as soft for fallback purposes so side tasks do not
+        # break the resident agent when Gemini says to retry later.
+        is_auto = (
+            resolved_provider in {"auto", "", None}
+            or (
+                resolved_provider == "google-gemini-cli"
+                and _is_rate_limit_error(first_err)
+            )
+        )
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"
@@ -4726,7 +4816,16 @@ async def async_call_llm(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
         )
-        is_auto = resolved_provider in {"auto", "", None}
+        # Keep parity with the sync path: Gemini OAuth is an optimization, not
+        # a hard dependency for async side tasks, so capacity throttles may
+        # fall through to the regular auto provider chain.
+        is_auto = (
+            resolved_provider in {"auto", "", None}
+            or (
+                resolved_provider == "google-gemini-cli"
+                and _is_rate_limit_error(first_err)
+            )
+        )
         if should_fallback and is_auto:
             if _is_payment_error(first_err):
                 reason = "payment error"

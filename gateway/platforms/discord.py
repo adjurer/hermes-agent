@@ -1087,11 +1087,52 @@ class DiscordAdapter(BasePlatformAdapter):
         if interval > 0:
             await asyncio.sleep(interval)
 
+    async def _run_voice_auto_follow_initial_check(self) -> None:
+        """Join an already-occupied allowed VC after gateway restart.
+
+        on_voice_state_update only fires for changes that happen after the
+        Discord gateway is ready.  If the user joined while Hermes was
+        restarting, scan the current voice-channel member cache once and
+        trigger the same auto-follow path.
+        """
+        if not self._voice_auto_follow or not self._client:
+            return
+        try:
+            await asyncio.sleep(1.0)
+            for guild in list(getattr(self._client, "guilds", []) or []):
+                for channel in list(getattr(guild, "voice_channels", []) or []):
+                    if not self._is_voice_auto_follow_channel(channel):
+                        continue
+                    for member in list(getattr(channel, "members", []) or []):
+                        if not self._is_voice_auto_follow_user(member):
+                            continue
+                        logger.info(
+                            "Discord voice auto-follow initial check found %s (%s) in %s (%s)",
+                            getattr(member, "display_name", member.id),
+                            member.id,
+                            getattr(channel, "name", channel.id),
+                            channel.id,
+                        )
+                        empty_state = type("VoiceStateSnapshot", (), {"channel": None})()
+                        joined_state = type("VoiceStateSnapshot", (), {"channel": channel})()
+                        timeout = float(os.getenv("DISCORD_VOICE_AUTO_FOLLOW_INITIAL_TIMEOUT_SECONDS", "15"))
+                        await asyncio.wait_for(
+                            self._handle_voice_auto_follow(member, empty_state, joined_state),
+                            timeout=max(1.0, timeout),
+                        )
+                        return
+        except asyncio.TimeoutError:
+            logger.warning("Discord voice auto-follow initial check timed out")
+        except Exception as e:
+            logger.warning("Discord voice auto-follow initial check failed: %s", e, exc_info=True)
+
     async def _run_post_connect_initialization(self) -> None:
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
         try:
+            if self._voice_auto_follow:
+                asyncio.create_task(self._run_voice_auto_follow_initial_check())
             sync_policy = self._get_discord_command_sync_policy()
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
@@ -1921,7 +1962,11 @@ class DiscordAdapter(BasePlatformAdapter):
         if getattr(member, "bot", False):
             return False
         user_id = str(getattr(member, "id", ""))
-        follow_users = self._voice_auto_follow_user_ids or self._allowed_user_ids
+        # Treat the explicit auto-follow list as an addition to the normal
+        # Discord allow-list, not as a narrower replacement.  This keeps
+        # hands-free mode working when DISCORD_ALLOWED_USERS is updated but
+        # the optional auto-follow env var still contains an older ID.
+        follow_users = set(self._allowed_user_ids or set()) | set(self._voice_auto_follow_user_ids or set())
         if follow_users and user_id not in follow_users:
             return False
         guild = getattr(member, "guild", None)
