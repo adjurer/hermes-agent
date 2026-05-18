@@ -10285,7 +10285,11 @@ class GatewayRunner:
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
-            from gateway.platforms.base import filter_existing_media_files, should_send_media_as_audio
+            from gateway.platforms.base import (
+                media_delivery_warning,
+                partition_existing_media_files,
+                should_send_media_as_audio,
+            )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -10296,7 +10300,19 @@ class GatewayRunner:
             # send_document below — preserving original bytes.
             image_paths: list = []
             non_image_media: list = []
-            for media_path, is_voice in filter_existing_media_files(media_files, getattr(adapter, "name", "Platform")):
+            valid_media_files, skipped_media_files = partition_existing_media_files(
+                media_files, getattr(adapter, "name", "Platform")
+            )
+            if skipped_media_files:
+                try:
+                    await adapter.send(
+                        chat_id=event.source.chat_id,
+                        content=media_delivery_warning(skipped_media_files),
+                        metadata=_thread_meta,
+                    )
+                except Exception as e:
+                    logger.warning("[%s] Post-stream missing media warning failed: %s", adapter.name, e)
+            for media_path, is_voice in valid_media_files:
                 ext = Path(media_path).suffix.lower()
                 if (ext in _IMAGE_EXTS
                         and not is_voice

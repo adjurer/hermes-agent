@@ -17,7 +17,9 @@ import subprocess
 import sys
 import unicodedata
 import uuid
+import zipfile
 from abc import ABC, abstractmethod
+from typing import Tuple
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -33,6 +35,10 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 # delivered as a regular document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+_ZIP_DOCUMENT_EXTS = frozenset({'.docx', '.xlsx', '.pptx', '.hwpx', '.zip', '.epub', '.apk'})
+_TEXT_DOCUMENT_EXTS = frozenset({'.md', '.markdown', '.txt', '.csv'})
+_IMAGE_DOCUMENT_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+_OLE_DOCUMENT_EXTS = frozenset({'.hwp', '.doc', '.xls', '.ppt'})
 
 
 def _platform_name(platform) -> str:
@@ -110,9 +116,71 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
     return True
 
 
-def filter_existing_media_files(items, platform_name: str = "Platform"):
-    """Return only real MEDIA files, skipping placeholders and stale paths."""
+def validate_outbound_media_file(path: str) -> Tuple[bool, str]:
+    """Best-effort corruption check before handing a local file to a platform."""
+    ext = Path(path).suffix.lower()
+    try:
+        size = os.path.getsize(path)
+        if size <= 0:
+            return False, "empty file"
+
+        if ext in _ZIP_DOCUMENT_EXTS:
+            with zipfile.ZipFile(path) as zf:
+                bad_member = zf.testzip()
+            if bad_member:
+                return False, f"corrupt zip member: {bad_member}"
+            return True, ""
+
+        if ext == ".pdf":
+            with open(path, "rb") as f:
+                head = f.read(8)
+                f.seek(max(size - 2048, 0))
+                tail = f.read()
+            if not head.startswith(b"%PDF-"):
+                return False, "missing PDF header"
+            if b"%%EOF" not in tail:
+                return False, "missing PDF EOF marker"
+            return True, ""
+
+        if ext in _TEXT_DOCUMENT_EXTS:
+            with open(path, "rb") as f:
+                data = f.read()
+            data.decode("utf-8")
+            return True, ""
+
+        if ext in _IMAGE_DOCUMENT_EXTS:
+            with open(path, "rb") as f:
+                head = f.read(16)
+            if ext == ".png" and not head.startswith(b"\x89PNG\r\n\x1a\n"):
+                return False, "invalid PNG header"
+            if ext in {".jpg", ".jpeg"} and not head.startswith(b"\xff\xd8"):
+                return False, "invalid JPEG header"
+            if ext == ".gif" and not head.startswith((b"GIF87a", b"GIF89a")):
+                return False, "invalid GIF header"
+            if ext == ".webp" and not (head.startswith(b"RIFF") and head[8:12] == b"WEBP"):
+                return False, "invalid WebP header"
+            return True, ""
+
+        if ext in _OLE_DOCUMENT_EXTS:
+            with open(path, "rb") as f:
+                head = f.read(8)
+            if not head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+                return False, "invalid OLE document header"
+            return True, ""
+    except UnicodeDecodeError:
+        return False, "not UTF-8 text"
+    except zipfile.BadZipFile:
+        return False, "bad zip file"
+    except OSError as exc:
+        return False, str(exc)
+
+    return True, ""
+
+
+def partition_existing_media_files(items, platform_name: str = "Platform"):
+    """Split MEDIA files into deliverable paths and skipped invalid paths."""
     valid = []
+    skipped = []
     for media_path, is_voice in items:
         path_text = str(media_path).strip()
         expanded = os.path.expanduser(path_text)
@@ -124,12 +192,34 @@ def filter_existing_media_files(items, platform_name: str = "Platform"):
         )
         if looks_placeholder:
             logger.info("[%s] Skipping placeholder MEDIA path: %s", platform_name, path_text)
+            skipped.append(path_text)
             continue
         if not os.path.isfile(expanded):
             logger.info("[%s] Skipping missing MEDIA file: %s", platform_name, path_text)
+            skipped.append(path_text)
+            continue
+        is_valid, reason = validate_outbound_media_file(expanded)
+        if not is_valid:
+            logger.info("[%s] Skipping invalid MEDIA file: %s (%s)", platform_name, path_text, reason)
+            skipped.append(f"{path_text} ({reason})")
             continue
         valid.append((expanded, is_voice))
+    return valid, skipped
+
+
+def filter_existing_media_files(items, platform_name: str = "Platform"):
+    """Return only real MEDIA files, skipping placeholders and stale paths."""
+    valid, _ = partition_existing_media_files(items, platform_name)
     return valid
+
+
+def media_delivery_warning(skipped_paths, *, limit: int = 3) -> str:
+    """Return a short user-facing warning for MEDIA paths that could not be sent."""
+    if not skipped_paths:
+        return ""
+    shown = ", ".join(str(p) for p in skipped_paths[:limit])
+    more = "" if len(skipped_paths) <= limit else f" 외 {len(skipped_paths) - limit}개"
+    return f"파일 첨부 일부는 실제 파일이 없거나 열 수 없어 전송하지 않았습니다: {shown}{more}"
 
 
 def utf16_len(s: str) -> int:
@@ -915,6 +1005,20 @@ def normalize_document_filename(filename: str | os.PathLike | None, fallback: st
     return safe_name
 
 
+def ensure_outbound_document_filename_policy(filename: str, today: str | None = None) -> str:
+    """Apply user-visible outbound naming rules to generated attachments."""
+    safe_name = normalize_document_filename(filename)
+    stem = Path(safe_name).stem
+    if re.match(r"^\d{6}(?:[_-]|$)", stem):
+        return safe_name
+    if today is None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
+    return f"{today}_{safe_name}"
+
+
 def is_text_document_path(path_or_name: str | os.PathLike | None) -> bool:
     """Return True for document extensions that are safe to decode/re-encode."""
     return Path(str(path_or_name or "")).suffix.lower() in TEXT_DOCUMENT_EXTS
@@ -942,7 +1046,9 @@ def prepare_outbound_document_for_send(
     the document cache as UTF-8 with BOM so Korean content opens consistently in
     clients that otherwise guess legacy encodings.
     """
-    display_name = normalize_document_filename(file_name or os.path.basename(str(file_path)))
+    display_name = ensure_outbound_document_filename_policy(
+        normalize_document_filename(file_name or os.path.basename(str(file_path)))
+    )
     source_path = Path(file_path)
     ext = Path(display_name).suffix.lower() or source_path.suffix.lower()
     if ext not in OUTBOUND_TEXT_NORMALIZE_EXTS:
@@ -3238,6 +3344,11 @@ class BasePlatformAdapter(ABC):
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
                 
+                valid_media_files, skipped_media_files = partition_existing_media_files(media_files, self.name)
+                if skipped_media_files:
+                    warning = media_delivery_warning(skipped_media_files)
+                    text_content = f"{text_content}\n\n{warning}".strip() if text_content else warning
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -3345,7 +3456,7 @@ class BasePlatformAdapter(ABC):
                 from urllib.parse import quote as _quote
                 _image_paths: list = []
                 _non_image_media: list = []
-                for media_path, is_voice in filter_existing_media_files(media_files, self.name):
+                for media_path, is_voice in valid_media_files:
                     _ext = Path(media_path).suffix.lower()
                     if (_ext in _IMAGE_EXTS
                             and not is_voice

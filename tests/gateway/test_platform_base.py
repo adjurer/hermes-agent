@@ -7,13 +7,17 @@ import pytest
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    ensure_outbound_document_filename_policy,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
     SUPPORTED_DOCUMENT_TYPES,
     filter_existing_media_files,
+    media_delivery_warning,
+    partition_existing_media_files,
     safe_url_for_log,
     utf16_len,
+    validate_outbound_media_file,
     _prefix_within_utf16_limit,
 )
 
@@ -402,6 +406,58 @@ class TestFilterExistingMediaFiles:
         )
 
         assert filtered == [(str(real), True)]
+
+    def test_partition_reports_skipped_media_paths(self, tmp_path):
+        real = tmp_path / "report.pdf"
+        real.write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n")
+
+        valid, skipped = partition_existing_media_files(
+            [
+                (str(real), False),
+                ("/absolute/path.png", False),
+                ("/tmp/missing-file.ogg", True),
+            ],
+            "Test",
+        )
+
+        assert valid == [(str(real), False)]
+        assert skipped == ["/absolute/path.png", "/tmp/missing-file.ogg"]
+
+    def test_media_delivery_warning_is_user_facing(self):
+        warning = media_delivery_warning(["/absolute/path.png", "/tmp/missing.pdf"])
+
+        assert "실제 파일이 없거나 열 수 없어 전송하지 않았습니다" in warning
+        assert "/absolute/path.png" in warning
+
+    def test_rejects_corrupt_zip_document(self, tmp_path):
+        broken = tmp_path / "보고서.docx"
+        broken.write_bytes(b"not a zip")
+
+        valid, reason = validate_outbound_media_file(str(broken))
+
+        assert valid is False
+        assert "zip" in reason
+
+    def test_rejects_non_utf8_markdown(self, tmp_path):
+        broken = tmp_path / "초안.md"
+        broken.write_bytes("깨진 초안".encode("cp949"))
+
+        valid, reason = validate_outbound_media_file(str(broken))
+
+        assert valid is False
+        assert "UTF-8" in reason
+
+    def test_outbound_document_filename_gets_date_prefix(self):
+        assert (
+            ensure_outbound_document_filename_policy("경기도 후보자 초안.md", today="260518")
+            == "260518_경기도 후보자 초안.md"
+        )
+
+    def test_outbound_document_filename_keeps_existing_date_prefix(self):
+        assert (
+            ensure_outbound_document_filename_policy("260518_경기도 후보자 초안.md", today="260519")
+            == "260518_경기도 후보자 초안.md"
+        )
 
 
 # ---------------------------------------------------------------------------
