@@ -125,6 +125,10 @@ Jobs with a `workdir` run sequentially on the scheduler tick, not in the paralle
 
 You do not need to delete and recreate jobs just to change them.
 
+:::tip Job reference
+The `<job_id>` placeholder below (and in [Lifecycle actions](#lifecycle-actions)) also accepts the job's name (case-insensitive) — handy when you remember `morning-digest` but not the hex ID. An exact job ID takes precedence over name matches; if the reference is not an ID and a name matches more than one job, the command refuses and prints the candidate IDs so you can disambiguate.
+:::
+
 ### Chat
 
 ```bash
@@ -253,6 +257,17 @@ The agent's final response is automatically delivered. You do not need to call `
 Semantics: `all` expands to every platform with a configured home channel. Zero is fine; the job simply produces no delivery targets and is recorded as a delivery failure upstream.
 
 `all` composes with explicit targets. `origin,all` delivers to the origin chat *plus* every other connected home channel, de-duplicating by `(platform, chat_id, thread_id)`.
+
+### Telegram cron topic (`TELEGRAM_CRON_THREAD_ID`)
+
+When Telegram topic mode is enabled, the root DM is reserved as a system lobby — replies sent there are rebuffed with a lobby reminder and `reply_to_message_id` is dropped, so you cannot reply to a cron message that landed in the main chat.
+
+Point cron at a dedicated forum topic instead:
+
+1. In Telegram, open the bot DM and create a topic named e.g. `Cron`. Long-press the topic header → **Copy link**; the trailing integer is the topic's `message_thread_id`.
+2. Set `TELEGRAM_CRON_THREAD_ID=<that id>` in your `.env`.
+
+This applies only to cron deliveries. `TELEGRAM_HOME_CHANNEL_THREAD_ID` (used elsewhere, e.g. restart notifications) is unchanged. Explicit `deliver="telegram:chat_id:thread_id"` targets continue to win over the env var. Replies to cron messages now arrive in the existing topic session, so you can act on them directly.
 
 ### Response wrapping
 

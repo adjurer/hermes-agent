@@ -98,7 +98,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 
 | Command | Description |
 |---------|-------------|
-| `/quit` | Exit the CLI (also: `/exit`). |
+| `/quit` | Exit the CLI (also: `/exit`). See note on `/q` under `/queue` above. Pass `--delete` (or `-d`) — e.g. `/exit --delete` — to also permanently remove the current session's SQLite history and on-disk transcripts before exiting. Useful for privacy-sensitive or one-off tasks. |
 
 ### Dynamic CLI slash commands
 
@@ -125,6 +125,11 @@ quick_commands:
 ```
 
 Then type `/status`, `/deploy`, or `/inbox` in the CLI or a messaging platform. Quick commands are resolved at dispatch time and may not appear in every built-in autocomplete/help table.
+
+For specialist Telegram bots, set `telegram.command_menu: quick_commands_only`
+to make Telegram's native slash menu show only profile-defined quick commands.
+Set `show_in_telegram_menu: false` on a quick command to keep it callable but
+hide it from the Telegram menu.
 
 String-only prompt shortcuts are not supported as quick commands. Put longer reusable prompts in a skill, or use `type: alias` to point at an existing slash command.
 

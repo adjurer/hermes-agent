@@ -256,6 +256,16 @@ TELEGRAM_HOME_CHANNEL_NAME="My Notes"
 Group chat IDs are negative numbers (e.g., `-1001234567890`). Your personal DM chat ID is the same as your user ID.
 :::
 
+### Cron deliveries in topic mode
+
+If you have topic mode enabled in your bot DM, cron messages delivered to the root chat land in the system-only lobby — replying there opens no session and you see the "main chat is reserved for system commands" notice. Create a dedicated forum topic (e.g. `Cron`) and set:
+
+```bash
+TELEGRAM_CRON_THREAD_ID=<topic_thread_id>
+```
+
+`TELEGRAM_CRON_THREAD_ID` overrides `TELEGRAM_HOME_CHANNEL_THREAD_ID` for cron deliveries only. Replies in that topic continue the topic's existing session.
+
 ## Voice Messages
 
 ### Incoming Voice (Speech-to-Text)
@@ -297,8 +307,42 @@ Hermes Agent works in Telegram group chats with a few considerations:
   - `@botusername` mentions
   - `/command@botusername` (Telegram's bot-menu command form that includes the bot name)
   - matches for one of your configured regex wake words in `telegram.mention_patterns`
+- In groups with multiple Hermes bots, `telegram.exclusive_bot_mentions` keeps routing deterministic. When a message explicitly mentions one or more Telegram bot usernames, only the mentioned bot profiles process it; other Hermes bots ignore it before reply and wake-word fallbacks run. This is enabled by default.
 - Use `telegram.ignored_threads` to keep Hermes silent in specific Telegram forum topics, even when the group would otherwise allow free responses or mention-triggered replies
 - If `telegram.require_mention` is left unset or false, Hermes keeps the previous open-group behavior and responds to normal group messages it can see
+
+### Multiple Hermes bots in one group
+
+If you run several Hermes profiles in the same Telegram group, create one Telegram bot token per profile and start one gateway per profile. Do not reuse the same bot token in multiple running gateways; Telegram will reject concurrent polling for the same token.
+
+Recommended group config:
+
+```yaml
+telegram:
+  require_mention: true
+  exclusive_bot_mentions: true
+  mention_patterns: []
+```
+
+With this setup, a group message like `@research_bot @ops_bot summarize this` is processed by `research_bot` and `ops_bot` only. Other Hermes bots in the group stay silent, even if the message is a reply to one of their earlier messages or would otherwise match a shared wake word.
+
+Set `exclusive_bot_mentions: false` only for legacy groups where explicit mentions should not override reply and wake-word triggers.
+
+To operate several profiles, run the gateway command once per profile. For example:
+
+```bash
+# default profile
+hermes gateway start
+hermes gateway status
+hermes gateway stop
+
+# named profiles
+hermes -p research gateway start
+hermes -p research gateway status
+hermes -p research gateway stop
+```
+
+For a small fixed fleet, use a shell loop or script that calls `hermes gateway <action>` for the default profile and `hermes -p <profile> gateway <action>` for each named profile. This is more reliable than assuming a single process-level command controls every named profile on every service manager.
 
 ### Troubleshooting: works in DMs but not groups
 
@@ -317,6 +361,9 @@ gates in order:
 4. **Mention filters:** if `telegram.require_mention: true` is set, normal
    group chatter is ignored unless the message is a slash command, reply to the
    bot, `@botusername` mention, or configured `mention_patterns` match.
+5. **Multi-bot routing:** if a group contains several bots, make sure each
+   Hermes profile uses a unique bot token and keep `exclusive_bot_mentions`
+   enabled unless you intentionally want legacy shared-trigger behavior.
 
 Negative chat IDs are normal for Telegram groups and supergroups. If you use
 chat-scoped authorization, put those IDs in `TELEGRAM_GROUP_ALLOWED_CHATS`, not
@@ -329,6 +376,7 @@ Add this to `~/.hermes/config.yaml`:
 ```yaml
 telegram:
   require_mention: true
+  exclusive_bot_mentions: true
   mention_patterns:
     - "^\\s*chompy\\b"
   ignored_threads:
@@ -408,6 +456,28 @@ platforms:
 3. Each topic maps to an isolated session key: `agent:main:telegram:dm:{chat_id}:{thread_id}`
 4. Messages in each topic have their own conversation history, memory flush, and context window
 
+### Root DM handling
+
+By default, messages sent to the root DM (outside any topic) are processed
+normally. Set `ignore_root_dm: true` to turn the root DM into a lobby — normal
+messages are silently ignored for users who have DM topics configured, while
+system commands (`/start`, `/help`, `/status`, etc.) still work.
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      ignore_root_dm: true
+      dm_topics:
+        - chat_id: 123456789
+          topics:
+            - name: General
+```
+
+The check is **per-chat**: only users with at least one entry in `dm_topics`
+will have their root DM affected. Users without configured topics are
+unaffected.
+
 ### Skill binding
 
 Topics with a `skill` field automatically load that skill when a new session starts in the topic. This works exactly like typing `/skill-name` at the start of a conversation — the skill content is injected into the first message, and subsequent messages see it in the conversation history.
@@ -442,7 +512,7 @@ Only authorized users (allowlist via `TELEGRAM_ALLOWED_USERS` / platform auth co
 | Who activates it | Operator, in `config.yaml` | End user, by sending `/topic` |
 | Topic list | Fixed set declared in config | User creates/deletes topics freely |
 | Topic names | Chosen by operator | Chosen by user; auto-renamed to match Hermes session title |
-| Root DM behavior | Unchanged — normal chat | Becomes a system lobby (non-command messages are rejected) |
+| Root DM behavior | Normal chat (lobby if `ignore_root_dm: true`) | Becomes a system lobby (non-command messages are rejected) |
 | Primary use case | Permanent workspaces with optional skill binding | Ad-hoc parallel sessions |
 | Persistence | `extra.dm_topics` in config | `telegram_dm_topic_mode` + `telegram_dm_topic_bindings` SQLite tables |
 
@@ -487,6 +557,18 @@ Every topic gets its own conversation history, model state, tool execution, and 
 
 When Hermes generates a session title for a topic (via the auto-title pipeline, after the first exchange), the Telegram topic itself is renamed to match — e.g. "New Topic" becomes "Database migration plan". The rename is best-effort: failures are logged but don't break the session.
 
+To disable this and keep your manually-chosen topic names untouched, set:
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        disable_topic_auto_rename: true
+```
+
+When this flag is on, Hermes still generates an internal session title (used by `hermes sessions`, the TUI, etc.) but never edits the Telegram topic name. Useful when you organise topics by hand under BotFather Threaded Mode and don't want every first reply to overwrite the title.
+
 ### `/new` inside a topic
 
 Resets the current topic's session (new session ID, fresh history) without touching other topics. Hermes replies with a reminder that for parallel work, creating another topic (via **All Messages**) is usually what you want.
@@ -520,6 +602,7 @@ Shows the current topic's binding: session title, session ID, and hints for `/ne
 - Each inbound DM message looks up its `(chat_id, thread_id)` binding. If present, the lookup routes the message to the bound session via `SessionStore.switch_session()` so the session-key-to-session-id mapping stays consistent on disk
 - `/new` inside a topic rewrites the binding row to point at the new session ID, so the next message stays on the fresh session
 - Topics declared in `extra.dm_topics` are **never auto-renamed** — the operator-chosen name is preserved even when multi-session mode is enabled
+- Set `extra.disable_topic_auto_rename: true` to turn off auto-rename for **all** topics in the chat (ad-hoc topics created via Threaded Mode included)
 - The General (pinned top) topic in a forum-enabled DM is treated as the root lobby, regardless of whether Telegram delivers its messages with `message_thread_id=1` or with no thread_id
 - Root-lobby reminders are rate-limited to one message per 30 seconds per chat — a user who forgets topic mode is on and types ten prompts in the root won't get ten replies
 - BotFather setup screenshots are rate-limited to one send per 5 minutes per chat — repeated `/topic` attempts while Threads Settings are still disabled won't re-upload the same image
@@ -611,7 +694,7 @@ To find a topic's `thread_id`, open the topic in Telegram Web or Desktop and loo
 
 - **Bot API 9.4 (Feb 2026):** Private Chat Topics — bots can create forum topics in 1-on-1 DM chats via `createForumTopic`. Hermes uses this for two distinct features: operator-curated [Private Chat Topics](#private-chat-topics-bot-api-94) (config-driven, fixed topic list) and user-driven [Multi-session DM mode](#multi-session-dm-mode-topic) (activated by `/topic`, unlimited user-created topics).
 - **Privacy policy:** Telegram now requires bots to have a privacy policy. Set one via BotFather with `/setprivacy_policy`, or Telegram may auto-generate a placeholder. This is particularly important if your bot is public-facing.
-- **Bot API 9.5 (Mar 2026): Native streaming via `sendMessageDraft`.** Hermes uses Telegram's native streaming-draft API to render an animated preview of the agent's reply as tokens arrive in private chats. Drops the per-edit jitter you used to see with the legacy `editMessageText` polling path on slow models.
+- **Bot API 9.5 (Mar 2026): Native streaming via `sendMessageDraft`.** Hermes supports Telegram's native streaming-draft API as an opt-in transport for private chats. The default remains the legacy `editMessageText` path because draft previews can visibly collapse and re-render on some Telegram clients.
 
 ### Streaming transport (`gateway.streaming.transport`)
 
@@ -619,9 +702,9 @@ When streaming is enabled (`gateway.streaming.enabled: true`), Hermes picks one 
 
 | Value | Behaviour |
 |---|---|
-| `auto` (default) | Native draft streaming on supported chats (currently Telegram DMs); legacy edit-based path otherwise. Falls back gracefully if a draft frame fails. |
+| `auto` | Native draft streaming on supported chats (currently Telegram DMs); legacy edit-based path otherwise. Falls back gracefully if a draft frame fails. |
 | `draft` | Force native drafts. Logs a downgrade and falls back to edit if the chat doesn't support drafts (e.g. groups/topics). |
-| `edit` | Legacy progressive `editMessageText` polling for every chat type. |
+| `edit` (default) | Legacy progressive `editMessageText` polling for every chat type. |
 | `off` | Disable streaming entirely (final reply only, no progressive updates). |
 
 In `~/.hermes/config.yaml`:
@@ -630,10 +713,12 @@ In `~/.hermes/config.yaml`:
 gateway:
   streaming:
     enabled: true
-    transport: auto    # auto | draft | edit | off
+    transport: edit    # edit | auto | draft | off
 ```
 
-**What you'll see in DMs with `auto` (default)** — when the agent generates a reply, Telegram shows an animated draft preview that updates token-by-token. When the reply finishes, it's delivered as a regular message and the draft preview clears naturally on the client. Drafts have no message id, so the final answer is what stays in your chat history.
+**What you'll see in DMs with `edit` (default)** — the gateway sends a normal preview message and progressively updates it via `editMessageText`, avoiding Telegram's draft-preview collapse/rollback effect.
+
+**What you'll see in DMs with `auto` or `draft`** — Telegram shows an animated draft preview that updates token-by-token. When the reply finishes, it's delivered as a regular message and the draft preview clears naturally on the client. Drafts have no message id, so the final answer is what stays in your chat history.
 
 **What about groups, supergroups, forum topics?** Telegram restricts `sendMessageDraft` to private chats (DMs). The gateway transparently falls back to the edit-based path for everything else — same UX as before.
 

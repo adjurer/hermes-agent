@@ -586,6 +586,8 @@ export interface Translations {
     createTask: string;
     noTasks: string;
     unassigned: string;
+    needsAssignee?: string;
+    needsAssigneeHint?: string;
     untitled: string;
     loadingDetail: string;
     addComment: string;
@@ -682,6 +684,7 @@ export interface Translations {
     confirmDone: string;
     confirmArchive: string;
     confirmBlocked: string;
+    confirmScheduled?: string;
     completionSummary: string;
     completionSummaryRequired: string;
     triagePlaceholder: string;

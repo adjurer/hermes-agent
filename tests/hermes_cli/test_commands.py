@@ -26,6 +26,7 @@ from hermes_cli.commands import (
     slack_subcommand_map,
     telegram_bot_commands,
     telegram_menu_commands,
+    telegram_quick_menu_commands,
 )
 
 
@@ -107,6 +108,7 @@ class TestResolveCommand:
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
+        assert resolve_command("codex_runtime").name == "codex-runtime"
         assert resolve_command("tasks").name == "agents"
 
     def test_topic_is_gateway_command(self):
@@ -250,6 +252,12 @@ class TestTelegramBotCommands:
         assert "background" in names
         assert "queue" in names
         assert "steer" in names
+
+    def test_hyphenated_codex_runtime_is_exposed_as_underscore_command(self):
+        """Telegram autocomplete exposes /codex-runtime as /codex_runtime."""
+        names = {name for name, _ in telegram_bot_commands()}
+        assert "codex_runtime" in names
+        assert "codex-runtime" not in names
 
 
 class TestSlackSubcommandMap:
@@ -1145,6 +1153,47 @@ class TestTelegramMenuCommands:
         assert "valid_skill" in menu_names
         # No empty string in menu names
         assert "" not in menu_names
+
+    def test_quick_menu_commands_include_profile_quick_commands_only(self):
+        menu, hidden = telegram_quick_menu_commands(
+            {
+                "agent-health": {
+                    "type": "exec",
+                    "command": "echo ok",
+                    "description": "Show agent health",
+                },
+                "hidden": {
+                    "type": "exec",
+                    "command": "echo hidden",
+                    "description": "Hidden command",
+                    "show_in_telegram_menu": False,
+                },
+            }
+        )
+
+        assert hidden == 0
+        assert menu == [("agent_health", "Show agent health")]
+
+    def test_quick_menu_commands_sanitize_dedupe_and_trim_descriptions(self):
+        menu, hidden = telegram_quick_menu_commands(
+            {
+                "agent-health": {
+                    "description": "A" * 80,
+                },
+                "agent_health": {
+                    "description": "Duplicate after sanitization",
+                },
+                "+++": {
+                    "description": "Sanitizes to empty",
+                },
+            },
+            max_commands=1,
+        )
+
+        assert hidden == 0
+        assert len(menu) == 1
+        assert menu[0][0] == "agent_health"
+        assert menu[0][1] == ("A" * 37) + "..."
 
 
 # ---------------------------------------------------------------------------
