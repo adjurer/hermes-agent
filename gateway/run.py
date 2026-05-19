@@ -8737,12 +8737,12 @@ class GatewayRunner:
             agent_lines.append(f"- {label} · {state} · {format_uptime_short(elapsed)}{suffix}")
 
         if agent_lines:
-            lines.append("재시작 직전 하고 있던 대화 업무:")
+            lines.append("하고 있던 대화/업무:")
             lines.extend(agent_lines)
             if len(running_agents) > len(agent_lines):
                 lines.append(f"- 외 {len(running_agents) - len(agent_lines)}개")
         else:
-            lines.append("재시작 직전 하고 있던 대화 업무: 없음")
+            lines.append("하고 있던 대화/업무: 없음")
 
         process_lines: list[str] = []
         if process_registry is not None:
@@ -13183,7 +13183,7 @@ class GatewayRunner:
 
             metadata = {"thread_id": thread_id} if thread_id else None
             summary = str(data.get("summary") or "").strip()
-            message = "♻️ 게이트웨이가 재시작되었습니다. 에르메스가 다시 깨어났고, 세션은 이어서 사용할 수 있습니다."
+            message = "게이트웨이가 재시작되었습니다."
             if summary:
                 message = f"{message}\n\n{summary}"
             result = await adapter.send(
@@ -13229,7 +13229,7 @@ class GatewayRunner:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ 게이트웨이가 재시작되었습니다. 에르메스가 다시 깨어났고, 대기 상태입니다."
+        message = "게이트웨이가 재시작되었습니다."
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
