@@ -8697,6 +8697,101 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    def _build_restart_wake_summary(self, reason: str = "") -> str:
+        """Snapshot useful pre-restart work state for the post-restart wake notice."""
+        try:
+            from tools.process_registry import format_uptime_short, process_registry
+        except Exception:
+            process_registry = None
+
+            def format_uptime_short(seconds: int) -> str:
+                return f"{int(seconds)}s"
+
+        now = time.time()
+        lines: list[str] = []
+        if reason:
+            lines.append(f"재시작 사유: {reason}")
+
+        running_agents: dict = getattr(self, "_running_agents", {}) or {}
+        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
+        agent_lines: list[str] = []
+        for session_key, agent in sorted(
+            running_agents.items(),
+            key=lambda item: running_started.get(item[0], now),
+        )[:5]:
+            elapsed = max(0, int(now - float(running_started.get(session_key, now))))
+            is_pending = agent is _AGENT_PENDING_SENTINEL
+            model = "" if is_pending else str(getattr(agent, "model", "") or "")
+            title = ""
+            try:
+                if getattr(self, "session_store", None) is not None:
+                    self.session_store._ensure_loaded()  # noqa: SLF001
+                    entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                    if entry and getattr(entry, "session_id", None) and getattr(self, "_session_db", None):
+                        title = self._session_db.get_session_title(entry.session_id) or ""
+            except Exception:
+                title = ""
+            label = title or session_key
+            state = "시작 중" if is_pending else "실행 중"
+            suffix = f" · {model}" if model else ""
+            agent_lines.append(f"- {label} · {state} · {format_uptime_short(elapsed)}{suffix}")
+
+        if agent_lines:
+            lines.append("재시작 직전 하고 있던 대화 업무:")
+            lines.extend(agent_lines)
+            if len(running_agents) > len(agent_lines):
+                lines.append(f"- 외 {len(running_agents) - len(agent_lines)}개")
+        else:
+            lines.append("재시작 직전 하고 있던 대화 업무: 없음")
+
+        process_lines: list[str] = []
+        if process_registry is not None:
+            try:
+                running_processes = [
+                    p for p in process_registry.list_sessions()
+                    if p.get("status") == "running"
+                ]
+            except Exception:
+                running_processes = []
+            for proc in running_processes[:5]:
+                cmd = " ".join(str(proc.get("command", "")).split())
+                if len(cmd) > 80:
+                    cmd = cmd[:77] + "..."
+                uptime = format_uptime_short(int(proc.get("uptime_seconds", 0) or 0))
+                process_lines.append(f"- {proc.get('session_id', '?')} · {uptime} · {cmd}")
+            if len(running_processes) > len(process_lines):
+                process_lines.append(f"- 외 {len(running_processes) - len(process_lines)}개")
+
+        background_tasks = [
+            task for task in (getattr(self, "_background_tasks", set()) or set())
+            if hasattr(task, "done") and not task.done()
+        ]
+        if process_lines or background_tasks:
+            lines.append("백그라운드에서 진행 중인 업무:")
+            lines.extend(process_lines)
+            if background_tasks:
+                lines.append(f"- gateway 내부 비동기 작업 {len(background_tasks)}개")
+        else:
+            lines.append("백그라운드에서 진행 중인 업무: 없음")
+
+        try:
+            from cron.jobs import list_jobs
+
+            cron_jobs = list_jobs(include_disabled=False)
+        except Exception:
+            cron_jobs = []
+        if cron_jobs:
+            names = [
+                str(job.get("name") or job.get("id") or "예약 작업")
+                for job in cron_jobs[:5]
+            ]
+            suffix = f" 외 {len(cron_jobs) - len(names)}개" if len(cron_jobs) > len(names) else ""
+            lines.append("상주 예약 업무: " + ", ".join(names) + suffix)
+        else:
+            lines.append("상주 예약 업무: 없음")
+
+        return "\n".join(lines)
+
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stop command - interrupt a running agent.
 
@@ -8770,6 +8865,7 @@ class GatewayRunner:
             notify_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
                 "chat_id": event.source.chat_id,
+                "summary": self._build_restart_wake_summary("수동 /restart 요청"),
             }
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
@@ -13086,9 +13182,13 @@ class GatewayRunner:
                 return None
 
             metadata = {"thread_id": thread_id} if thread_id else None
+            summary = str(data.get("summary") or "").strip()
+            message = "♻️ 게이트웨이가 재시작되었습니다. 에르메스가 다시 깨어났고, 세션은 이어서 사용할 수 있습니다."
+            if summary:
+                message = f"{message}\n\n{summary}"
             result = await adapter.send(
                 str(chat_id),
-                "♻️ 게이트웨이가 재시작되었습니다. 에르메스가 다시 깨어났고, 세션은 이어서 사용할 수 있습니다.",
+                message,
                 metadata=metadata,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
