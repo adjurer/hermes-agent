@@ -3516,13 +3516,29 @@ class GatewayRunner:
         # This prevents unwanted auto-resets after `hermes update`,
         # `hermes gateway restart`, or `/restart`.
         _clean_marker = _hermes_home / ".clean_shutdown"
+        _unexpected_restart_recovery_summary = ""
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
             try:
                 _clean_marker.unlink()
             except Exception:
                 pass
+            try:
+                # A clean shutdown means there should be no abandoned in-flight
+                # work. Clear any stale durable ledger rows left by a prior
+                # crash or manual file edit so they cannot replay later.
+                self._write_active_work_ledger({"version": 1, "items": {}})
+            except Exception:
+                pass
         else:
+            try:
+                recovered_rows = self._mark_ledger_work_resume_pending("restart_interrupted")
+                if recovered_rows:
+                    _unexpected_restart_recovery_summary = (
+                        self._build_unexpected_restart_recovery_summary(recovered_rows)
+                    )
+            except Exception as e:
+                logger.warning("Active-work ledger recovery failed: %s", e)
             try:
                 suspended = self.session_store.suspend_recently_active()
                 if suspended:
@@ -3760,6 +3776,10 @@ class GatewayRunner:
             )
             await self._send_home_channel_startup_notifications(
                 skip_targets=skip_home_targets,
+            )
+        elif _unexpected_restart_recovery_summary:
+            await self._send_home_channel_startup_notifications(
+                summary=_unexpected_restart_recovery_summary,
             )
 
         # Automatically continue fresh sessions that were interrupted by the
@@ -7133,6 +7153,13 @@ class GatewayRunner:
             self._set_session_reasoning_override(session_key, None)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
+
+        self._record_active_work_ledger_entry(
+            session_key=session_key,
+            session_id=session_entry.session_id,
+            source=source,
+            message=event.text or "",
+        )
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -8740,6 +8767,7 @@ class GatewayRunner:
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
         agent_lines: list[str] = []
+        ledger_rows = list((self._load_active_work_ledger().get("items") or {}).values())
         for session_key, agent in sorted(
             running_agents.items(),
             key=lambda item: running_started.get(item[0], now),
@@ -8766,6 +8794,12 @@ class GatewayRunner:
             lines.extend(f"   {line}" for line in agent_lines)
             if len(running_agents) > len(agent_lines):
                 lines.append(f"   - 외 {len(running_agents) - len(agent_lines)}개")
+            if ledger_rows:
+                lines.append("   - 재시작 후 자동 재개 장부에 기록됨")
+        elif ledger_rows:
+            lines.append("• 진행중인 대화/업무:")
+            lines.extend(f"   {line}" for line in self._format_active_work_rows(ledger_rows))
+            lines.append("   - 재시작 후 자동 재개 장부에 기록됨")
         else:
             lines.append("• 진행중인 대화/업무: 없음")
         lines.append("")
@@ -8820,6 +8854,128 @@ class GatewayRunner:
         else:
             lines.append("• 예약 업무: 없음")
 
+        return "\n".join(lines)
+
+    def _active_work_ledger_path(self) -> Path:
+        return _hermes_home / ".active_work.json"
+
+    def _load_active_work_ledger(self) -> dict[str, Any]:
+        path = self._active_work_ledger_path()
+        if not path.exists():
+            return {"version": 1, "items": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"version": 1, "items": {}}
+            items = data.get("items")
+            if not isinstance(items, dict):
+                data["items"] = {}
+            return data
+        except Exception as exc:
+            logger.debug("Failed to read active-work ledger: %s", exc)
+            return {"version": 1, "items": {}}
+
+    def _write_active_work_ledger(self, data: dict[str, Any]) -> None:
+        try:
+            atomic_json_write(self._active_work_ledger_path(), data, indent=None)
+        except Exception as exc:
+            logger.debug("Failed to write active-work ledger: %s", exc)
+
+    def _record_active_work_ledger_entry(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        source: SessionSource,
+        message: str,
+    ) -> None:
+        if not session_key:
+            return
+        now_iso = datetime.now().isoformat()
+        preview = " ".join(str(message or "").split())
+        if len(preview) > 180:
+            preview = preview[:177].rstrip() + "..."
+        data = self._load_active_work_ledger()
+        items = data.setdefault("items", {})
+        items[session_key] = {
+            "session_key": session_key,
+            "session_id": session_id,
+            "platform": source.platform.value if source.platform else "",
+            "chat_id": source.chat_id,
+            "thread_id": source.thread_id,
+            "chat_type": source.chat_type,
+            "user_id": source.user_id,
+            "user_name": source.user_name,
+            "chat_name": source.chat_name,
+            "message_preview": preview or "(첨부/시스템 이벤트)",
+            "started_at": items.get(session_key, {}).get("started_at") or now_iso,
+            "updated_at": now_iso,
+        }
+        self._write_active_work_ledger(data)
+
+    def _clear_active_work_ledger_entry(self, session_key: str) -> None:
+        if not session_key:
+            return
+        data = self._load_active_work_ledger()
+        items = data.get("items")
+        if not isinstance(items, dict) or session_key not in items:
+            return
+        items.pop(session_key, None)
+        self._write_active_work_ledger(data)
+
+    def _format_active_work_rows(self, rows: list[dict[str, Any]], *, limit: int = 5) -> list[str]:
+        formatted: list[str] = []
+        for row in rows[:limit]:
+            platform = str(row.get("platform") or "?")
+            chat = str(row.get("chat_name") or row.get("chat_id") or "?")
+            preview = str(row.get("message_preview") or "진행 중 업무")
+            if len(preview) > 90:
+                preview = preview[:87].rstrip() + "..."
+            formatted.append(f"- {platform}:{chat} · {preview}")
+        if len(rows) > limit:
+            formatted.append(f"- 외 {len(rows) - limit}개")
+        return formatted
+
+    def _mark_ledger_work_resume_pending(self, reason: str) -> list[dict[str, Any]]:
+        data = self._load_active_work_ledger()
+        items = data.get("items") if isinstance(data, dict) else {}
+        if not isinstance(items, dict) or not items:
+            return []
+
+        recovered: list[dict[str, Any]] = []
+        for session_key, row in list(items.items()):
+            if not isinstance(row, dict):
+                continue
+            try:
+                marked = self.session_store.mark_resume_pending(session_key, reason)
+            except Exception as exc:
+                logger.debug("Failed to mark ledger session resume_pending for %s: %s", session_key, exc)
+                marked = False
+            if marked:
+                recovered.append(row)
+
+        if recovered:
+            logger.warning(
+                "Recovered %d active-work ledger entrie(s) as resume_pending after gateway restart",
+                len(recovered),
+            )
+        return recovered
+
+    def _build_unexpected_restart_recovery_summary(self, rows: list[dict[str, Any]]) -> str:
+        lines = [
+            "• 재시작 사유: 예기치 않은 게이트웨이 종료/재시작 복구",
+            "",
+            "• 진행중인 대화/업무:",
+        ]
+        lines.extend(f"   {line}" for line in self._format_active_work_rows(rows))
+        lines.extend(
+            [
+                "",
+                "• 처리:",
+                "   - 위 업무를 resume_pending으로 표시했습니다.",
+                "   - 게이트웨이 시작 후 자동으로 이어서 처리합니다.",
+            ]
+        )
         return "\n".join(lines)
 
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
@@ -13363,6 +13519,7 @@ class GatewayRunner:
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        summary: str = "",
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify configured home channels that the gateway is back online.
 
@@ -13373,6 +13530,8 @@ class GatewayRunner:
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
         message = "게이트웨이가 재시작되었습니다."
+        if summary.strip():
+            message = f"{message}\n\n{summary.strip()}"
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
@@ -14057,6 +14216,7 @@ class GatewayRunner:
             return False
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
+        self._clear_active_work_ledger_entry(session_key)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
         return True
@@ -15776,17 +15936,26 @@ class GatewayRunner:
             # timestamp (legacy transcripts) are treated as fresh so the
             # historical auto-continue behaviour is preserved.
             _freshness_window = _auto_continue_freshness_window()
-            _interruption_is_fresh = _is_fresh_gateway_interruption(
-                _last_transcript_timestamp(history),
-                window_secs=_freshness_window,
-            )
-
             _resume_entry = None
             if session_key:
                 try:
                     _resume_entry = self.session_store._entries.get(session_key)
                 except Exception:
                     _resume_entry = None
+            _transcript_interruption_is_fresh = _is_fresh_gateway_interruption(
+                _last_transcript_timestamp(history),
+                window_secs=_freshness_window,
+            )
+            _resume_marker_is_fresh = False
+            if _resume_entry is not None and getattr(_resume_entry, "resume_pending", False):
+                _resume_marker_is_fresh = _is_fresh_gateway_interruption(
+                    getattr(_resume_entry, "last_resume_marked_at", None)
+                    or getattr(_resume_entry, "updated_at", None),
+                    window_secs=_freshness_window,
+                )
+            _interruption_is_fresh = (
+                _transcript_interruption_is_fresh or _resume_marker_is_fresh
+            )
             _is_resume_pending = bool(
                 _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)

@@ -126,10 +126,18 @@ def _simulate_note_injection(
         if window_secs is not None
         else _auto_continue_freshness_window()
     )
-    interruption_is_fresh = _is_fresh_gateway_interruption(
+    transcript_interruption_is_fresh = _is_fresh_gateway_interruption(
         _last_transcript_timestamp(history),
         window_secs=window,
     )
+    resume_marker_is_fresh = False
+    if resume_entry is not None and getattr(resume_entry, "resume_pending", False):
+        resume_marker_is_fresh = _is_fresh_gateway_interruption(
+            getattr(resume_entry, "last_resume_marked_at", None)
+            or getattr(resume_entry, "updated_at", None),
+            window_secs=window,
+        )
+    interruption_is_fresh = transcript_interruption_is_fresh or resume_marker_is_fresh
 
     message = user_message
     is_resume_pending = bool(
@@ -517,6 +525,29 @@ class TestResumePendingSystemNote:
             window_secs=1800,
         )
         assert result == "start a new task"
+
+    def test_fresh_resume_marker_can_recover_after_long_power_outage(self):
+        """A durable active-work ledger marks resume_pending at startup.
+
+        In that path the transcript may be old because the Mac was powered off,
+        but ``last_resume_marked_at`` is fresh.  The resume note should still
+        fire so Hermes continues the abandoned task instead of treating the
+        empty auto-resume event as unrelated new input.
+        """
+        entry = self._pending_entry()
+        entry.last_resume_marked_at = datetime.now()
+        history = [
+            {"role": "assistant", "content": "old in progress",
+             "timestamp": time.time() - 7200},
+        ]
+        result = _simulate_note_injection(
+            history=history,
+            user_message="",
+            resume_entry=entry,
+            window_secs=1800,
+        )
+        assert "[System note:" in result
+        assert "gateway restart" in result
 
     def test_fresh_tool_tail_preserves_auto_continue_note(self):
         history = [
@@ -1135,29 +1166,28 @@ async def test_startup_auto_resume_skips_when_adapter_unavailable():
 
 
 # ---------------------------------------------------------------------------
-# Shutdown banner wording
+# Shutdown banner suppression
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_restart_banner_uses_try_to_resume_wording():
-    """The notification sent before drain should hedge the resume promise
-    — the session-continuity fix is best-effort (stuck-loop counter can
-    still escalate to suspended)."""
+async def test_restart_shutdown_banner_suppressed_for_wake_notice():
+    """Restart flows should not send a noisy pre-shutdown banner.
+
+    The post-restart wake notification carries the useful work summary, so the
+    shutdown path stays quiet and avoids a duplicate "gateway restarting" ping.
+    """
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    msg = adapter.sent[0]
-    assert "restarting" in msg
-    assert "try to resume" in msg
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+async def test_restart_suppresses_home_channel_shutdown_banner():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -1168,14 +1198,11 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_dedupes_active_chat():
+async def test_restart_shutdown_suppression_ignores_active_chat_deduping():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
@@ -1187,11 +1214,11 @@ async def test_restart_home_channel_notification_dedupes_active_chat():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_shutdown_suppression_ignores_thread_deduping():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
@@ -1213,13 +1240,12 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 2
-    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    assert adapter.sent == []
+    assert adapter.sent_calls == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_ignores_false_send_result():
+async def test_restart_shutdown_suppression_does_not_send_to_failing_adapter():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -1231,7 +1257,7 @@ async def test_restart_home_channel_notification_ignores_false_send_result():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    adapter.send.assert_called_once()
+    adapter.send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
