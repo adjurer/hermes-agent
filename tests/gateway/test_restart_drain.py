@@ -196,8 +196,8 @@ async def test_shutdown_notification_sent_to_active_sessions():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_notification_says_restarting_when_restart_requested():
-    """When _restart_requested is True, the message says 'restarting' and mentions /retry."""
+async def test_shutdown_notification_suppressed_when_restart_requested():
+    """Restart flows send only the post-restart wake notice, not a pre-shutdown ping."""
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:dm:999"
@@ -205,9 +205,7 @@ async def test_shutdown_notification_says_restarting_when_restart_requested():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    assert "restarting" in adapter.sent[0]
-    assert "resume" in adapter.sent[0]
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio

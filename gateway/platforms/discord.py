@@ -190,6 +190,57 @@ class VoiceReceiver:
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
 
+    def _decrypt_transport_payload(self, header: bytes, payload_with_nonce: bytes) -> Optional[bytes]:
+        """Decrypt Discord voice transport payload according to negotiated mode."""
+        mode = getattr(self._vc, "mode", None) or getattr(getattr(self._vc, "_connection", None), "mode", None)
+        if not isinstance(mode, str):
+            mode = None
+        mode = mode or "aead_xchacha20_poly1305_rtpsize"
+
+        try:
+            if mode == "aead_xchacha20_poly1305_rtpsize":
+                if len(payload_with_nonce) < 4:
+                    return None
+                nonce = bytearray(24)
+                nonce[:4] = payload_with_nonce[-4:]
+                encrypted = bytes(payload_with_nonce[:-4])
+                import nacl.secret  # noqa: E402 — delayed import, only in voice path
+                box = nacl.secret.Aead(self._secret_key)
+                return box.decrypt(encrypted, header, bytes(nonce))
+
+            import nacl.secret  # noqa: E402 — delayed import, only in voice path
+            box = nacl.secret.SecretBox(self._secret_key)
+            nonce = bytearray(24)
+
+            if mode == "xsalsa20_poly1305_lite":
+                if len(payload_with_nonce) < 4:
+                    return None
+                nonce[:4] = payload_with_nonce[-4:]
+                return box.decrypt(bytes(payload_with_nonce[:-4]), bytes(nonce))
+
+            if mode == "xsalsa20_poly1305_suffix":
+                if len(payload_with_nonce) < 24:
+                    return None
+                nonce[:] = payload_with_nonce[-24:]
+                return box.decrypt(bytes(payload_with_nonce[:-24]), bytes(nonce))
+
+            if mode == "xsalsa20_poly1305":
+                nonce[:12] = header[:12]
+                return box.decrypt(bytes(payload_with_nonce), bytes(nonce))
+
+            logger.warning("Unsupported Discord voice encryption mode: %s", mode)
+            return None
+        except Exception as e:
+            if self._packet_debug_count <= 10:
+                logger.warning(
+                    "Discord voice decrypt failed: %s (mode=%s, hdr=%d, payload=%d)",
+                    e,
+                    mode,
+                    len(header),
+                    len(payload_with_nonce),
+                )
+            return None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -326,22 +377,11 @@ class VoiceReceiver:
             )
 
         header = bytes(data[:header_size])
-        payload_with_nonce = data[header_size:]
+        payload_with_nonce = bytes(data[header_size:])
 
-        # --- NaCl transport decrypt (aead_xchacha20_poly1305_rtpsize) ---
-        if len(payload_with_nonce) < 4:
-            return
-        nonce = bytearray(24)
-        nonce[:4] = payload_with_nonce[-4:]
-        encrypted = bytes(payload_with_nonce[:-4])
-
-        try:
-            import nacl.secret  # noqa: E402 — delayed import, only in voice path
-            box = nacl.secret.Aead(self._secret_key)
-            decrypted = box.decrypt(encrypted, header, bytes(nonce))
-        except Exception as e:
-            if self._packet_debug_count <= 10:
-                logger.warning("NaCl decrypt failed: %s (hdr=%d, enc=%d)", e, header_size, len(encrypted))
+        # --- Discord transport decrypt ---
+        decrypted = self._decrypt_transport_payload(header, payload_with_nonce)
+        if decrypted is None:
             return
 
         # Skip encrypted extension data to get the actual opus payload
@@ -2211,7 +2251,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._on_voice_disconnect(str(text_ch_id))
             except Exception:
                 pass
-        if text_ch_id and self._client:
+        if (
+            text_ch_id
+            and self._client
+            and os.getenv("DISCORD_VOICE_STATUS_MESSAGES", "true").lower() in {"1", "true", "yes", "on"}
+        ):
             ch = self._client.get_channel(text_ch_id)
             if ch:
                 try:

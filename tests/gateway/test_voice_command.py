@@ -968,8 +968,9 @@ class TestVoiceChannelCommands:
         assert event.source.user_id == "42"
 
     @pytest.mark.asyncio
-    async def test_input_posts_transcript_in_text_channel(self, runner):
+    async def test_input_posts_transcript_in_text_channel(self, runner, monkeypatch):
         """Voice input sends transcript message to text channel."""
+        monkeypatch.setenv("DISCORD_VOICE_ECHO_TRANSCRIPT", "true")
         from gateway.config import Platform
         mock_adapter = AsyncMock()
         mock_adapter._voice_text_channels = {111: 123}
@@ -986,8 +987,9 @@ class TestVoiceChannelCommands:
         assert "42" in msg  # user_id in mention
 
     @pytest.mark.asyncio
-    async def test_input_suppresses_duplicate_transcript(self, runner):
+    async def test_input_suppresses_duplicate_transcript(self, runner, monkeypatch):
         """Near-immediate duplicate STT output should not dispatch twice."""
+        monkeypatch.setenv("DISCORD_VOICE_ECHO_TRANSCRIPT", "true")
         from gateway.config import Platform
 
         mock_adapter = AsyncMock()
@@ -1006,8 +1008,9 @@ class TestVoiceChannelCommands:
         mock_channel.send.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_input_suppresses_near_duplicate_transcript(self, runner):
+    async def test_input_suppresses_near_duplicate_transcript(self, runner, monkeypatch):
         """Small STT wording drift should still be treated as the same utterance."""
+        monkeypatch.setenv("DISCORD_VOICE_ECHO_TRANSCRIPT", "true")
         from gateway.config import Platform
 
         mock_adapter = AsyncMock()

@@ -1382,6 +1382,10 @@ class GatewayRunner:
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
+        # Discord voice bridge transcript buffer. Discord is treated as a
+        # lightweight voice surface; on voice-session end, a compact digest is
+        # sent to the Telegram home channel so the main yuri context continues.
+        self._discord_voice_bridge: Dict[int, Dict[str, Any]] = {}
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -2779,6 +2783,26 @@ class GatewayRunner:
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
+        pending_restart_notice_for_home = False
+        if _restart_notification_pending():
+            try:
+                data = json.loads((_hermes_home / ".restart_notify.json").read_text())
+                platform = Platform(str(data.get("platform")))
+                home = self.config.get_home_channel(platform)
+                pending_restart_notice_for_home = bool(
+                    home
+                    and str(home.chat_id) == str(data.get("chat_id"))
+                    and str(home.thread_id or "") == str(data.get("thread_id") or "")
+                )
+            except Exception:
+                pending_restart_notice_for_home = False
+
+        if self._restart_requested or pending_restart_notice_for_home:
+            logger.info(
+                "Shutdown notification suppressed: restart wake notification is pending",
+            )
+            return
+
         active = self._snapshot_running_agents()
 
         action = "restarting" if self._restart_requested else "shutting down"
@@ -8710,7 +8734,8 @@ class GatewayRunner:
         now = time.time()
         lines: list[str] = []
         if reason:
-            lines.append(f"재시작 사유: {reason}")
+            lines.append(f"• 재시작 사유: {reason}")
+            lines.append("")
 
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
@@ -8737,12 +8762,13 @@ class GatewayRunner:
             agent_lines.append(f"- {label} · {state} · {format_uptime_short(elapsed)}{suffix}")
 
         if agent_lines:
-            lines.append("하고 있던 대화/업무:")
-            lines.extend(agent_lines)
+            lines.append("• 진행중인 대화/업무:")
+            lines.extend(f"   {line}" for line in agent_lines)
             if len(running_agents) > len(agent_lines):
-                lines.append(f"- 외 {len(running_agents) - len(agent_lines)}개")
+                lines.append(f"   - 외 {len(running_agents) - len(agent_lines)}개")
         else:
-            lines.append("하고 있던 대화/업무: 없음")
+            lines.append("• 진행중인 대화/업무: 없음")
+        lines.append("")
 
         process_lines: list[str] = []
         if process_registry is not None:
@@ -8767,12 +8793,14 @@ class GatewayRunner:
             if hasattr(task, "done") and not task.done()
         ]
         if process_lines or background_tasks:
-            lines.append("백그라운드에서 진행 중인 업무:")
-            lines.extend(process_lines)
+            lines.append("• 백그라운드에서 진행 중인 업무:")
+            lines.extend(f"   {line}" for line in process_lines)
             if background_tasks:
-                lines.append(f"- gateway 내부 비동기 작업 {len(background_tasks)}개")
+                lines.append(f"   - gateway 내부 비동기 작업 {len(background_tasks)}개")
         else:
-            lines.append("백그라운드에서 진행 중인 업무: 없음")
+            lines.append("• 백그라운드에서 진행 중인 업무:")
+            lines.append("   - 별도 장기 프로세스 확인 안 됨")
+        lines.append("")
 
         try:
             from cron.jobs import list_jobs
@@ -8785,10 +8813,12 @@ class GatewayRunner:
                 str(job.get("name") or job.get("id") or "예약 작업")
                 for job in cron_jobs[:5]
             ]
-            suffix = f" 외 {len(cron_jobs) - len(names)}개" if len(cron_jobs) > len(names) else ""
-            lines.append("상주 예약 업무: " + ", ".join(names) + suffix)
+            lines.append("• 예약 업무:")
+            lines.extend(f"   - {name}" for name in names)
+            if len(cron_jobs) > len(names):
+                lines.append(f"   - 외 {len(cron_jobs) - len(names)}개")
         else:
-            lines.append("상주 예약 업무: 없음")
+            lines.append("• 예약 업무: 없음")
 
         return "\n".join(lines)
 
@@ -10118,6 +10148,7 @@ class GatewayRunner:
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
+        self._queue_discord_voice_bridge_summary(guild_id=guild_id, reason="수동 음성 종료")
         return "Left voice channel."
 
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
@@ -10129,6 +10160,110 @@ class GatewayRunner:
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        self._queue_discord_voice_bridge_summary(chat_id=chat_id, reason="음성 세션 종료")
+
+    def _record_discord_voice_bridge_transcript(
+        self,
+        *,
+        guild_id: int,
+        text_channel_id: str,
+        user_id: int,
+        transcript: str,
+    ) -> None:
+        """Remember recent Discord voice utterances for Telegram handoff."""
+        if os.getenv("DISCORD_VOICE_SUMMARY_TO_TELEGRAM", "true").lower() not in {"1", "true", "yes", "on"}:
+            return
+        if not hasattr(self, "_discord_voice_bridge") or not isinstance(self._discord_voice_bridge, dict):
+            self._discord_voice_bridge = {}
+        entry = self._discord_voice_bridge.setdefault(
+            int(guild_id),
+            {
+                "text_channel_id": str(text_channel_id),
+                "started_at": time.time(),
+                "items": [],
+            },
+        )
+        entry["text_channel_id"] = str(text_channel_id)
+        items = entry.setdefault("items", [])
+        items.append(
+            {
+                "ts": time.time(),
+                "user_id": str(user_id),
+                "text": transcript.strip(),
+            }
+        )
+        del items[:-20]
+
+    def _queue_discord_voice_bridge_summary(
+        self,
+        *,
+        guild_id: Optional[int] = None,
+        chat_id: Optional[str] = None,
+        reason: str = "음성 세션 종료",
+    ) -> None:
+        """Schedule a Telegram-only digest for a finished Discord voice session."""
+        if os.getenv("DISCORD_VOICE_SUMMARY_TO_TELEGRAM", "true").lower() not in {"1", "true", "yes", "on"}:
+            return
+        bridge = getattr(self, "_discord_voice_bridge", None)
+        if not isinstance(bridge, dict):
+            return
+        if guild_id is not None:
+            target_guilds = [int(guild_id)]
+        else:
+            target_guilds = [
+                gid for gid, data in bridge.items()
+                if str(data.get("text_channel_id")) == str(chat_id)
+            ]
+        for gid in target_guilds:
+            data = bridge.pop(gid, None)
+            if not data or not data.get("items"):
+                continue
+            task = asyncio.create_task(
+                self._send_discord_voice_bridge_summary(guild_id=gid, data=data, reason=reason)
+            )
+            background_tasks = getattr(self, "_background_tasks", None)
+            if isinstance(background_tasks, set):
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+
+    async def _send_discord_voice_bridge_summary(
+        self,
+        *,
+        guild_id: int,
+        data: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Send a compact Discord voice digest to Telegram home only."""
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        home = self.config.get_home_channel(Platform.TELEGRAM)
+        if not adapter or not home or not home.chat_id:
+            logger.debug("Discord voice bridge summary skipped: telegram home channel unavailable")
+            return
+
+        items = list(data.get("items") or [])
+        if not items:
+            return
+        started_at = float(data.get("started_at") or time.time())
+        duration = max(0, int(time.time() - started_at))
+        lines = [
+            "Discord 음성 대화 요약",
+            "",
+            f"• 종료 사유: {reason}",
+            f"• 대화 길이: 약 {duration // 60}분 {duration % 60}초",
+            f"• 연결 세션: guild {guild_id} / text {data.get('text_channel_id')}",
+            "",
+            "• 주요 발화:",
+        ]
+        for item in items[-8:]:
+            text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+            if len(text) > 180:
+                text = text[:177] + "..."
+            lines.append(f"   - {text}")
+
+        try:
+            await adapter.send(str(home.chat_id), "\n".join(lines))
+        except Exception as exc:
+            logger.debug("Discord voice bridge summary send failed: %s", exc)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -10217,14 +10352,22 @@ class GatewayRunner:
             )
             return
 
+        self._record_discord_voice_bridge_transcript(
+            guild_id=guild_id,
+            text_channel_id=str(text_ch_id),
+            user_id=user_id,
+            transcript=transcript,
+        )
+
         # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+        if os.getenv("DISCORD_VOICE_ECHO_TRANSCRIPT", "true").lower() in {"1", "true", "yes", "on"}:
+            try:
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+            except Exception:
+                pass
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
