@@ -13,8 +13,10 @@ import importlib
 import os
 import sys
 import unicodedata
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -26,6 +28,10 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_VIDEO_TYPES,
 )
+
+
+def _today_prefix() -> str:
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
 
 
 # ---------------------------------------------------------------------------
@@ -632,7 +638,7 @@ class TestSendDocument:
         connected_adapter._bot.send_document.assert_called_once()
         call_kwargs = connected_adapter._bot.send_document.call_args[1]
         assert call_kwargs["chat_id"] == 12345
-        assert call_kwargs["filename"] == "report.pdf"
+        assert call_kwargs["filename"] == f"{_today_prefix()}_report.pdf"
         assert call_kwargs["caption"] == "Here's the report"
 
     @pytest.mark.asyncio
@@ -653,7 +659,7 @@ class TestSendDocument:
 
         assert result.success is True
         call_kwargs = connected_adapter._bot.send_document.call_args[1]
-        assert call_kwargs["filename"] == "clean_data.csv"
+        assert call_kwargs["filename"] == f"{_today_prefix()}_clean_data.csv"
 
     @pytest.mark.asyncio
     async def test_send_document_normalizes_korean_text_attachment(self, connected_adapter, tmp_path):
@@ -676,7 +682,7 @@ class TestSendDocument:
         )
 
         assert result.success is True
-        assert captured["filename"] == "한글보고서.md"
+        assert captured["filename"] == f"{_today_prefix()}_한글보고서.md"
         assert captured["payload"].startswith(b"\xef\xbb\xbf")
         assert captured["payload"].decode("utf-8-sig") == "# 제목\n한글 내용"
         assert test_file.read_bytes() == "# 제목\n한글 내용".encode("cp949")

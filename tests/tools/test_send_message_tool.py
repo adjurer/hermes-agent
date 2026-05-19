@@ -5,11 +5,17 @@ import json
 import os
 import sys
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
+
+
+def _today_prefix() -> str:
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
 
 
 @pytest.fixture(autouse=True)
@@ -460,7 +466,7 @@ class TestSendTelegramMediaDelivery:
         )
 
         assert result["success"] is True
-        assert captured["filename"] == "한글보고서.md"
+        assert captured["filename"] == f"{_today_prefix()}_한글보고서.md"
         assert captured["payload"].startswith(b"\xef\xbb\xbf")
         assert captured["payload"].decode("utf-8-sig") == "# 제목\n한글 내용"
         assert doc_path.read_bytes() == "# 제목\n한글 내용".encode("cp949")
@@ -2605,4 +2611,3 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
-
