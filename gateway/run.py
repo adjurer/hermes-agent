@@ -13088,7 +13088,7 @@ class GatewayRunner:
             metadata = {"thread_id": thread_id} if thread_id else None
             result = await adapter.send(
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                "♻️ 게이트웨이가 재시작되었습니다. 에르메스가 다시 깨어났고, 세션은 이어서 사용할 수 있습니다.",
                 metadata=metadata,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -13129,7 +13129,7 @@ class GatewayRunner:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = "♻️ 게이트웨이가 재시작되었습니다. 에르메스가 다시 깨어났고, 대기 상태입니다."
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
