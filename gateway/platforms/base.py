@@ -58,18 +58,25 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when the Bot API supports it.
     """
     thread_id = getattr(source, "thread_id", None)
-    if thread_id is None:
-        return None
-    metadata = {"thread_id": thread_id}
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
+    metadata = {}
+    if thread_id is not None:
+        metadata["thread_id"] = thread_id
+
+    if _platform_name(getattr(source, "platform", None)) == "telegram":
+        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        if anchor is not None:
+            metadata["telegram_reply_to_message_id"] = str(anchor)
+
+    if (
+        _platform_name(getattr(source, "platform", None)) == "telegram"
+        and getattr(source, "chat_type", None) == "dm"
+        and thread_id is not None
+    ):
         metadata["telegram_dm_topic_reply_fallback"] = True
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
             metadata["direct_messages_topic_id"] = tid
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
-        if anchor is not None:
-            metadata["telegram_reply_to_message_id"] = str(anchor)
-    return metadata
+    return metadata or None
 
 
 def _reply_anchor_for_event(event) -> str | None:
@@ -1030,9 +1037,181 @@ def normalize_document_filename(filename: str | os.PathLike | None, fallback: st
     return safe_name
 
 
+def _outbound_generic_korean_stem(extension: str) -> str:
+    ext = extension.lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+        return "이미지"
+    if ext in {".xlsx", ".xls", ".csv", ".tsv"}:
+        return "표자료"
+    if ext in {".hwp", ".hwpx", ".doc", ".docx", ".pdf", ".ppt", ".pptx"}:
+        return "문서"
+    if ext in {".html", ".htm"}:
+        return "페이지"
+    if ext in {".md", ".markdown"}:
+        return "초안"
+    if ext in {".txt"}:
+        return "메모"
+    if ext in {".json"}:
+        return "자료"
+    if ext in {".zip"}:
+        return "압축자료"
+    return "자료"
+
+
+_OUTBOUND_KOREANIZE_EXTS = {
+    ".csv",
+    ".doc",
+    ".docx",
+    ".gif",
+    ".htm",
+    ".html",
+    ".hwp",
+    ".hwpx",
+    ".json",
+    ".jpeg",
+    ".jpg",
+    ".markdown",
+    ".md",
+    ".pdf",
+    ".png",
+    ".ppt",
+    ".pptx",
+    ".tsv",
+    ".txt",
+    ".webp",
+    ".xls",
+    ".xlsx",
+    ".zip",
+}
+
+_OUTBOUND_ENGLISH_ARTIFACT_KEYWORDS = {
+    "agenda",
+    "analysis",
+    "brief",
+    "calendar",
+    "campaign",
+    "candidate",
+    "check",
+    "contract",
+    "dashboard",
+    "draft",
+    "election",
+    "export",
+    "final",
+    "gyeonggi",
+    "legal",
+    "map",
+    "memo",
+    "minutes",
+    "note",
+    "output",
+    "policy",
+    "poll",
+    "report",
+    "research",
+    "result",
+    "review",
+    "route",
+    "schedule",
+    "summary",
+    "survey",
+    "table",
+    "test",
+    "update",
+    "verify",
+    "workbook",
+    "worksheet",
+}
+
+
+def _has_any_keyword(text: str, keywords: set[str]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def _outbound_korean_stem_from_keywords(lower_name: str, extension: str) -> str:
+    compact = lower_name.replace("-", "_")
+    is_spreadsheet = extension.lower() in {".xlsx", ".xls", ".csv", ".tsv"}
+
+    if "nesdc" in compact or "poll" in compact or "survey" in compact:
+        return "여심위_여론조사_자료" if is_spreadsheet else "여론조사_자료"
+    if _has_any_keyword(compact, {"schedule", "calendar", "agenda", "timetable"}):
+        if _has_any_keyword(compact, {"map", "route", "location", "geo", "coord"}):
+            return "일정지도"
+        return "일정표"
+    if _has_any_keyword(compact, {"map", "route", "location", "geo", "coord"}):
+        return "지도자료"
+    if _has_any_keyword(compact, {"candidate", "election", "campaign", "kpp", "gyeonggi"}):
+        return "선거자료"
+    if _has_any_keyword(compact, {"law", "legal", "contract"}):
+        return "법률자료"
+    if _has_any_keyword(compact, {"report", "summary", "brief", "proposal", "policy"}):
+        return "보고서"
+    if "draft" in compact:
+        return "초안"
+    if _has_any_keyword(compact, {"minutes", "meeting"}):
+        return "회의록"
+    if _has_any_keyword(compact, {"analysis", "review", "check", "test", "verify", "research", "update"}):
+        return "검토자료"
+    if extension.lower() == ".json" and _has_any_keyword(compact, {"data", "dataset", "export", "result", "output"}):
+        return "자료"
+    if _has_any_keyword(compact, {"table", "workbook", "worksheet", "data", "dataset", "export"}):
+        return "표자료"
+    if _has_any_keyword(compact, {"memo", "note"}):
+        return "메모"
+    return _outbound_generic_korean_stem(extension)
+
+
+def _looks_like_generated_english_artifact(stem: str, lower_name: str, extension: str) -> bool:
+    if re.search(r"[가-힣]", stem):
+        return False
+    if extension.lower() not in _OUTBOUND_KOREANIZE_EXTS:
+        return False
+    lower_stem = stem.lower()
+    return bool(
+        _has_any_keyword(lower_name, _OUTBOUND_ENGLISH_ARTIFACT_KEYWORDS)
+        or re.search(r"[_-]", lower_stem)
+        or re.search(r"\d{4,}", lower_stem)
+    )
+
+
+def _friendly_outbound_document_filename(filename: str | os.PathLike | None) -> str:
+    """Convert generated/cache-style attachment names into user-facing Korean names."""
+    safe_name = normalize_document_filename(filename)
+    path = Path(safe_name)
+    stem = path.stem.strip()
+    ext = path.suffix
+    lower_name = safe_name.lower()
+    lower_stem = stem.lower()
+
+    stem = re.sub(r"^(?:send|doc|document|cache|tmp|temp)_[0-9a-f-]{8,}_?", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"^(?:img|image|photo|audio|video)_[0-9a-f-]{8,}_?", "", stem, flags=re.IGNORECASE)
+
+    if re.match(r"^image_\d{4}-\d{2}-\d{2}[_-]", lower_stem):
+        stem = "이미지"
+    elif "browser_screenshot" in lower_name or re.match(r"^(?:screenshot|screen_shot|screen-shot)[_-]", lower_stem):
+        stem = "화면캡처"
+    elif "nesdc" in lower_name or ("poll" in lower_name and ext.lower() in {".xlsx", ".xls", ".csv", ".tsv"}):
+        stem = "여심위_여론조사_자료"
+    else:
+        has_korean = bool(re.search(r"[가-힣]", stem))
+        technical_name = bool(
+            re.search(r"(?:^|[_-])(?:tmp|temp|cache|latest|final|output|result|screenshot|image|img|doc|send)(?:[_-]|$)", lower_name)
+            or re.search(r"[0-9a-f]{12,}", stem, flags=re.IGNORECASE)
+            or len(stem) > 48
+        )
+        if not has_korean and technical_name:
+            stem = _outbound_korean_stem_from_keywords(lower_name, ext)
+        elif _looks_like_generated_english_artifact(stem, lower_name, ext):
+            stem = _outbound_korean_stem_from_keywords(lower_name, ext)
+
+    if not stem.strip():
+        stem = _outbound_generic_korean_stem(ext)
+    return normalize_document_filename(f"{stem}{ext}")
+
+
 def ensure_outbound_document_filename_policy(filename: str, today: str | None = None) -> str:
     """Apply user-visible outbound naming rules to generated attachments."""
-    safe_name = normalize_document_filename(filename)
+    safe_name = _friendly_outbound_document_filename(filename)
     stem = Path(safe_name).stem
     if re.match(r"^\d{6}(?:[_-]|$)", stem):
         return safe_name
@@ -1042,6 +1221,18 @@ def ensure_outbound_document_filename_policy(filename: str, today: str | None = 
 
         today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
     return f"{today}_{safe_name}"
+
+
+def _outbound_document_date_prefix_for_path(file_path: str | os.PathLike) -> str:
+    """Return YYMMDD from the file's written time in Korea time."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    try:
+        timestamp = Path(file_path).stat().st_mtime
+        return datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
+    except OSError:
+        return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
 
 
 def is_text_document_path(path_or_name: str | os.PathLike | None) -> bool:
@@ -1071,10 +1262,11 @@ def prepare_outbound_document_for_send(
     the document cache as UTF-8 with BOM so Korean content opens consistently in
     clients that otherwise guess legacy encodings.
     """
-    display_name = ensure_outbound_document_filename_policy(
-        normalize_document_filename(file_name or os.path.basename(str(file_path)))
-    )
     source_path = Path(file_path)
+    display_name = ensure_outbound_document_filename_policy(
+        normalize_document_filename(file_name or os.path.basename(str(file_path))),
+        today=_outbound_document_date_prefix_for_path(source_path),
+    )
     ext = Path(display_name).suffix.lower() or source_path.suffix.lower()
     if ext not in OUTBOUND_TEXT_NORMALIZE_EXTS:
         return str(source_path), display_name

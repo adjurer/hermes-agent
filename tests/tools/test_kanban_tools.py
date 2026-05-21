@@ -397,16 +397,21 @@ def test_complete_with_result_only(worker_env):
     assert d["ok"] is True
 
 
-def test_complete_with_artifacts_lands_in_event_payload(worker_env):
+def test_complete_with_artifacts_lands_in_event_payload(worker_env, tmp_path):
     """``artifacts=[...]`` rides into the completed event payload so the
     gateway notifier can upload them as native attachments. See the
     kanban notifier in gateway/run.py for the consumer side."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    chart = tmp_path / "q3-revenue.png"
+    report = tmp_path / "q3-report.pdf"
+    chart.write_bytes(b"png")
+    report.write_bytes(b"pdf")
+
     out = kt._handle_complete({
         "summary": "rendered the chart",
-        "artifacts": ["/tmp/q3-revenue.png", "/tmp/q3-report.pdf"],
+        "artifacts": [str(chart), str(report)],
     })
     assert json.loads(out)["ok"] is True
 
@@ -417,49 +422,51 @@ def test_complete_with_artifacts_lands_in_event_payload(worker_env):
         completed = [e for e in events if e.kind == "completed"]
         assert len(completed) == 1
         payload = completed[0].payload or {}
-        assert payload.get("artifacts") == [
-            "/tmp/q3-revenue.png",
-            "/tmp/q3-report.pdf",
-        ]
+        assert payload.get("artifacts") == [str(chart), str(report)]
         # And the artifacts also live on metadata for downstream workers
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata.get("artifacts") == [
-            "/tmp/q3-revenue.png",
-            "/tmp/q3-report.pdf",
-        ]
+        assert run.metadata.get("artifacts") == [str(chart), str(report)]
     finally:
         conn.close()
 
 
-def test_complete_artifacts_accepts_single_string(worker_env):
+def test_complete_artifacts_accepts_single_string(worker_env, tmp_path):
     """A bare string is auto-promoted to a single-element list for convenience."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    chart = tmp_path / "chart.png"
+    chart.write_bytes(b"png")
+
     out = kt._handle_complete({
         "summary": "one chart",
-        "artifacts": "/tmp/chart.png",
+        "artifacts": str(chart),
     })
     assert json.loads(out)["ok"] is True
 
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata.get("artifacts") == ["/tmp/chart.png"]
+        assert run.metadata.get("artifacts") == [str(chart)]
     finally:
         conn.close()
 
 
-def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env):
+def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env, tmp_path):
     """If the worker passes metadata.artifacts AND the top-level artifacts
     param, merge the two without duplicates."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    a = tmp_path / "a.png"
+    b = tmp_path / "b.pdf"
+    a.write_bytes(b"png")
+    b.write_bytes(b"pdf")
+
     out = kt._handle_complete({
         "summary": "merged",
-        "metadata": {"artifacts": ["/tmp/a.png"], "other": "fact"},
-        "artifacts": ["/tmp/b.pdf", "/tmp/a.png"],
+        "metadata": {"artifacts": [str(a)], "other": "fact"},
+        "artifacts": [str(b), str(a)],
     })
     assert json.loads(out)["ok"] is True
 
@@ -467,7 +474,7 @@ def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env):
     try:
         run = kb.latest_run(conn, worker_env)
         # Order: existing entries first, then new ones, deduplicated.
-        assert run.metadata.get("artifacts") == ["/tmp/a.png", "/tmp/b.pdf"]
+        assert run.metadata.get("artifacts") == [str(a), str(b)]
         assert run.metadata.get("other") == "fact"
     finally:
         conn.close()
@@ -482,6 +489,20 @@ def test_complete_rejects_non_list_artifacts(worker_env):
     })
     err = json.loads(out).get("error", "")
     assert "artifacts must be a list" in err
+
+
+def test_complete_rejects_missing_artifact_path(worker_env):
+    """A worker cannot mark a file-delivery task done with a missing file."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "created report",
+        "artifacts": "/tmp/definitely-missing-hermes-report.md",
+    })
+
+    err = json.loads(out).get("error", "")
+    assert "artifact path(s) do not exist" in err
+    assert "still in-flight" in err
 
 
 def test_complete_rejects_no_handoff(worker_env):

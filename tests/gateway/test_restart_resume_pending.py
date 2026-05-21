@@ -852,9 +852,9 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
 
 
 @pytest.mark.asyncio
-async def test_clean_drain_does_not_mark_resume_pending():
-    """If the drain completes within timeout (no force-interrupt), no
-    sessions should be flagged — the normal shutdown path is unchanged."""
+async def test_clean_drain_clears_pre_marked_resume_pending():
+    """If the drain completes within timeout, the defensive pre-mark is
+    cleared so no session remains flagged after a normal shutdown."""
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
 
@@ -870,6 +870,7 @@ async def test_clean_drain_does_not_mark_resume_pending():
 
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -877,7 +878,12 @@ async def test_clean_drain_does_not_mark_resume_pending():
     ):
         await runner.stop()
 
-    session_store.mark_resume_pending.assert_not_called()
+    session_store.mark_resume_pending.assert_called_once_with(
+        "agent:main:telegram:dm:A", "shutdown_timeout"
+    )
+    session_store.clear_resume_pending.assert_called_once_with(
+        "agent:main:telegram:dm:A"
+    )
     running_agent.interrupt.assert_not_called()
 
 
@@ -912,6 +918,7 @@ async def test_drain_timeout_only_marks_still_running_sessions():
 
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.clear_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -921,8 +928,12 @@ async def test_drain_timeout_only_marks_still_running_sessions():
 
     calls = session_store.mark_resume_pending.call_args_list
     marked = {args[0][0] for args in calls}
-    # Only the session still running at timeout is marked; the finisher is not.
-    assert marked == {session_key_stuck}
+    # The defensive pre-mark covers both sessions before the drain. The
+    # finisher is then cleared, while the stuck session is marked again when
+    # the timeout path force-interrupts remaining work.
+    assert marked == {session_key_finisher, session_key_stuck}
+    session_store.clear_resume_pending.assert_called_once_with(session_key_finisher)
+    assert calls[-1][0][0] == session_key_stuck
 
 
 @pytest.mark.asyncio
@@ -1035,6 +1046,58 @@ async def test_startup_auto_resume_includes_crash_recovery():
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pinned_telegram_message_refreshes_resume_origin_from_active_ledger():
+    """A pinned active-work message should re-anchor restart auto-resume."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="pin-chat")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:pin-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    runner.session_store._save = MagicMock()
+    runner._load_active_work_ledger = MagicMock(return_value={
+        "version": 1,
+        "items": {
+            entry.session_key: {
+                "session_key": entry.session_key,
+                "session_id": "sid",
+                "platform": "telegram",
+                "chat_id": "pin-chat",
+                "chat_type": "dm",
+                "user_id": "u1",
+                "message_id": "777",
+                "message_preview": "대표님 요청 처리",
+            }
+        },
+    })
+    runner._record_active_work_ledger_entry = MagicMock()
+    adapter.get_pinned_work_refs = AsyncMock(return_value=[{
+        "chat_id": "pin-chat",
+        "chat_type": "dm",
+        "user_id": "u1",
+        "user_name": "대표님",
+        "message_id": "777",
+        "text": "대표님 요청 처리",
+    }])
+
+    recovered = await runner._recover_telegram_pinned_work()
+
+    assert len(recovered) == 1
+    assert entry.resume_pending is True
+    assert entry.resume_reason == "pinned_message_recovery"
+    assert entry.origin.message_id == "777"
+    assert entry.origin.chat_id == "pin-chat"
+    runner.session_store._save.assert_called()
+    runner._record_active_work_ledger_entry.assert_called_once()
 
 
 @pytest.mark.asyncio

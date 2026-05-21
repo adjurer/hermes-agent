@@ -459,6 +459,48 @@ class TestFilterExistingMediaFiles:
             == "260518_경기도 후보자 초안.md"
         )
 
+    def test_generated_image_filename_becomes_korean(self):
+        assert (
+            ensure_outbound_document_filename_policy("image_2026-05-20_10-52-04.png", today="260520")
+            == "260520_이미지.png"
+        )
+
+    def test_technical_poll_filename_becomes_korean(self):
+        assert (
+            ensure_outbound_document_filename_policy("260520_nesdc_poll_since_20260511.xlsx", today="260520")
+            == "260520_여심위_여론조사_자료.xlsx"
+        )
+
+    def test_generated_english_schedule_filename_becomes_korean(self):
+        assert (
+            ensure_outbound_document_filename_policy("candidate_schedule_map.xlsx", today="260520")
+            == "260520_일정지도.xlsx"
+        )
+
+    def test_generated_english_report_filename_becomes_korean(self):
+        assert (
+            ensure_outbound_document_filename_policy("policy_report.md", today="260520")
+            == "260520_보고서.md"
+        )
+
+    def test_generated_english_election_filename_becomes_korean(self):
+        assert (
+            ensure_outbound_document_filename_policy("kpp_gyeonggi_controversy_update.xlsx", today="260520")
+            == "260520_선거자료.xlsx"
+        )
+
+    def test_generated_english_html_dashboard_filename_becomes_korean(self):
+        assert (
+            ensure_outbound_document_filename_policy("campaign_schedule_map_olivia_latest.html", today="260520")
+            == "260520_일정지도.html"
+        )
+
+    def test_korean_existing_date_filename_is_preserved(self):
+        assert (
+            ensure_outbound_document_filename_policy("260520_6.3지선 중간 판세(평택을)_v1.hwp", today="260520")
+            == "260520_6.3지선 중간 판세(평택을)_v1.hwp"
+        )
+
 
 # ---------------------------------------------------------------------------
 # should_send_media_as_audio

@@ -100,6 +100,30 @@ def make_restart_runner(
     runner._send_home_channel_startup_notifications = (
         GatewayRunner._send_home_channel_startup_notifications.__get__(runner, GatewayRunner)
     )
+    runner._recover_telegram_pinned_work = GatewayRunner._recover_telegram_pinned_work.__get__(
+        runner, GatewayRunner
+    )
+    runner._mark_session_resume_pending_with_origin = (
+        GatewayRunner._mark_session_resume_pending_with_origin.__get__(runner, GatewayRunner)
+    )
+    runner._build_restart_wake_summary = GatewayRunner._build_restart_wake_summary.__get__(
+        runner, GatewayRunner
+    )
+    runner._ensure_restart_wake_notice_marker = (
+        GatewayRunner._ensure_restart_wake_notice_marker.__get__(runner, GatewayRunner)
+    )
+    runner._load_active_work_ledger = GatewayRunner._load_active_work_ledger.__get__(
+        runner, GatewayRunner
+    )
+    runner._record_active_work_ledger_entry = GatewayRunner._record_active_work_ledger_entry.__get__(
+        runner, GatewayRunner
+    )
+    runner._write_active_work_ledger = GatewayRunner._write_active_work_ledger.__get__(
+        runner, GatewayRunner
+    )
+    runner._format_active_work_rows = GatewayRunner._format_active_work_rows.__get__(
+        runner, GatewayRunner
+    )
     runner._status_action_label = GatewayRunner._status_action_label.__get__(
         runner, GatewayRunner
     )

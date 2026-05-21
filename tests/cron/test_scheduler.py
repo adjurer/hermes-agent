@@ -851,6 +851,31 @@ class TestDeliverResultErrorReturns:
         assert result is not None
         assert "no delivery target" in result
 
+    def test_interpreter_shutdown_delivery_error_is_suppressed(self):
+        """Gateway shutdown can race with cron delivery; don't persist noisy false alerts."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        async def _fake_send(*_args, **_kwargs):
+            return {
+                "error": "Telegram send failed: RuntimeError('cannot schedule new futures after interpreter shutdown')"
+            }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", side_effect=_fake_send):
+            job = {
+                "id": "shutdown-race",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            result = _deliver_result(job, "Output.")
+
+        assert result is None
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):

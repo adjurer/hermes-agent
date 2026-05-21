@@ -456,6 +456,35 @@ def _handle_complete(args: dict, **kw) -> str:
                 metadata["artifacts"] = merged
             else:
                 metadata["artifacts"] = artifacts
+    if isinstance(metadata, dict) and "artifacts" in metadata:
+        metadata_artifacts = metadata.get("artifacts")
+        if isinstance(metadata_artifacts, str):
+            metadata_artifacts = [metadata_artifacts]
+            metadata["artifacts"] = metadata_artifacts
+        if not isinstance(metadata_artifacts, (list, tuple)):
+            return tool_error(
+                f"metadata.artifacts must be a list of file paths, got "
+                f"{type(metadata_artifacts).__name__}"
+            )
+        cleaned_artifacts: list[str] = [
+            os.path.expanduser(str(p).strip())
+            for p in metadata_artifacts
+            if str(p).strip()
+        ]
+        missing_artifacts = [
+            p for p in cleaned_artifacts
+            if not os.path.isfile(p)
+        ]
+        if missing_artifacts:
+            return tool_error(
+                "kanban_complete blocked: artifact path(s) do not exist or "
+                "are not files: "
+                + ", ".join(missing_artifacts)
+                + ". Your task is still in-flight (no state change). Create "
+                "the file(s) first, correct the artifacts list, or use "
+                "kanban_block if delivery is not possible."
+            )
+        metadata["artifacts"] = cleaned_artifacts
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"

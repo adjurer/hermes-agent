@@ -403,7 +403,7 @@ async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch
 
 @pytest.mark.asyncio
 async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, monkeypatch):
-    """If the requester's platform isn't connected, clean up without crashing."""
+    """If the requester's platform isn't connected, keep marker for retry."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
@@ -416,15 +416,15 @@ async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, mo
 
     await runner._send_restart_notification()
 
-    # File cleaned up even though we couldn't send
-    assert not notify_path.exists()
+    # Keep the marker so a later startup/reconnect can still deliver it.
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio
 async def test_send_restart_notification_cleans_up_on_send_failure(
     tmp_path, monkeypatch
 ):
-    """If the adapter.send() raises, the file is still cleaned up."""
+    """If the adapter.send() raises, keep the marker for retry."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
@@ -438,9 +438,8 @@ async def test_send_restart_notification_cleans_up_on_send_failure(
 
     delivered_target = await runner._send_restart_notification()
 
-    # File cleaned up even though send raised.
     assert delivered_target is None
-    assert not notify_path.exists()
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio
@@ -492,8 +491,8 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
         "Expected a WARNING line mentioning the failure; "
         f"got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
-    # Still cleans up.
-    assert not notify_path.exists()
+    # Keep the marker so the wake notice is not lost on transient delivery failures.
+    assert notify_path.exists()
 
 
 @pytest.mark.asyncio

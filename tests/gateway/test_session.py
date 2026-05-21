@@ -388,6 +388,50 @@ class TestBuildSessionContextPrompt:
         assert "**User:** Alice" in prompt
         assert "Multi-user thread" not in prompt
 
+    def test_telegram_prompt_marks_primary_owner(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "1285952827")
+        monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "*")
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100123",
+            chat_name="Office Group",
+            chat_type="group",
+            user_id="1285952827",
+            user_name="대표님",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Telegram sender role:** primary owner / directly authorized user" in prompt
+        assert "Only treat this message as the owner's direct instruction" in prompt
+
+    def test_telegram_prompt_marks_group_guest(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "1285952827")
+        monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "*")
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100123",
+            chat_name="Office Group",
+            chat_type="group",
+            user_id="7618785674",
+            user_name="김채원",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "**Telegram sender role:** group participant / guest caller; not the primary owner" in prompt
+        assert "do not infer owner approval" in prompt
+
     def test_shared_non_thread_group_prompt_hides_single_user(self):
         """Shared non-thread group sessions should avoid pinning one user."""
         config = GatewayConfig(

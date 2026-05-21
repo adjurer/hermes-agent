@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.run import GatewayRunner, _parse_session_key
+from gateway.run import (
+    GatewayRunner,
+    _format_agent_completion_notification,
+    _parse_session_key,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -556,3 +560,17 @@ def test_parse_session_key_too_short():
 def test_parse_session_key_wrong_prefix():
     assert _parse_session_key("cron:main:telegram:dm:123") is None
     assert _parse_session_key("agent:cron:telegram:dm:123") is None
+
+
+def test_agent_completion_notification_demands_clean_user_report():
+    text = _format_agent_completion_notification(
+        session_id="proc_test",
+        exit_code=1,
+        command="python /tmp/private_script.py --token=secret",
+        output="Traceback...\nHTTPError 403\n",
+    )
+
+    assert "internal continuation event" in text
+    assert "Do not quote raw commands" in text
+    assert "cause, impact, and next action" in text
+    assert "Internal command for diagnosis only" in text

@@ -12,8 +12,13 @@ class RecordingAdapter:
     def __init__(self):
         self.sent = []
 
-    async def send(self, chat_id, text, metadata=None):
-        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+    async def send(self, chat_id, text, reply_to=None, metadata=None):
+        self.sent.append({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_to": reply_to,
+            "metadata": metadata or {},
+        })
 
 
 class DisconnectedAdapters(dict):
@@ -21,6 +26,14 @@ class DisconnectedAdapters(dict):
 
     def get(self, key, default=None):
         return None
+
+
+class TranscriptStore:
+    def __init__(self):
+        self.entries = []
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.entries.append((session_id, message))
 
 
 async def _run_one_notifier_tick(monkeypatch, runner):
@@ -41,14 +54,21 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
+    runner.session_store = TranscriptStore()
     return runner
 
 
-def _create_completed_subscription(summary="done once"):
+def _create_completed_subscription(summary="done once", reply_to_message_id=None):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="notify once", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            reply_to_message_id=reply_to_message_id,
+        )
         kb.complete_task(conn, tid, summary=summary)
         return tid
     finally:
@@ -85,8 +105,56 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert "Kanban" in adapter.sent[0]["text"]
-    assert tid in adapter.sent[0]["text"]
+    assert "마무리했습니다" in adapter.sent[0]["text"]
+    assert "Kanban" not in adapter.sent[0]["text"]
+    assert tid not in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_replies_to_original_message(tmp_path, monkeypatch):
+    db_path = tmp_path / "reply-anchor.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    _create_completed_subscription(reply_to_message_id="462")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["reply_to"] == "462"
+    assert adapter.sent[0]["metadata"]["telegram_reply_to_message_id"] == "462"
+
+
+def test_kanban_notifier_persists_completion_for_followup_context(tmp_path, monkeypatch):
+    db_path = tmp_path / "context-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="에르메스 코덱스 기능 조사",
+            assignee="researcher",
+            session_id="session-direct-chat",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="1. Codex CLI 위임 2. Codex lane")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert runner.session_store.entries
+    session_id, message = runner.session_store.entries[-1]
+    assert session_id == "session-direct-chat"
+    assert message["role"] == "assistant"
+    assert "Codex CLI" in message["content"]
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
@@ -144,7 +212,7 @@ class FailingAdapter:
     def __init__(self):
         self.attempts = 0
 
-    async def send(self, chat_id, text, metadata=None):
+    async def send(self, chat_id, text, reply_to=None, metadata=None):
         self.attempts += 1
         raise RuntimeError("simulated send failure")
 
@@ -205,7 +273,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     # First crash delivered.
     assert len(adapter.sent) == 1
-    assert "crashed" in adapter.sent[0]["text"].lower()
+    assert "중간에 멈췄습니다" in adapter.sent[0]["text"]
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -233,4 +301,4 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"Second crashed event should also notify; got {len(adapter.sent)} "
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "crashed" in adapter.sent[1]["text"].lower()
+    assert "중간에 멈췄습니다" in adapter.sent[1]["text"]

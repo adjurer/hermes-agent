@@ -70,6 +70,25 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict({"gateway_restart_notification": "false"})
         assert restored.gateway_restart_notification is False
 
+    def test_top_level_telegram_extra_flags_are_preserved(self):
+        restored = PlatformConfig.from_dict({
+            "pin_active_work": False,
+            "disable_link_previews": True,
+            "extra": {"foo": "bar"},
+        })
+
+        assert restored.extra["pin_active_work"] is False
+        assert restored.extra["disable_link_previews"] is True
+        assert restored.extra["foo"] == "bar"
+
+    def test_explicit_extra_overrides_top_level_extra_bridge(self):
+        restored = PlatformConfig.from_dict({
+            "pin_active_work": False,
+            "extra": {"pin_active_work": True},
+        })
+
+        assert restored.extra["pin_active_work"] is True
+
 
 class TestGetConnectedPlatforms:
     def test_returns_enabled_with_token(self):

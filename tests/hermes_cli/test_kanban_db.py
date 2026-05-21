@@ -777,6 +777,22 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
+def test_notify_sub_preserves_reply_anchor(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reply anchored", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="12345",
+            reply_to_message_id="987",
+        )
+        subs = kb.list_notify_subs(conn, tid)
+
+    assert len(subs) == 1
+    assert subs[0]["reply_to_message_id"] == "987"
+
+
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="live")
@@ -1777,6 +1793,7 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_ALLOW_DIRECT_SEND"] == "0"
 
 
 # ---------------------------------------------------------------------------

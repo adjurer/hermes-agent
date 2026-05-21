@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 import subprocess
 from datetime import datetime
@@ -8,6 +9,7 @@ import pytest
 
 import gateway.run as gateway_run
 from agent.i18n import t
+from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
@@ -215,6 +217,30 @@ async def test_shutdown_notification_suppressed_when_restart_requested():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_service_restart_queues_wake_notice_and_suppresses_shutdown_ping(tmp_path, monkeypatch):
+    """Service-manager restarts should get the post-start briefing, too."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        name="Home",
+    )
+    session_key = "agent:main:telegram:dm:999"
+    runner._running_agents[session_key] = MagicMock()
+
+    assert runner._ensure_restart_wake_notice_marker("테스트 재시작") is True
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == []
+    data = json.loads((tmp_path / ".restart_notify.json").read_text())
+    assert data["platform"] == "telegram"
+    assert data["chat_id"] == "999"
+    assert "테스트 재시작" in data["summary"]
+    assert "진행중인 대화/업무" in data["summary"]
 
 
 @pytest.mark.asyncio

@@ -99,6 +99,44 @@ class TestCompress:
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
 
+    def test_historical_voice_transcript_is_not_pinned_as_head(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "compressed old voice context"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=3,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {
+                "role": "user",
+                "content": "[The user sent a voice message~ Here's what they said: \"old voice ask\"]",
+            },
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": "old follow-up"},
+            {"role": "assistant", "content": "old follow-up answer"},
+            {"role": "user", "content": "middle work"},
+            {"role": "assistant", "content": "middle answer"},
+            {"role": "user", "content": "current ask"},
+            {"role": "assistant", "content": "current answer"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs, current_tokens=100000)
+
+        live_contents = [m.get("content", "") for m in result]
+        assert not any(
+            isinstance(content, str) and content.startswith("[The user sent a voice message")
+            for content in live_contents
+        )
+        assert result[-2]["content"] == "current ask"
+        assert result[-1]["content"] == "current answer"
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""

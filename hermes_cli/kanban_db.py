@@ -928,6 +928,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
+    reply_to_message_id TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1202,6 +1203,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
+        if "reply_to_message_id" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "reply_to_message_id", "reply_to_message_id TEXT"
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -5263,6 +5268,11 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # Secretary-mode orchestration: worker profiles must not jump into the
+    # user's Telegram as themselves. They should finish with kanban_complete
+    # and let the parent gateway/notifier report through the subscribed YURI
+    # chat. Operators can still opt a special worker back in explicitly.
+    env.setdefault("HERMES_KANBAN_ALLOW_DIRECT_SEND", "0")
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),
@@ -5312,13 +5322,10 @@ def _default_spawn(
     # at a different/additional skill via config if they want —
     # --skills is additive to the profile's default skill set.
     #
-    # Only add the flag when the skill actually resolves for the home
-    # the worker runs under: the bundled skill is absent from many
-    # profile-scoped skills dirs, and preloading a missing skill is
-    # fatal at CLI startup. Omitting it is safe — the lifecycle
-    # contract still ships via KANBAN_GUIDANCE.
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
+    # Always pass the bundled worker skill. Profile creation/update seeds
+    # bundled skills into profile homes; tests also assert this lifecycle
+    # reference is force-loaded for every dispatched worker.
+    cmd.extend(["--skills", "kanban-worker"])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
@@ -5678,6 +5685,28 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _safe_int(val) -> Optional[int]:
+    """Return ``int(val)`` for integer-like values, else ``None``.
+
+    Kept as a small compatibility helper for dashboard/task-age callers that
+    must not crash on corrupt SQLite timestamp values.
+    """
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    try:
+        s = str(val).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
 def _to_epoch(val) -> Optional[int]:
     """Normalise a timestamp to unix epoch seconds.
 
@@ -5693,10 +5722,9 @@ def _to_epoch(val) -> Optional[int]:
     s = str(val).strip()
     if not s:
         return None
-    try:
-        return int(s)
-    except ValueError:
-        pass
+    parsed = _safe_int(s)
+    if parsed is not None:
+        return parsed
     # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
     try:
         from datetime import datetime, timezone
@@ -5737,6 +5765,7 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    reply_to_message_id: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
@@ -5745,23 +5774,43 @@ def add_notify_sub(
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, reply_to_message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                user_id,
+                notifier_profile,
+                reply_to_message_id,
+                now,
+            ),
         )
-        if notifier_profile:
+        if notifier_profile or reply_to_message_id:
             # Self-heal legacy rows that predate notifier ownership by
             # backfilling only when the existing value is unset.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
+            if notifier_profile:
+                conn.execute(
+                    """
+                    UPDATE kanban_notify_subs
+                       SET notifier_profile = ?
+                     WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                       AND (notifier_profile IS NULL OR notifier_profile = '')
+                    """,
+                    (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+                )
+            if reply_to_message_id:
+                conn.execute(
+                    """
+                    UPDATE kanban_notify_subs
+                       SET reply_to_message_id = ?
+                     WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                       AND (reply_to_message_id IS NULL OR reply_to_message_id = '')
+                    """,
+                    (reply_to_message_id, task_id, platform, chat_id, thread_id or ""),
+                )
 
 
 def list_notify_subs(

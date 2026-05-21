@@ -449,6 +449,32 @@ def test_group_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate(
     assert adapter._should_process_message(_group_message("hello", from_user_id=333)) is True
 
 
+def test_group_auth_receives_chat_context_for_group_allowlists():
+    adapter = _make_adapter(require_mention=True)
+    seen = {}
+
+    def _authorize(user_id, **kwargs):
+        seen["user_id"] = user_id
+        seen.update(kwargs)
+        return True
+
+    adapter._is_callback_user_authorized = _authorize
+
+    message = _group_message(
+        "hi @hermes_bot",
+        chat_id=-100123,
+        from_user_id=333,
+        thread_id=42,
+        entities=[_mention_entity("hi @hermes_bot")],
+    )
+
+    assert adapter._should_process_message(message) is True
+    assert seen["user_id"] == "333"
+    assert seen["chat_id"] == "-100123"
+    assert seen["chat_type"] == "group"
+    assert seen["thread_id"] == "42"
+
+
 def test_top_level_require_mention_bridges_to_telegram(monkeypatch, tmp_path):
     """require_mention at the config.yaml top level (alongside group_sessions_per_user)
     must behave identically to telegram.require_mention: true (#3979).

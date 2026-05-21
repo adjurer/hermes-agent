@@ -34,6 +34,29 @@ from gateway.config import (
 
 logger = logging.getLogger("gateway.stream_consumer")
 
+_LOCAL_ARTIFACT_RE = re.compile(
+    r"file:///[^\s`<>)\]}]+|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/[^\s`<>)\]}]*"
+    r"|(?<!MEDIA:)(?<![\w./-])(?:/Users/tbd|/private/tmp|/tmp|/var/folders)/[^\s`<>)\]}]+"
+)
+_LOCAL_PATH_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:파일\s*)?(?:경로|저장\s*위치|local\s*path|path|url)\s*[:：]\s*$"
+)
+_INLINE_LOCAL_PATH_LABEL_RE = re.compile(
+    r"(?i)(?:파일\s*)?(?:경로|저장\s*위치|local\s*path|path|url)\s*[:：]\s*"
+    r"(?:(?:file:///[^\s`<>)\]}]+|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/[^\s`<>)\]}]*)"
+    r"|(?:(?<!MEDIA:)(?<![\w./-])(?:/Users/tbd|/private/tmp|/tmp|/var/folders)/[^\s`<>)\]}]+))"
+)
+
+
+def _strip_local_delivery_noise(text: str) -> str:
+    """Hide local artifact paths from streamed chat text."""
+    cleaned = _INLINE_LOCAL_PATH_LABEL_RE.sub("", str(text or ""))
+    cleaned = _LOCAL_ARTIFACT_RE.sub("", cleaned)
+    cleaned = _LOCAL_PATH_LABEL_RE.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]+(\n|$)", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.rstrip()
+
 # Sentinel to signal the stream is complete
 _DONE = object()
 
@@ -655,10 +678,9 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
-            return text
         cleaned = text.replace("[[audio_as_voice]]", "")
         cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
+        cleaned = _strip_local_delivery_noise(cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         # Strip trailing whitespace/newlines but preserve leading content

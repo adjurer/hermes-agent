@@ -43,6 +43,14 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _is_interpreter_shutdown_delivery_error(error: object) -> bool:
+    text = str(error or "").casefold()
+    return (
+        "interpreter shutdown" in text
+        or "cannot schedule new futures after interpreter shutdown" in text
+    )
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -741,12 +749,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                     result = future.result(timeout=30)
             except Exception as e:
+                if _is_interpreter_shutdown_delivery_error(e):
+                    logger.info(
+                        "Job '%s': delivery skipped because the gateway is shutting down",
+                        job["id"],
+                    )
+                    continue
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
 
             if result and result.get("error"):
+                if _is_interpreter_shutdown_delivery_error(result["error"]):
+                    logger.info(
+                        "Job '%s': delivery skipped because the gateway is shutting down",
+                        job["id"],
+                    )
+                    continue
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)

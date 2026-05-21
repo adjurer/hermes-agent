@@ -106,6 +106,31 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 
+_TELEGRAM_LOCAL_ARTIFACT_RE = re.compile(
+    r"file:///[^\s`<>)\]}]+|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/[^\s`<>)\]}]*"
+    r"|(?<!MEDIA:)(?<![\w./-])(?:/Users/tbd|/private/tmp|/tmp|/var/folders)/[^\s`<>)\]}]+"
+)
+_TELEGRAM_LOCAL_PATH_LABEL_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:파일\s*)?(?:경로|저장\s*위치|local\s*path|path|url)\s*[:：]\s*$"
+)
+_TELEGRAM_INLINE_LOCAL_PATH_LABEL_RE = re.compile(
+    r"(?i)(?:파일\s*)?(?:경로|저장\s*위치|local\s*path|path|url)\s*[:：]\s*"
+    r"(?:(?:file:///[^\s`<>)\]}]+|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/[^\s`<>)\]}]*)"
+    r"|(?:(?<!MEDIA:)(?<![\w./-])(?:/Users/tbd|/private/tmp|/tmp|/var/folders)/[^\s`<>)\]}]+))"
+)
+_TELEGRAM_MEDIA_TAG_RE = re.compile(r'''[`"']?MEDIA:\s*\S+(?:[^\S\n]+\S+)*?[`"']?''')
+
+
+def _strip_telegram_local_delivery_noise(text: str) -> str:
+    """Keep Telegram chat text free of local artifact paths."""
+    cleaned = _TELEGRAM_MEDIA_TAG_RE.sub("", str(text or ""))
+    cleaned = _TELEGRAM_INLINE_LOCAL_PATH_LABEL_RE.sub("", cleaned)
+    cleaned = _TELEGRAM_LOCAL_ARTIFACT_RE.sub("", cleaned)
+    cleaned = _TELEGRAM_LOCAL_PATH_LABEL_RE.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]+(\n|$)", r"\1", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 
 MAX_COMMANDS_PER_SCOPE = 30
 
@@ -399,6 +424,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
+        self._pin_active_work: bool = self._coerce_bool_extra("pin_active_work", True)
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
@@ -558,13 +584,11 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         reply_to_mode: Optional[str] = None,
     ) -> Optional[int]:
+        if reply_to_mode == "off":
+            return None
         if reply_to:
             return int(reply_to)
-        if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
-            if reply_to_mode == "off":
-                return None
-            return cls._metadata_reply_to_message_id(metadata)
-        return None
+        return cls._metadata_reply_to_message_id(metadata)
 
     @classmethod
     def _thread_kwargs_for_send(
@@ -1652,6 +1676,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        content = _strip_telegram_local_delivery_noise(content)
         
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
@@ -1696,8 +1722,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 reply_to_source = reply_to or (
-                    str(metadata_reply_to)
-                    if metadata and metadata.get("telegram_dm_topic_reply_fallback") and metadata_reply_to is not None else None
+                    str(metadata_reply_to) if metadata_reply_to is not None else None
                 )
                 if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
                     should_thread = (
@@ -4464,14 +4489,33 @@ class TelegramAdapter(BasePlatformAdapter):
         # leaving inbound messages unblocked (issue #23778).
         _user = getattr(message, "from_user", None)
         _user_id = str(getattr(_user, "id", "")) if _user else ""
-        if not self._is_callback_user_authorized(_user_id):
-            logger.warning(
-                "[%s] Unauthorized user %s — message dropped",
-                self.name, _user_id,
-            )
-            return False
+        _chat = getattr(message, "chat", None)
+        _chat_id = str(getattr(_chat, "id", "")) if _chat else None
+        _chat_type = str(getattr(_chat, "type", "")).split(".")[-1].lower() if _chat else None
+        _thread_id = getattr(message, "message_thread_id", None)
+        _user_name = getattr(_user, "username", None) or getattr(_user, "full_name", None)
+        is_group_chat = self._is_group_chat(message)
+        guest_mention = is_group_chat and self._is_guest_mention(message)
+        if not self._is_callback_user_authorized(
+            _user_id,
+            chat_id=_chat_id,
+            chat_type=_chat_type,
+            thread_id=str(_thread_id) if _thread_id is not None else None,
+            user_name=str(_user_name).strip() if _user_name else None,
+        ):
+            if guest_mention:
+                logger.info(
+                    "[%s] Guest mention accepted for user %s in chat %s",
+                    self.name, _user_id, _chat_id,
+                )
+            else:
+                logger.warning(
+                    "[%s] Unauthorized user %s — message dropped",
+                    self.name, _user_id,
+                )
+                return False
 
-        if not self._is_group_chat(message):
+        if not is_group_chat:
             return True
 
         thread_id = getattr(message, "message_thread_id", None)
@@ -4489,22 +4533,10 @@ class TelegramAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
 
-        if not self._is_group_chat(message):
-            # Root DM (non-topic): ignore if ignore_root_dm is configured
-            if thread_id is None and self.config.extra.get("ignore_root_dm", False):
-                chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
-                if not is_command and chat_id in self._dm_topic_chat_ids:
-                    return False
-            return True
-
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
-
-        # Resolve guest-mode mention bypass once so _message_mentions_bot
-        # is not called redundantly in the normal flow below.
-        guest_mention = self._is_guest_mention(message)
 
         # allowed_chats check (whitelist). When set, group messages from chats
         # outside the whitelist are ignored unless guest_mode permits this
@@ -5426,8 +5458,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if chat_id and message_id:
             if self._reactions_enabled():
                 await self._set_reaction(chat_id, message_id, "\U0001f440")
-            # Pin the incoming message for the duration of the turn
-            if self._bot:
+            # Optional visible active-work marker. On busy personal chats this
+            # creates noisy Telegram service messages, so deployments can keep
+            # recovery on the durable ledger only by setting pin_active_work=false.
+            if self._pin_active_work and self._bot:
                 try:
                     await self._bot.pin_chat_message(
                         chat_id=int(chat_id),
@@ -5463,8 +5497,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id,
                     "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
                 )
-        # Unpin the message when processing is complete
-        if self._bot:
+        # Unpin the message when processing is complete, but only if this
+        # adapter was configured to create the temporary pin in the first place.
+        if self._pin_active_work and self._bot:
             try:
                 await self._bot.unpin_chat_message(
                     chat_id=int(chat_id),
@@ -5472,3 +5507,64 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 logger.debug("[Telegram] Failed to unpin message %s in chat %s", message_id, chat_id)
+
+    async def get_pinned_work_refs(self, chat_ids: List[str]) -> List[Dict[str, Any]]:
+        """Return current Telegram pinned-message refs for restart recovery.
+
+        Hermes uses temporary pins as a visible "active work" marker.  On
+        startup the gateway can compare these refs against its active-work
+        ledger; only ledger-matched pins are resumed, so ordinary user pins do
+        not accidentally restart old conversations.
+        """
+        if not self._bot:
+            return []
+
+        refs: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_chat_id in chat_ids:
+            chat_id = str(raw_chat_id or "").strip()
+            if not chat_id or chat_id in seen:
+                continue
+            seen.add(chat_id)
+
+            try:
+                chat = await self._bot.get_chat(int(chat_id))
+                pinned = getattr(chat, "pinned_message", None)
+            except Exception:
+                logger.debug("[Telegram] Failed to inspect pinned message for chat %s", chat_id, exc_info=True)
+                continue
+            if pinned is None:
+                continue
+
+            try:
+                from_user = getattr(pinned, "from_user", None)
+                if getattr(from_user, "is_bot", False):
+                    continue
+                pinned_chat = getattr(pinned, "chat", None)
+                pinned_chat_type = str(getattr(pinned_chat, "type", "") or "").lower()
+                if pinned_chat_type == "private":
+                    chat_type = "dm"
+                elif pinned_chat_type in {"group", "supergroup"}:
+                    chat_type = "group"
+                elif pinned_chat_type == "channel":
+                    chat_type = "channel"
+                else:
+                    chat_type = "dm"
+
+                thread_id = getattr(pinned, "message_thread_id", None)
+                text = getattr(pinned, "text", None) or getattr(pinned, "caption", None) or ""
+                refs.append({
+                    "platform": "telegram",
+                    "chat_id": str(getattr(pinned_chat, "id", None) or chat_id),
+                    "chat_name": getattr(pinned_chat, "title", None) or getattr(pinned_chat, "full_name", None),
+                    "chat_type": chat_type,
+                    "thread_id": str(thread_id) if thread_id is not None else None,
+                    "user_id": str(getattr(from_user, "id", "")) if from_user else None,
+                    "user_name": getattr(from_user, "full_name", None) if from_user else None,
+                    "message_id": str(getattr(pinned, "message_id", "")),
+                    "text": text,
+                })
+            except Exception:
+                logger.debug("[Telegram] Failed to normalize pinned message for chat %s", chat_id, exc_info=True)
+                continue
+        return refs

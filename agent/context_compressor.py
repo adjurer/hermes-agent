@@ -50,6 +50,10 @@ SUMMARY_PREFIX = (
     "config, etc.) may reflect work described here — avoid repeating it:"
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+VOICE_TRANSCRIPT_PREFIX_RE = re.compile(
+    r"^\s*\[The user sent a voice message[~:]\s+Here's what they said:",
+    re.IGNORECASE,
+)
 
 # Minimum tokens for the summary output
 _MIN_SUMMARY_TOKENS = 2000
@@ -1339,6 +1343,40 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             head = 1
         return head + self.protect_first_n
 
+    @staticmethod
+    def _is_voice_transcript_message(msg: Dict[str, Any]) -> bool:
+        """True for synthetic STT wrapper turns inserted for voice messages."""
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            return False
+        return bool(VOICE_TRANSCRIPT_PREFIX_RE.match(_content_text_for_contains(msg.get("content"))))
+
+    def _adjust_head_for_ephemeral_voice(
+        self,
+        messages: List[Dict[str, Any]],
+        compress_start: int,
+    ) -> int:
+        """Do not pin the session's first STT voice turn forever.
+
+        ``protect_first_n`` is useful for durable startup context such as a
+        system prompt or auto-loaded skill.  In Telegram voice-heavy sessions,
+        however, the first user message can be a one-off STT wrapper.  Keeping
+        that wrapper in the protected head makes every future compressed
+        session look like it is still answering that old voice note.
+
+        If the first non-system protected message is a voice transcript, move
+        the compression boundary back to that message so it becomes part of the
+        handoff summary instead of live active context.  Recent voice messages
+        remain protected by the tail logic.
+        """
+        if compress_start <= 0 or not messages:
+            return compress_start
+        first_non_system = 1 if messages[0].get("role") == "system" else 0
+        if first_non_system >= compress_start or first_non_system >= len(messages):
+            return compress_start
+        if not self._is_voice_transcript_message(messages[first_non_system]):
+            return compress_start
+        return first_non_system
+
     def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Pull a compress-end boundary backward to avoid splitting a
         tool_call / result group.
@@ -1564,6 +1602,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # Phase 2: Determine boundaries
         compress_start = self._protect_head_size(messages)
+        compress_start = self._adjust_head_for_ephemeral_voice(messages, compress_start)
         compress_start = self._align_boundary_forward(messages, compress_start)
 
         # Use token-budget tail protection instead of fixed message count

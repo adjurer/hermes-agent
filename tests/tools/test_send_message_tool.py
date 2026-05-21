@@ -2430,7 +2430,8 @@ class TestCheckSendMessage:
 
     1. ``HERMES_KANBAN_TASK`` is set (worker spawned by the kanban dispatcher
        — parent gateway is by definition running, but the worker's
-       ``HERMES_HOME`` may be a profile dir without a ``gateway.pid``).
+       ``HERMES_HOME`` may be a profile dir without a ``gateway.pid``), unless
+       ``HERMES_KANBAN_ALLOW_DIRECT_SEND`` explicitly disables direct sends.
     2. ``HERMES_SESSION_PLATFORM`` resolves to a non-empty, non-``local`` value
        (the session is wired to a messaging platform like Telegram).
     3. ``is_gateway_running()`` returns True (CLI / orchestrator profile with
@@ -2449,6 +2450,19 @@ class TestCheckSendMessage:
         with patch("gateway.session_context.get_session_env", return_value=""), \
              patch("gateway.status.is_gateway_running", return_value=False):
             assert _check_send_message() is True
+
+    def test_kanban_task_env_can_disable_direct_send(self, monkeypatch):
+        """Secretary-mode kanban workers should report via kanban_complete, not
+        send_message, when the dispatcher disables direct sends."""
+        from tools.send_message_tool import _check_send_message
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc12345")
+        monkeypatch.setenv("HERMES_KANBAN_ALLOW_DIRECT_SEND", "0")
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+        with patch("gateway.session_context.get_session_env", return_value=""), \
+             patch("gateway.status.is_gateway_running", return_value=False):
+            assert _check_send_message() is False
 
     def test_kanban_task_env_short_circuits_before_gateway_check(self, monkeypatch):
         """Honoring HERMES_KANBAN_TASK must not depend on importing or calling

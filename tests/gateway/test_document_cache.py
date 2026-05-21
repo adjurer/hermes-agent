@@ -8,7 +8,9 @@ Covers: get_document_cache_dir, cache_document_from_bytes,
 import os
 import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -128,10 +130,12 @@ class TestDocumentEncoding:
         decomposed_name = unicodedata.normalize("NFD", "한글보고서.md")
         source = tmp_path / decomposed_name
         source.write_bytes("# 제목\n한글 내용".encode("cp949"))
+        written_at = datetime(2026, 5, 20, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+        os.utime(source, (written_at, written_at))
 
         send_path, display_name = prepare_outbound_document_for_send(source)
 
-        assert display_name == "한글보고서.md"
+        assert display_name == "260520_한글보고서.md"
         assert send_path != str(source)
         sent_bytes = Path(send_path).read_bytes()
         assert sent_bytes.startswith(b"\xef\xbb\xbf")
@@ -141,22 +145,36 @@ class TestDocumentEncoding:
     def test_prepare_outbound_binary_document_does_not_reencode(self, tmp_path):
         source = tmp_path / unicodedata.normalize("NFD", "계약서.hwp")
         source.write_bytes(b"\xd0\xcf\x11\xe0binary-hwp")
+        written_at = datetime(2026, 5, 20, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+        os.utime(source, (written_at, written_at))
 
         send_path, display_name = prepare_outbound_document_for_send(source)
 
         assert send_path == str(source)
-        assert display_name == "계약서.hwp"
+        assert display_name == "260520_계약서.hwp"
         assert source.read_bytes() == b"\xd0\xcf\x11\xe0binary-hwp"
 
     def test_prepare_outbound_json_does_not_add_bom(self, tmp_path):
         source = tmp_path / "data.json"
         source.write_bytes('{"name":"한글"}'.encode("utf-8"))
+        written_at = datetime(2026, 5, 20, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+        os.utime(source, (written_at, written_at))
 
         send_path, display_name = prepare_outbound_document_for_send(source)
 
         assert send_path == str(source)
-        assert display_name == "data.json"
+        assert display_name == "260520_data.json"
         assert source.read_bytes() == '{"name":"한글"}'.encode("utf-8")
+
+    def test_prepare_outbound_document_uses_file_written_date_prefix(self, tmp_path):
+        source = tmp_path / "policy_report.md"
+        source.write_bytes("# 보고서\n".encode("utf-8"))
+        written_at = datetime(2026, 5, 18, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+        os.utime(source, (written_at, written_at))
+
+        _, display_name = prepare_outbound_document_for_send(source)
+
+        assert display_name == "260518_보고서.md"
 
 
 # ---------------------------------------------------------------------------

@@ -330,6 +330,18 @@ class PlatformConfig:
         if _grn is None:
             _grn = data.get("extra", {}).get("gateway_restart_notification")
 
+        extra = data.get("extra", {})
+        if not isinstance(extra, dict):
+            extra = {}
+        else:
+            extra = dict(extra)
+        # Some user-facing platform keys live beside `reply_to_mode` in
+        # config.yaml for readability, while adapters consume them through
+        # PlatformConfig.extra.  Preserve top-level values there too.
+        for extra_key in ("disable_link_previews", "pin_active_work"):
+            if extra_key in data and extra_key not in extra:
+                extra[extra_key] = data[extra_key]
+
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
             token=data.get("token"),
@@ -337,7 +349,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
-            extra=data.get("extra", {}),
+            extra=extra,
         )
 
 

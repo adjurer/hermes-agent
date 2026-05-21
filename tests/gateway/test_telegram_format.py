@@ -732,6 +732,29 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
     assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
 
 
+@pytest.mark.asyncio
+async def test_send_uses_metadata_reply_anchor_for_plain_telegram_chats(adapter):
+    adapter._bot = MagicMock()
+    sent_kwargs = []
+
+    async def _fake_send_message(**kwargs):
+        sent_kwargs.append(kwargs)
+        msg = MagicMock()
+        msg.message_id = 777
+        return msg
+
+    adapter._bot.send_message = AsyncMock(side_effect=_fake_send_message)
+
+    result = await adapter.send(
+        "123",
+        "reply from metadata",
+        metadata={"telegram_reply_to_message_id": "456"},
+    )
+
+    assert result.success is True
+    assert sent_kwargs[0]["reply_to_message_id"] == 456
+
+
 # =========================================================================
 # edit_message — streaming Markdown safety
 # =========================================================================
@@ -849,9 +872,13 @@ def _guest_test_adapter(*, guest_mode=True, require_mention=True, allowed_chats=
             "guest_mode": guest_mode,
             "require_mention": require_mention,
             "allowed_chats": allowed_chats or ["-100200"],
+            # Keep this helper isolated from TELEGRAM_ALLOWED_TOPICS that
+            # config-bridge tests may set while exercising env export.
+            "allowed_topics": [],
         },
     )
     adapter = object.__new__(TelegramAdapter)
+    adapter.platform = SimpleNamespace(value="telegram")
     adapter.config = config
     adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
     adapter._mention_patterns = adapter._compile_mention_patterns()
