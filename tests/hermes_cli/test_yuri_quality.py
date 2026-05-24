@@ -55,6 +55,26 @@ def test_yuri_quality_detects_simple_check_overrouting():
     assert "simple_check_overrouted" in {i.code for i in issues}
 
 
+def test_yuri_quality_detects_thin_orchestration_ack():
+    issues = yq.scan_messages([
+        {"id": "7", "sender": "YURI", "text": "네. 운영팀에 이관하겠습니다."}
+    ])
+
+    assert "thin_orchestration_ack" in {i.code for i in issues}
+
+
+def test_yuri_quality_detects_stock_orchestration_phrase():
+    issues = yq.scan_messages([
+        {
+            "id": "8",
+            "sender": "YURI",
+            "text": "진행과 검증은 나눠 진행하고, 결과는 제가 모아서 짧게 보고드리겠습니다.",
+        }
+    ])
+
+    assert "stock_orchestration_phrase" in {i.code for i in issues}
+
+
 def test_yuri_quality_backtests_pass():
     result = yq.run_backtests()
 

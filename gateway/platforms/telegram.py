@@ -5781,7 +5781,8 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            emoji = self._reaction_from_env("TELEGRAM_REACTION_START", "\U0001f440")
+            await self._set_reaction_with_fallback(chat_id, message_id, emoji, "\U0001f440")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
@@ -5805,8 +5806,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
         else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
-            )
+            if outcome == ProcessingOutcome.SUCCESS:
+                emoji = self._reaction_from_env("TELEGRAM_REACTION_SUCCESS", "\U0001f525")
+                await self._set_reaction_with_fallback(chat_id, message_id, emoji, "\U0001f44d")
+                return
+            emoji = self._optional_reaction_from_env("TELEGRAM_REACTION_FAILURE", None)
+            if emoji is None:
+                await self._clear_reactions(chat_id, message_id)
+            else:
+                await self._set_reaction_with_fallback(chat_id, message_id, emoji, "\U0001f44e")

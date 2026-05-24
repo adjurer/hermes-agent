@@ -346,7 +346,7 @@ async def test_yuri_delivery_followup_links_to_recent_done_task(tmp_path, monkey
 
     assert response is not None
     assert "문서팀에 이관하겠습니다" in response
-    assert "확인해야 할 상태" in response
+    assert "원래 요청에 이어 결과만 보고하겠습니다" in response
     conn = kb.connect()
     try:
         children = kb.child_ids(conn, parent_id)

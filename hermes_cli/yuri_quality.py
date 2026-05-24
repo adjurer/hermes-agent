@@ -64,6 +64,16 @@ WORKER_COMPLETE_RE = re.compile(
     r"(완료(?:했습니다|했습니다,|함)|전송 완료|마무리했습니다|처리 완료|보고드립니다)"
 )
 
+STOCK_ORCHESTRATION_RE = re.compile(
+    r"(진행과\s*검증은\s*나눠\s*진행하고|결과는\s*제가\s*모아서\s*짧게\s*보고|"
+    r"확인해야\s*할\s*상태,\s*실제\s*원인,\s*바로\s*할\s*조치)"
+)
+
+SPECIFIC_INTERPRETATION_RE = re.compile(
+    r"(제가 이해한|이건|이 일은|말씀하신|요청은|목표는|핵심은|"
+    r"상태|원인|파일|문서|로그|게이트웨이|텔레그램|지도|사이트|검토|조사|수정|설정|접속)"
+)
+
 YURI_NAMES = {"yuri", "유리", "beanslab_bot", "@beanslab_bot"}
 INTERNAL_WORKER_HINTS = {
     "planner", "researcher", "ops", "reviewer", "docslead", "analyst", "writer",
@@ -183,6 +193,23 @@ def scan_messages(messages: Iterable[Mapping[str, Any]], *, context_window: int 
                     summary="간단 진단/정확 응답 요청을 서브에이전트 업무처럼 라우팅했습니다.",
                     recommendation="건강 확인, OK-only, 가능 여부 질문은 직접 짧게 답하고 실제 다단계 업무만 Kanban/subagent로 보냅니다.",
                 ))
+            elif not SPECIFIC_INTERPRETATION_RE.search(text) and len(text.strip()) < 80:
+                issues.append(QualityIssue(
+                    code="thin_orchestration_ack",
+                    severity="medium",
+                    message_id=mid,
+                    summary="구체적 업무 해석 없이 팀 이관만 말해 로봇처럼 보입니다.",
+                    recommendation="첫 응답에는 이번 일을 어떻게 이해했는지 한 문장으로 적고, 팀 배정은 짧게 붙입니다.",
+                ))
+
+        if _is_yuri(sender) and STOCK_ORCHESTRATION_RE.search(text):
+            issues.append(QualityIssue(
+                code="stock_orchestration_phrase",
+                severity="medium",
+                message_id=mid,
+                summary="반복되는 오케스트레이션 멘트가 사용자 대화에 노출되었습니다.",
+                recommendation="고정 문구 대신 이번 업무의 구체적 해석, 맡길 팀, 완료 후 보고 방식만 짧게 말합니다.",
+            ))
 
     return issues
 
@@ -288,6 +315,16 @@ def run_backtests() -> dict[str, Any]:
                 {"id": "m6b", "sender": "YURI", "text": "네. 운영팀에 이관하겠습니다."},
             ],
             "expect": {"simple_check_overrouted"},
+        },
+        {
+            "name": "orchestration acks need concrete interpretation",
+            "messages": [{"id": "m7", "sender": "YURI", "text": "네. 운영팀에 이관하겠습니다."}],
+            "expect": {"thin_orchestration_ack"},
+        },
+        {
+            "name": "stock orchestration phrases should be avoided",
+            "messages": [{"id": "m8", "sender": "YURI", "text": "진행과 검증은 나눠 진행하고, 결과는 제가 모아서 짧게 보고드리겠습니다."}],
+            "expect": {"stock_orchestration_phrase"},
         },
     ]
     results = []
