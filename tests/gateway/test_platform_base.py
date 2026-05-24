@@ -7,17 +7,11 @@ import pytest
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    ensure_outbound_document_filename_policy,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
     MessageType,
-    SUPPORTED_DOCUMENT_TYPES,
-    filter_existing_media_files,
-    media_delivery_warning,
-    partition_existing_media_files,
     safe_url_for_log,
     utf16_len,
-    validate_outbound_media_file,
     _prefix_within_utf16_limit,
 )
 
@@ -335,30 +329,6 @@ class TestExtractMedia:
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
 
-    def test_media_tag_supports_korean_document_paths(self):
-        content = "Docs\nMEDIA:/tmp/기초비례최종/보고서.hwp\nMEDIA:/tmp/기초비례최종/서식.hwpx"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
-        assert media == [
-            ("/tmp/기초비례최종/보고서.hwp", False),
-            ("/tmp/기초비례최종/서식.hwpx", False),
-        ]
-        assert cleaned == "Docs"
-
-    def test_media_tag_supports_markdown_document_paths(self):
-        content = "Docs\nMEDIA:/tmp/candidate_roster.md\nMEDIA:/tmp/report.markdown"
-        media, cleaned = BasePlatformAdapter.extract_media(content)
-        assert media == [
-            ("/tmp/candidate_roster.md", False),
-            ("/tmp/report.markdown", False),
-        ]
-        assert cleaned == "Docs"
-
-    def test_supported_document_types_include_markdown_hwp_and_hwpx(self):
-        assert SUPPORTED_DOCUMENT_TYPES[".md"] == "text/markdown"
-        assert SUPPORTED_DOCUMENT_TYPES[".markdown"] == "text/markdown"
-        assert SUPPORTED_DOCUMENT_TYPES[".hwp"] == "application/x-hwp"
-        assert SUPPORTED_DOCUMENT_TYPES[".hwpx"] == "application/hwp+zip"
-
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from
         user-visible text just like [[audio_as_voice]]. Callers detect the
@@ -391,115 +361,70 @@ class TestExtractMedia:
         assert "[[as_document]]" not in cleaned
 
 
-class TestFilterExistingMediaFiles:
-    def test_keeps_real_file_and_skips_missing_or_placeholder(self, tmp_path):
-        real = tmp_path / "speech.ogg"
-        real.write_bytes(b"audio")
-
-        filtered = filter_existing_media_files(
-            [
-                (str(real), True),
-                ("/path/to/file.xlsx", False),
-                ("/tmp/missing-file.ogg", False),
-            ],
-            "Test",
+class TestMediaDeliveryPathValidation:
+    def _patch_roots(self, monkeypatch, *roots):
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            tuple(roots),
         )
 
-        assert filtered == [(str(real), True)]
+    def test_allows_existing_file_inside_safe_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "media-cache"
+        media_file = root / "voice.ogg"
+        media_file.parent.mkdir(parents=True)
+        media_file.write_bytes(b"OggS")
+        self._patch_roots(monkeypatch, root)
 
-    def test_partition_reports_skipped_media_paths(self, tmp_path):
-        real = tmp_path / "report.pdf"
-        real.write_bytes(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n")
+        assert BasePlatformAdapter.validate_media_delivery_path(str(media_file)) == str(media_file.resolve())
 
-        valid, skipped = partition_existing_media_files(
-            [
-                (str(real), False),
-                ("/absolute/path.png", False),
-                ("/tmp/missing-file.ogg", True),
-            ],
-            "Test",
-        )
+    def test_rejects_existing_file_outside_safe_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "media-cache"
+        root.mkdir()
+        secret = tmp_path / "secrets.txt"
+        secret.write_text("not for upload")
+        self._patch_roots(monkeypatch, root)
 
-        assert valid == [(str(real), False)]
-        assert skipped == ["/absolute/path.png", "/tmp/missing-file.ogg"]
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
-    def test_media_delivery_warning_is_user_facing(self):
-        warning = media_delivery_warning(["/absolute/path.png", "/tmp/missing.pdf"])
+    def test_rejects_symlink_escape_from_safe_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "media-cache"
+        root.mkdir()
+        secret = tmp_path / "outside.png"
+        secret.write_bytes(b"secret")
+        link = root / "safe-looking.png"
+        try:
+            link.symlink_to(secret)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+        self._patch_roots(monkeypatch, root)
 
-        assert "실제 파일이 없거나 열 수 없어 전송하지 않았습니다" in warning
-        assert "/absolute/path.png" in warning
+        assert BasePlatformAdapter.validate_media_delivery_path(str(link)) is None
 
-    def test_rejects_corrupt_zip_document(self, tmp_path):
-        broken = tmp_path / "보고서.docx"
-        broken.write_bytes(b"not a zip")
+    def test_filter_keeps_safe_media_and_drops_unsafe(self, tmp_path, monkeypatch):
+        root = tmp_path / "media-cache"
+        safe = root / "speech.ogg"
+        unsafe = tmp_path / "outside.ogg"
+        safe.parent.mkdir(parents=True)
+        safe.write_bytes(b"OggS")
+        unsafe.write_bytes(b"OggS")
+        self._patch_roots(monkeypatch, root)
 
-        valid, reason = validate_outbound_media_file(str(broken))
+        filtered = BasePlatformAdapter.filter_media_delivery_paths([
+            (str(unsafe), False),
+            (str(safe), True),
+        ])
 
-        assert valid is False
-        assert "zip" in reason
+        assert filtered == [(str(safe.resolve()), True)]
 
-    def test_rejects_non_utf8_markdown(self, tmp_path):
-        broken = tmp_path / "초안.md"
-        broken.write_bytes("깨진 초안".encode("cp949"))
+    def test_allows_operator_configured_extra_root(self, tmp_path, monkeypatch):
+        extra_root = tmp_path / "operator-media"
+        media_file = extra_root / "report.pdf"
+        media_file.parent.mkdir(parents=True)
+        media_file.write_bytes(b"%PDF-1.4")
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(extra_root))
 
-        valid, reason = validate_outbound_media_file(str(broken))
-
-        assert valid is False
-        assert "UTF-8" in reason
-
-    def test_outbound_document_filename_gets_date_prefix(self):
-        assert (
-            ensure_outbound_document_filename_policy("경기도 후보자 초안.md", today="260518")
-            == "260518_경기도 후보자 초안.md"
-        )
-
-    def test_outbound_document_filename_keeps_existing_date_prefix(self):
-        assert (
-            ensure_outbound_document_filename_policy("260518_경기도 후보자 초안.md", today="260519")
-            == "260518_경기도 후보자 초안.md"
-        )
-
-    def test_generated_image_filename_becomes_korean(self):
-        assert (
-            ensure_outbound_document_filename_policy("image_2026-05-20_10-52-04.png", today="260520")
-            == "260520_이미지.png"
-        )
-
-    def test_technical_poll_filename_becomes_korean(self):
-        assert (
-            ensure_outbound_document_filename_policy("260520_nesdc_poll_since_20260511.xlsx", today="260520")
-            == "260520_여심위_여론조사_자료.xlsx"
-        )
-
-    def test_generated_english_schedule_filename_becomes_korean(self):
-        assert (
-            ensure_outbound_document_filename_policy("candidate_schedule_map.xlsx", today="260520")
-            == "260520_일정지도.xlsx"
-        )
-
-    def test_generated_english_report_filename_becomes_korean(self):
-        assert (
-            ensure_outbound_document_filename_policy("policy_report.md", today="260520")
-            == "260520_보고서.md"
-        )
-
-    def test_generated_english_election_filename_becomes_korean(self):
-        assert (
-            ensure_outbound_document_filename_policy("kpp_gyeonggi_controversy_update.xlsx", today="260520")
-            == "260520_선거자료.xlsx"
-        )
-
-    def test_generated_english_html_dashboard_filename_becomes_korean(self):
-        assert (
-            ensure_outbound_document_filename_policy("campaign_schedule_map_olivia_latest.html", today="260520")
-            == "260520_일정지도.html"
-        )
-
-    def test_korean_existing_date_filename_is_preserved(self):
-        assert (
-            ensure_outbound_document_filename_policy("260520_6.3지선 중간 판세(평택을)_v1.hwp", today="260520")
-            == "260520_6.3지선 중간 판세(평택을)_v1.hwp"
-        )
+        assert BasePlatformAdapter.validate_media_delivery_path(str(media_file)) == str(media_file.resolve())
 
 
 # ---------------------------------------------------------------------------

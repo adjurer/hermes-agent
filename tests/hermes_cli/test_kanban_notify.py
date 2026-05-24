@@ -1,5 +1,4 @@
 import asyncio
-import json
 import pytest
 
 from pathlib import Path
@@ -18,6 +17,11 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Allow the kanban notifier path-validator to upload artifacts the
+    # tests write under ``tmp_path``. Without this, every artifact-delivery
+    # test silently drops files because ``tmp_path`` isn't inside the
+    # default ``MEDIA_DELIVERY_SAFE_ROOTS`` cache dirs.
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
     kb.init_db()
     return home
 
@@ -45,7 +49,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
     fake_adapter = MagicMock()
 
-    async def _send_and_stop(chat_id, msg, reply_to=None, metadata=None):
+    async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
@@ -105,7 +109,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     fake_adapter = MagicMock()
 
-    async def _send_and_stop(chat_id, msg, reply_to=None, metadata=None):
+    async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
@@ -124,12 +128,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
-    expected_phrase = {
-        "gave_up": "반복해서 실패",
-        "crashed": "중간에 멈췄",
-        "timed_out": "시간이 길어",
-    }[kind]
-    assert expected_phrase in fake_adapter.send.call_args[0][1]
+    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
@@ -165,7 +164,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     delivered_msgs: list[str] = []
 
-    async def _capture_send(chat_id, msg, reply_to=None, metadata=None):
+    async def _capture_send(chat_id, msg, metadata=None):
         delivered_msgs.append(msg)
 
     fake_adapter = MagicMock()
@@ -215,7 +214,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "막혔" in m]
+    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
     assert len(blocked_deliveries) == 2, (
@@ -412,7 +411,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
 
     fake_adapter = MagicMock()
 
-    async def _send_and_stop(chat_id, msg, reply_to=None, metadata=None):
+    async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
@@ -488,7 +487,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
 
 @pytest.mark.asyncio
-async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path):
+async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, monkeypatch):
     """When a completed event carries ``artifacts`` in its payload, the
     notifier uploads each file to the subscribed chat as a native
     attachment. Images batch through send_multiple_images; documents
@@ -499,6 +498,13 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path):
     from gateway.run import GatewayRunner
     from gateway.config import Platform
     from tools import kanban_tools as kt
+
+    # ``_deliver_kanban_artifacts`` routes candidates through
+    # ``BasePlatformAdapter.filter_local_delivery_paths``, which only accepts
+    # paths under ``MEDIA_DELIVERY_SAFE_ROOTS`` or roots explicitly allowlisted
+    # via ``HERMES_MEDIA_ALLOW_DIRS``. Test fixtures live under ``tmp_path``,
+    # so allowlist it for the duration of the test.
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
 
     # Materialize real files so os.path.isfile passes inside the helper.
     chart_path = tmp_path / "q3-revenue.png"
@@ -538,7 +544,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path):
     images_uploaded: list = []
     documents_uploaded: list = []
 
-    async def _send(chat_id, msg, reply_to=None, metadata=None):
+    async def _send(chat_id, msg, metadata=None):
         sends.append((chat_id, msg))
         runner._running = False
 
@@ -578,15 +584,18 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_notifier_artifact_delivery_rejects_missing_explicit_files(kanban_home, tmp_path):
-    """Explicit artifact paths are a delivery contract.
-
-    If a worker claims a file deliverable in ``artifacts`` but the file is
-    missing, completion must be rejected before the notifier ever sees a
-    phantom attachment.
-    """
+async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
+    """Missing artifact paths are silently skipped — they may have been
+    referenced by name only. The notifier must not crash and must still
+    deliver any artifacts that do exist."""
     import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
     from tools import kanban_tools as kt
+
+    # Allow ``tmp_path`` through the media-delivery safety filter. See the
+    # companion test for the full explanation.
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
@@ -601,23 +610,47 @@ async def test_notifier_artifact_delivery_rejects_missing_explicit_files(kanban_
     import os
     os.environ["HERMES_KANBAN_TASK"] = tid
     try:
-        out = kt._handle_complete({
+        kt._handle_complete({
             "summary": "one real, one ghost",
             "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
 
-    err = json.loads(out).get("error", "")
-    assert "artifact path(s) do not exist" in err
-    assert "still in-flight" in err
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
 
-    conn = kb.connect()
-    try:
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        assert task.status != "done"
-        completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
-        assert completed == []
-    finally:
-        conn.close()
+    fake_adapter = MagicMock()
+    fake_adapter.name = "telegram"
+
+    documents_uploaded: list = []
+
+    async def _send(chat_id, msg, metadata=None):
+        runner._running = False
+
+    async def _send_document(chat_id, file_path, metadata=None, **_kw):
+        documents_uploaded.append(file_path)
+
+    fake_adapter.send = AsyncMock(side_effect=_send)
+    fake_adapter.send_document = AsyncMock(side_effect=_send_document)
+    fake_adapter.send_multiple_images = AsyncMock()
+    from gateway.platforms.base import BasePlatformAdapter
+    fake_adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    # Only the real file was uploaded.
+    assert len(documents_uploaded) == 1
+    assert "real.pdf" in documents_uploaded[0]
