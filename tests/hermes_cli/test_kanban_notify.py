@@ -49,7 +49,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
     fake_adapter = MagicMock()
 
-    async def _send_and_stop(chat_id, msg, metadata=None):
+    async def _send_and_stop(chat_id, msg, metadata=None, **_kw):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
@@ -109,7 +109,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     fake_adapter = MagicMock()
 
-    async def _send_and_stop(chat_id, msg, metadata=None):
+    async def _send_and_stop(chat_id, msg, metadata=None, **_kw):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
@@ -384,6 +384,84 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_notifier_suppresses_intermediate_child_completion(kanban_home, tmp_path):
+    """Intermediate worker cards hand the subscription to children without
+    sending confusing completion or missing-artifact messages to the user."""
+    import os
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="root handoff", assignee="researcher")
+        child_id = kb.create_task(
+            conn,
+            title="final report",
+            assignee="writer",
+            parents=[parent_id],
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="chat1",
+            notifier_profile="default",
+        )
+    finally:
+        conn.close()
+
+    intermediate = tmp_path / "intermediate.md"
+    intermediate.write_text("internal only", encoding="utf-8")
+
+    os.environ["HERMES_KANBAN_TASK"] = parent_id
+    try:
+        kt._handle_complete({
+            "summary": "중간 자료를 만들었습니다.",
+            "artifacts": [str(intermediate)],
+        })
+    finally:
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+    intermediate.unlink()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "default"
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+    tick_count = 0
+
+    async def _fast_sleep(_):
+        nonlocal tick_count
+        await _orig_sleep(0)
+        tick_count += 1
+        if tick_count >= 3:
+            runner._running = False
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_not_called()
+    conn = kb.connect()
+    try:
+        parent_subs = kb.list_notify_subs(conn, parent_id)
+        child_subs = kb.list_notify_subs(conn, child_id)
+    finally:
+        conn.close()
+    assert parent_subs == []
+    assert len(child_subs) == 1
+
+
+@pytest.mark.asyncio
 async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_home):
     """The gateway for the profile that created/subscribed the task reports it."""
     import hermes_cli.kanban_db as kb
@@ -411,7 +489,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
 
     fake_adapter = MagicMock()
 
-    async def _send_and_stop(chat_id, msg, metadata=None):
+    async def _send_and_stop(chat_id, msg, metadata=None, **_kw):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
@@ -544,7 +622,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     images_uploaded: list = []
     documents_uploaded: list = []
 
-    async def _send(chat_id, msg, metadata=None):
+    async def _send(chat_id, msg, metadata=None, **_kw):
         sends.append((chat_id, msg))
         runner._running = False
 
@@ -599,6 +677,8 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
+    ghost_pdf = tmp_path / "ghost.pdf"
+    ghost_pdf.write_bytes(b"%PDF-ghost")
 
     conn = kb.connect()
     try:
@@ -612,10 +692,11 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     try:
         kt._handle_complete({
             "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
+            "artifacts": [str(real_pdf), str(ghost_pdf)],
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+    ghost_pdf.unlink()
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
@@ -626,7 +707,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     documents_uploaded: list = []
 
-    async def _send(chat_id, msg, metadata=None):
+    async def _send(chat_id, msg, metadata=None, **_kw):
         runner._running = False
 
     async def _send_document(chat_id, file_path, metadata=None, **_kw):

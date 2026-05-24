@@ -5203,6 +5203,13 @@ class GatewayRunner:
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
                         if kind == "completed":
+                            if int(d.get("open_child_count") or 0) > 0:
+                                logger.debug(
+                                    "kanban notifier: suppressing intermediate completion for %s; %d child task(s) still open",
+                                    sub["task_id"],
+                                    int(d.get("open_child_count") or 0),
+                                )
+                                continue
                             artifact_status = self._kanban_artifact_status(
                                 adapter=adapter,
                                 event_payload=getattr(ev, "payload", None),
@@ -5212,18 +5219,6 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             task_result_text = str(task.result) if task and task.result else ""
-                            if (
-                                kind == "completed"
-                                and getattr(task, "assignee", None) == "planner"
-                                and int(d.get("open_child_count") or 0) > 0
-                                and re.search(r"(?:배정|연결).{0,20}(?:완료|했습니다)", str(payload_summary or task_result_text))
-                            ):
-                                logger.debug(
-                                    "kanban notifier: suppressing planner handoff completion for %s; %d child task(s) still open",
-                                    sub["task_id"],
-                                    int(d.get("open_child_count") or 0),
-                                )
-                                continue
                             if (
                                 artifact_status["declared"] > 0
                                 and artifact_status["existing"] == 0
