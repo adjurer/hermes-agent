@@ -7354,6 +7354,10 @@ class GatewayRunner:
 
         worker_brief = self._yuri_worker_brief(compact, assignee, reason)
         user_interpretation = self._yuri_user_interpretation(compact, assignee, reason)
+        recent_context = self._yuri_recent_context_summary(
+            source,
+            current_message_id=str(getattr(event, "message_id", "") or ""),
+        )
         body_parts = [
             (
                 "유리 PM 오케스트레이션 루트 업무입니다."
@@ -7391,6 +7395,17 @@ class GatewayRunner:
             "- 실제 첨부 성공 전까지 '전달했습니다'라고 보고하지 않습니다.",
             "- 페이커/올리비아처럼 다른 사람의 봇이나 외부 에이전트는 내부 worker처럼 지휘하지 않습니다. 관찰/요약만 하고 유리의 담당 업무와 분리합니다.",
         ]
+        if recent_context:
+            try:
+                insert_at = body_parts.index("처리 규칙:")
+            except ValueError:
+                insert_at = 8
+            body_parts[insert_at:insert_at] = [
+                "",
+                "최근 대화 맥락 요약:",
+                recent_context,
+                "- 위 맥락은 후속 지시 해석용 참고입니다. 현재 요청과 충돌하면 현재 요청을 우선하고, 그래도 모호하면 완료 처리하지 말고 차단합니다.",
+            ]
         if media_lines:
             body_parts.extend([
                 "- 대표님이 함께 보낸 이미지/파일은 아래 작업자료로 같이 전달되었습니다.",
@@ -7452,6 +7467,70 @@ class GatewayRunner:
             "pm_root": pm_root,
             "source_room_required": source_room_required,
         }
+
+    def _yuri_recent_context_summary(
+        self,
+        source: SessionSource,
+        *,
+        current_message_id: str = "",
+        max_rows: int = 2,
+        max_chars: int = 180,
+    ) -> str:
+        """Return compact prior-chat context for worker handoff cards."""
+        try:
+            store = getattr(self, "session_store", None)
+            if store is None:
+                return ""
+            entry = store.get_or_create_session(source)
+            session_id = str(getattr(entry, "session_id", "") or "")
+            if not session_id or not hasattr(store, "load_transcript"):
+                return ""
+            history = store.load_transcript(session_id) or []
+        except Exception:
+            logger.debug("Yuri recent context summary unavailable", exc_info=True)
+            return ""
+
+        rows: list[str] = []
+        seen_message_id = str(current_message_id or "")
+        for item in reversed(history):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            mid = str(item.get("message_id") or item.get("platform_message_id") or "")
+            if seen_message_id and mid == seen_message_id:
+                continue
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            if content.startswith("[YURI secretary protocol]"):
+                continue
+            summary = self._yuri_compact_context_line(content, max_chars=max_chars)
+            if not summary:
+                continue
+            label = "직전 사용자 의도" if role == "user" else "직전 유리 응답"
+            rows.append(f"- {label}: {summary}")
+            if len(rows) >= max_rows:
+                break
+        rows.reverse()
+        return "\n".join(rows)
+
+    @staticmethod
+    def _yuri_compact_context_line(text: str, *, max_chars: int = 180) -> str:
+        text = re.sub(r"\s+", " ", text or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"https?://localhost(?::\d+)?/[^\s]+", "[로컬 URL]", text)
+        text = re.sub(r"https?://127\.0\.0\.1(?::\d+)?/[^\s]+", "[로컬 URL]", text)
+        text = re.sub(
+            r"(?<![\w./-])(?:/Users/tbd|/private/tmp|/tmp|/var/folders)/[^\s]+",
+            "[로컬 경로]",
+            text,
+        )
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        return text
 
     @staticmethod
     def _yuri_worker_brief(text: str, assignee: str, reason: str) -> str:

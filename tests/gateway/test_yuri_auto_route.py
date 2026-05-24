@@ -20,8 +20,9 @@ def _runner(profile: str = "default") -> GatewayRunner:
 
 
 class _TranscriptStore:
-    def __init__(self, session_id="session-ctx"):
+    def __init__(self, session_id="session-ctx", history=None):
         self.session_id = session_id
+        self.history = list(history or [])
         self.entries = []
         self.updated = []
 
@@ -30,6 +31,9 @@ class _TranscriptStore:
 
     def append_to_transcript(self, session_id, message, skip_db=False):
         self.entries.append((session_id, message))
+
+    def load_transcript(self, session_id):
+        return list(self.history)
 
     def update_session(self, session_key, last_prompt_tokens=None):
         self.updated.append(session_key)
@@ -127,6 +131,42 @@ def test_yuri_auto_route_sends_ops_work_to_ops():
     assert "대표님 원문" not in route["body"]
     assert "그대로 인용" in route["body"]
     assert "접수" not in route["body"]
+
+
+def test_yuri_auto_route_includes_recent_chat_context_for_workers():
+    store = _TranscriptStore(history=[
+        {"role": "user", "content": "아까 공개지도 레이어에서 하얀 박스를 키우기로 했어.", "message_id": "m-prev-1"},
+        {"role": "assistant", "content": "네. 공개지도 안내 레이어 수정 흐름으로 보겠습니다.", "message_id": "m-prev-2"},
+    ])
+    runner = _runner()
+    runner.session_store = store
+
+    route = runner._classify_yuri_auto_route(
+        _event("스티커도 넣고 제작자 문구도 바꿔주세요")
+    )
+
+    assert route is not None
+    assert "최근 대화 맥락 요약" in route["body"]
+    assert "직전 사용자 의도" in route["body"]
+    assert "하얀 박스" in route["body"]
+    assert "직전 유리 응답" in route["body"]
+    assert "현재 요청을 우선" in route["body"]
+
+
+def test_yuri_recent_context_summary_sanitizes_local_noise():
+    store = _TranscriptStore(history=[
+        {"role": "user", "content": "결과는 /Users/tbd/tmp/report.md 에서 확인했어.", "message_id": "m-prev"},
+    ])
+    runner = _runner()
+    runner.session_store = store
+
+    route = runner._classify_yuri_auto_route(
+        _event("파일로 다시 보내주세요", message_type=MessageType.TEXT)
+    )
+
+    assert route is not None
+    assert "[로컬 경로]" in route["body"]
+    assert "/Users/tbd/tmp" not in route["body"]
 
 
 def test_yuri_auto_route_sends_address_lookup_to_ops_not_planner():
