@@ -1834,28 +1834,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             pass
 
     # Registry-driven enable for plugin platforms.  Built-ins have explicit
-    # blocks above; plugins expose check_fn() which is the single source of
-    # truth for "are my env vars set?".  When it returns True, ensure the
-    # platform is enabled so start() will create its adapter.  Plugins that
-    # need to seed ``PlatformConfig.extra`` from env vars (e.g. Google Chat's
-    # project_id / subscription_name) can supply ``env_enablement_fn`` on
-    # their PlatformEntry — called here BEFORE adapter construction.
+    # blocks above.  For plugins, check_fn() means "dependencies are present",
+    # not necessarily "credentials are configured"; only auto-enable when an
+    # env/config connectivity signal is present.  This avoids starting
+    # installed-but-unconfigured adapters (notably Discord) in profile
+    # gateways, where they otherwise retry forever with no token.
     try:
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
-            try:
-                if not entry.check_fn():
-                    continue
-            except Exception as e:
-                logger.debug("check_fn for %s raised: %s", entry.name, e)
-                continue
             platform = Platform(entry.name)
-            if platform not in config.platforms:
-                config.platforms[platform] = PlatformConfig()
-            config.platforms[platform].enabled = True
-            # Seed extras from env if the plugin opted in.
+            platform_cfg = config.platforms.get(platform) or PlatformConfig()
+            seed = None
+            connected_by_env = False
+
             if entry.env_enablement_fn is not None:
                 try:
                     seed = entry.env_enablement_fn()
@@ -1865,21 +1858,64 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                     )
                     seed = None
                 if isinstance(seed, dict) and seed:
-                    # Extract the home_channel dict (if provided) so we wire it
-                    # up as a proper HomeChannel dataclass.  Everything else is
-                    # merged into ``extra``.
-                    home = seed.pop("home_channel", None)
-                    config.platforms[platform].extra.update(seed)
-                    if isinstance(home, dict) and home.get("chat_id"):
-                        config.platforms[platform].home_channel = HomeChannel(
-                            platform=platform,
-                            chat_id=str(home["chat_id"]),
-                            name=str(home.get("name") or "Home"),
-                            thread_id=(
-                                str(home["thread_id"])
-                                if home.get("thread_id")
-                                else None
-                            ),
-                        )
+                    connected_by_env = True
+
+            if not connected_by_env and entry.required_env:
+                connected_by_env = all(
+                    bool(os.getenv(env_name, "").strip())
+                    for env_name in entry.required_env
+                )
+
+            if not connected_by_env and entry.validate_config is not None:
+                try:
+                    connected_by_env = bool(entry.validate_config(platform_cfg))
+                except Exception as e:
+                    logger.debug("validate_config for %s raised: %s", entry.name, e)
+
+            if not connected_by_env and entry.is_connected is not None:
+                try:
+                    connected_by_env = bool(entry.is_connected(platform_cfg))
+                except Exception as e:
+                    logger.debug("is_connected for %s raised: %s", entry.name, e)
+
+            if not connected_by_env and not (
+                entry.required_env or entry.validate_config or entry.is_connected
+            ):
+                try:
+                    connected_by_env = bool(entry.check_fn())
+                except Exception as e:
+                    logger.debug("check_fn for %s raised: %s", entry.name, e)
+
+            if not connected_by_env:
+                continue
+
+            try:
+                if not entry.check_fn():
+                    continue
+            except Exception as e:
+                logger.debug("check_fn for %s raised: %s", entry.name, e)
+                continue
+
+            if platform not in config.platforms:
+                config.platforms[platform] = platform_cfg
+            config.platforms[platform].enabled = True
+            # Seed extras from env if the plugin opted in.
+            if isinstance(seed, dict) and seed:
+                # Extract the home_channel dict (if provided) so we wire it
+                # up as a proper HomeChannel dataclass.  Everything else is
+                # merged into ``extra``.
+                home = seed.pop("home_channel", None)
+                config.platforms[platform].extra.update(seed)
+                if isinstance(home, dict) and home.get("chat_id"):
+                    config.platforms[platform].home_channel = HomeChannel(
+                        platform=platform,
+                        chat_id=str(home["chat_id"]),
+                        name=str(home.get("name") or "Home"),
+                        thread_id=(
+                            str(home["thread_id"])
+                            if home.get("thread_id")
+                            else None
+                        ),
+                    )
     except Exception as e:
         logger.debug("Plugin platform enable pass failed: %s", e)

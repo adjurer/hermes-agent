@@ -708,3 +708,64 @@ class TestPluginPlatformSharedKeyBridge:
             assert extra.get("allow_from") == ["alice", "bob"]
         finally:
             _reg.unregister("mysharedplat")
+
+
+class TestPluginPlatformEnvAutoEnable:
+    """Plugin platforms should not start just because dependencies exist."""
+
+    def _write_config(self, tmp_path, content: str = ""):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(content, encoding="utf-8")
+        return hermes_home
+
+    def test_required_env_missing_keeps_dependency_available_plugin_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.platform_registry import platform_registry as _reg
+
+        monkeypatch.delenv("MYTOKENPLAT_TOKEN", raising=False)
+        _reg.register(PlatformEntry(
+            name="mytokenplat",
+            label="MyTokenPlat",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            required_env=["MYTOKENPLAT_TOKEN"],
+            source="plugin",
+        ))
+        try:
+            home = self._write_config(tmp_path)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+
+            from gateway.config import load_gateway_config
+            cfg = load_gateway_config()
+
+            plat = Platform("mytokenplat")
+            assert plat not in cfg.platforms
+        finally:
+            _reg.unregister("mytokenplat")
+
+    def test_required_env_present_auto_enables_plugin(self, tmp_path, monkeypatch):
+        from gateway.platform_registry import platform_registry as _reg
+
+        monkeypatch.setenv("MYTOKENPLAT_TOKEN", "tok")
+        _reg.register(PlatformEntry(
+            name="mytokenplat",
+            label="MyTokenPlat",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            required_env=["MYTOKENPLAT_TOKEN"],
+            source="plugin",
+        ))
+        try:
+            home = self._write_config(tmp_path)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+
+            from gateway.config import load_gateway_config
+            cfg = load_gateway_config()
+
+            plat = Platform("mytokenplat")
+            assert cfg.platforms[plat].enabled is True
+        finally:
+            _reg.unregister("mytokenplat")
+            monkeypatch.delenv("MYTOKENPLAT_TOKEN", raising=False)
