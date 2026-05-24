@@ -53,6 +53,20 @@ def test_reactions_enabled_when_set_true(monkeypatch):
     assert adapter._reactions_enabled() is True
 
 
+def test_reaction_from_env_uses_configured_value(monkeypatch):
+    """Configured reaction emoji should override defaults."""
+    monkeypatch.setenv("TELEGRAM_REACTION_START", "\U0001f440")
+    adapter = _make_adapter()
+    assert adapter._reaction_from_env("TELEGRAM_REACTION_START", "\U0001f44d") == "\U0001f440"
+
+
+def test_reaction_from_env_falls_back_when_blank(monkeypatch):
+    """Blank reaction env should not produce an empty Telegram API value."""
+    monkeypatch.setenv("TELEGRAM_REACTION_START", "   ")
+    adapter = _make_adapter()
+    assert adapter._reaction_from_env("TELEGRAM_REACTION_START", "\U0001f440") == "\U0001f440"
+
+
 def test_reactions_enabled_with_1(monkeypatch):
     """TELEGRAM_REACTIONS=1 enables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "1")
@@ -122,6 +136,22 @@ async def test_set_reaction_handles_api_error_gracefully(monkeypatch):
     assert result is False
 
 
+@pytest.mark.asyncio
+async def test_set_reaction_with_fallback_retries(monkeypatch):
+    """Unsupported configured reactions should retry with a known-supported fallback."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    adapter._bot.set_message_reaction = AsyncMock(
+        side_effect=[RuntimeError("unsupported reaction"), None]
+    )
+
+    result = await adapter._set_reaction_with_fallback("123", "456", "✅", "\U0001f44d")
+
+    assert result is True
+    assert adapter._bot.set_message_reaction.await_args_list[0].kwargs["reaction"] == "✅"
+    assert adapter._bot.set_message_reaction.await_args_list[1].kwargs["reaction"] == "\U0001f44d"
+
+
 # ── on_processing_start ──────────────────────────────────────────────
 
 
@@ -175,7 +205,7 @@ async def test_on_processing_start_handles_missing_ids(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_success(monkeypatch):
-    """Successful processing should set thumbs-up reaction."""
+    """Successful processing should switch to the configured completion reaction."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
     event = _make_event()
@@ -185,14 +215,31 @@ async def test_on_processing_complete_success(monkeypatch):
     adapter._bot.set_message_reaction.assert_awaited_once_with(
         chat_id=123,
         message_id=456,
-        reaction="\U0001f44d",
+        reaction="\U0001f525",
     )
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_failure(monkeypatch):
-    """Failed processing should set thumbs-down reaction."""
+    """Failed processing should clear the in-progress reaction by default."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    event = _make_event()
+
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123,
+        message_id=456,
+        reaction=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_processing_complete_failure_can_be_configured(monkeypatch):
+    """A deployment can still opt into a visible failure reaction."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    monkeypatch.setenv("TELEGRAM_REACTION_FAILURE", "\U0001f44e")
     adapter = _make_adapter()
     event = _make_event()
 
@@ -278,24 +325,33 @@ async def test_clear_reactions_returns_false_without_bot(monkeypatch):
 
 
 def test_config_bridges_telegram_reactions(monkeypatch, tmp_path):
-    """gateway/config.py bridges telegram.reactions to TELEGRAM_REACTIONS env var."""
+    """gateway/config.py bridges telegram reaction settings to env vars."""
     import yaml
     config_file = tmp_path / "config.yaml"
     config_file.write_text(yaml.dump({
-        "telegram": {
-            "reactions": True,
-        },
+            "telegram": {
+                "reactions": True,
+                "reaction_start": "\U0001f440",
+                "reaction_success": "\U0001f525",
+                "reaction_failure": "",
+            },
     }))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     # Use setenv (not delenv) so monkeypatch registers cleanup even when
     # the var doesn't exist yet — load_gateway_config will overwrite it.
     monkeypatch.setenv("TELEGRAM_REACTIONS", "")
+    monkeypatch.delenv("TELEGRAM_REACTION_START", raising=False)
+    monkeypatch.delenv("TELEGRAM_REACTION_SUCCESS", raising=False)
+    monkeypatch.delenv("TELEGRAM_REACTION_FAILURE", raising=False)
 
     from gateway.config import load_gateway_config
     load_gateway_config()
 
     import os
     assert os.getenv("TELEGRAM_REACTIONS") == "true"
+    assert os.getenv("TELEGRAM_REACTION_START") == "\U0001f440"
+    assert os.getenv("TELEGRAM_REACTION_SUCCESS") == "\U0001f525"
+    assert os.getenv("TELEGRAM_REACTION_FAILURE") == ""
 
 
 def test_config_reactions_env_takes_precedence(monkeypatch, tmp_path):

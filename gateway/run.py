@@ -219,11 +219,36 @@ _KANBAN_STATUS_PREFIX_RE = re.compile(
     r"(?i)^\s*(?:[✔✅⏸✖⏱]\s*)?(?:@\w+\s+)?Kanban\s+t_[0-9a-f]{6,}\s+"
     r"(?:done|blocked|gave up|worker crashed|timed out)\s*[—:-]?\s*"
 )
+_KANBAN_ARTIFACT_DELIVERY_CLAIM_RE = re.compile(
+    r"(?:파일|문서|산출물|첨부).{0,24}(?:전송(?:했| 완료)|보냈(?:습|어|다)|"
+    r"첨부(?:했| 완료)|전달(?:했| 완료))"
+    r"|(?:전송(?:했| 완료)|보냈(?:습|어|다)|첨부(?:했| 완료)|전달(?:했| 완료)).{0,24}"
+    r"(?:파일|문서|산출물|첨부)"
+)
+_KANBAN_RAW_FAILURE_RE = re.compile(
+    r"(?is)\s*⚠?️?\s*(?:Cron job '.+?' failed|Script exited with code \d+|"
+    r"Connection closed by UNKNOWN port|Traceback \(most recent call last\)).*"
+)
+_LIVENESS_QUERY_RE = re.compile(
+    r"(?i)("
+    r"정신\s*차렸|살아\s*있|응답\s*(?:해|안|없|되)|"
+    r"대답\s*(?:해|안|없|하)|답변\s*(?:해|안|없|하)|"
+    r"질문.{0,12}(?:대답|응답|답변)|"
+    r"(?:대답|응답|답변).{0,12}(?:안|않|없)|"
+    r"왜.{0,12}(?:대답|응답|답변).{0,12}(?:안|않|없)|"
+    r"are\s+you\s+there|ping|alive|wake\s*up"
+    r")"
+)
 
 
 def _secretary_clean_kanban_text(platform: Any, text: str, *, limit: int = 260) -> str:
     """Turn worker/kanban text into representative-facing secretary language."""
     cleaned = _sanitize_gateway_final_response(platform, str(text or ""))
+    if _KANBAN_RAW_FAILURE_RE.search(cleaned):
+        cleaned = _KANBAN_RAW_FAILURE_RE.sub(
+            "예약 작업에서 오류가 났습니다. 원시 로그는 내부에 남겼고, 원인과 영향, 다음 조치를 확인해야 합니다.",
+            cleaned,
+        )
     cleaned = _KANBAN_STATUS_PREFIX_RE.sub("", cleaned)
     cleaned = _KANBAN_INTERNAL_TOKEN_RE.sub("", cleaned)
     cleaned = re.sub(r"(?im)^\s*[-*]\s*(?:카드|루트\s*업무|task|job_id)\s*[:：].*$", "", cleaned)
@@ -233,6 +258,15 @@ def _secretary_clean_kanban_text(platform: Any, text: str, *, limit: int = 260) 
     if limit > 0 and len(cleaned) > limit:
         cleaned = cleaned[:limit].rstrip() + "..."
     return cleaned
+
+
+def _kanban_text_claims_artifact_delivery(*texts: Any) -> bool:
+    """True when worker text claims a file/document was actually sent."""
+    return any(
+        _KANBAN_ARTIFACT_DELIVERY_CLAIM_RE.search(str(text or ""))
+        for text in texts
+        if text
+    )
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -1867,11 +1901,13 @@ class GatewayRunner:
         if raw in {None, ""}:
             return None
         if isinstance(raw, bool):
-            return "all" if raw else "important"
+            return "all" if raw else "off"
         mode = str(raw).strip().lower()
         if mode in {"1", "true", "yes", "on", "all"}:
             return "all"
-        if mode in {"0", "false", "no", "off", "silent", "important"}:
+        if mode in {"0", "false", "no", "off", "silent"}:
+            return "off"
+        if mode in {"important"}:
             return "important"
         return mode
 
@@ -3069,6 +3105,53 @@ class GatewayRunner:
             logger.debug("Failed to send busy-ack: %s", e)
 
         return True
+
+    def _quick_liveness_response(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[str]:
+        """Answer short liveness pings without sending them into a long agent turn."""
+        text = (event.text or "").strip()
+        if not text or event.get_command():
+            return None
+        if len(text) > 90:
+            return None
+        if not _LIVENESS_QUERY_RE.search(text):
+            return None
+
+        active_agent = getattr(self, "_running_agents", {}).get(session_key)
+        status_parts: list[str] = []
+        if active_agent and active_agent is not _AGENT_PENDING_SENTINEL:
+            status_parts.append("이전 작업 처리 중")
+            try:
+                summary = active_agent.get_activity_summary()
+                iteration = summary.get("api_call_count", 0)
+                max_iter = summary.get("max_iterations", 0)
+                current_tool = summary.get("current_tool")
+                if max_iter:
+                    status_parts.append(f"반복 {iteration}/{max_iter}")
+                if current_tool:
+                    status_parts.append(f"사용 중인 도구: {current_tool}")
+            except Exception:
+                pass
+        elif active_agent is _AGENT_PENDING_SENTINEL:
+            status_parts.append("응답 준비 중")
+        else:
+            status_parts.append("대기 중")
+
+        adapter = self.adapters.get(event.source.platform)
+        try:
+            if adapter and session_key in getattr(adapter, "_pending_messages", {}):
+                status_parts.append("대기 메시지 있음")
+        except Exception:
+            pass
+
+        status = ", ".join(status_parts)
+        return (
+            f"네, 살아있습니다. 현재 상태는 {status}입니다.\n"
+            "방금 메시지는 상태 확인으로 따로 처리했습니다. 바로 이어서 지시를 주시면 그 작업으로 진행하겠습니다."
+        )
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -4855,6 +4938,42 @@ class GatewayRunner:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                open_child_count = 0
+                                open_child_ids: list[str] = []
+                                try:
+                                    for child_id in _kb.child_ids(conn, sub["task_id"]):
+                                        child = _kb.get_task(conn, child_id)
+                                        if child and child.status not in {"done", "archived", "blocked"}:
+                                            open_child_count += 1
+                                            open_child_ids.append(str(child_id))
+                                except Exception:
+                                    open_child_count = 0
+                                    open_child_ids = []
+                                if open_child_ids:
+                                    # PM/root cards often finish by creating
+                                    # child work. The visible conversation must
+                                    # follow those children, otherwise Yuri
+                                    # says work was delegated and then goes
+                                    # quiet until the user asks for status.
+                                    for child_id in open_child_ids:
+                                        try:
+                                            _kb.add_notify_sub(
+                                                conn,
+                                                task_id=child_id,
+                                                platform=sub["platform"],
+                                                chat_id=sub["chat_id"],
+                                                thread_id=sub.get("thread_id") or None,
+                                                user_id=sub.get("user_id") or None,
+                                                notifier_profile=owner_profile or notifier_profile,
+                                                reply_to_message_id=sub.get("reply_to_message_id") or None,
+                                            )
+                                        except Exception:
+                                            logger.debug(
+                                                "kanban notifier: failed to hand off subscription from %s to child %s",
+                                                sub["task_id"],
+                                                child_id,
+                                                exc_info=True,
+                                            )
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -4866,6 +4985,8 @@ class GatewayRunner:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "open_child_count": open_child_count,
+                                    "open_child_ids": open_child_ids,
                                 })
                         finally:
                             conn.close()
@@ -4916,6 +5037,22 @@ class GatewayRunner:
                                 event_payload=getattr(ev, "payload", None),
                                 task=task,
                             )
+                            payload_summary = None
+                            if ev.payload and ev.payload.get("summary"):
+                                payload_summary = str(ev.payload["summary"])
+                            task_result_text = str(task.result) if task and task.result else ""
+                            if (
+                                kind == "completed"
+                                and getattr(task, "assignee", None) == "planner"
+                                and int(d.get("open_child_count") or 0) > 0
+                                and re.search(r"(?:배정|연결).{0,20}(?:완료|했습니다)", str(payload_summary or task_result_text))
+                            ):
+                                logger.debug(
+                                    "kanban notifier: suppressing planner handoff completion for %s; %d child task(s) still open",
+                                    sub["task_id"],
+                                    int(d.get("open_child_count") or 0),
+                                )
+                                continue
                             if (
                                 artifact_status["declared"] > 0
                                 and artifact_status["existing"] == 0
@@ -4931,6 +5068,24 @@ class GatewayRunner:
                                     sub["task_id"],
                                     artifact_status["declared"],
                                 )
+                            elif (
+                                artifact_status["declared"] == 0
+                                and _kanban_text_claims_artifact_delivery(
+                                    payload_summary,
+                                    task_result_text,
+                                )
+                            ):
+                                msg = (
+                                    "파일 전달은 아직 확인되지 않았습니다.\n"
+                                    "작업자가 파일 전송 완료처럼 보고했지만 첨부할 파일 경로가 없습니다. "
+                                    "산출물 위치를 확인해 실제 첨부까지 끝낸 뒤 다시 말씀드리겠습니다."
+                                )
+                                handoff = ""
+                                logger.warning(
+                                    "kanban notifier: completed task %s claimed artifact delivery "
+                                    "without declared/uploadable artifacts",
+                                    sub["task_id"],
+                                )
                             else:
                                 # Prefer the run's summary (the worker's
                                 # intentional human-facing handoff, carried
@@ -4938,9 +5093,6 @@ class GatewayRunner:
                                 # task.result for legacy rows written before
                                 # runs shipped.
                                 handoff = ""
-                                payload_summary = None
-                                if ev.payload and ev.payload.get("summary"):
-                                    payload_summary = str(ev.payload["summary"])
                                 if payload_summary:
                                     h = _sanitize_gateway_final_response(sub["platform"], payload_summary)
                                     h = _secretary_clean_kanban_text(sub["platform"], h, limit=220)
@@ -6251,10 +6403,10 @@ class GatewayRunner:
                 except Exception:
                     pass
             _notify_mode = _notify_mode or "important"
-            if _notify_mode not in {"all", "important"}:
+            if _notify_mode not in {"all", "important", "off"}:
                 logger.warning(
                     "Unknown telegram notifications mode '%s', "
-                    "defaulting to 'important' (valid: all, important)",
+                    "defaulting to 'important' (valid: all, important, off)",
                     _notify_mode,
                 )
                 _notify_mode = "important"
@@ -6765,10 +6917,50 @@ class GatewayRunner:
         has_media = bool(getattr(event, "media_urls", None))
         if not text and not has_media:
             return None
+        if (
+            not text
+            and getattr(event, "message_type", None) in {MessageType.VOICE, MessageType.AUDIO}
+        ):
+            # Voice/audio-only messages must go through STT or normal chat first.
+            # Routing the raw attachment creates vague cards like "텔레그램 첨부 업무"
+            # and makes Yuri look as if she understood something she never
+            # repeated back to the user.
+            return None
 
         compact = re.sub(r"\s+", " ", text)
         lowered = compact.casefold()
         bare = re.sub(r"[\s.!?。！？~…]+", "", lowered)
+        ordinal_followup = bool(re.search(r"(?:^|[^\d])\d+\s*번", compact)) and any(
+            marker in lowered for marker in ("자세", "설명", "뭐", "무엇", "무슨", "보고")
+        )
+        if ordinal_followup and not any(
+            marker in lowered
+            for marker in ("진행", "처리", "적용", "수정", "삭제", "설치", "만들", "보내", "첨부")
+        ):
+            # "1번 더 자세히" is a referent-resolution chat turn, not a new
+            # work item. Let the main agent read the immediate transcript so it
+            # can answer the right bullet instead of inventing a fresh task.
+            return None
+        if "이해" in lowered and any(
+            marker in lowered for marker in ("했는지", "했는지만", "여부만", "확인만")
+        ):
+            return None
+        status_followup_question = (
+            not has_media
+            and len(compact) <= 80
+            and any(marker in lowered for marker in (
+                "찾아봤", "봤니", "봤어", "해봤", "했니", "했어",
+                "됐어", "되었", "끝났", "완료됐", "완료되었",
+                "하고 있", "진행중", "진행 중", "어디까지",
+                "결과 나왔", "상태 어때", "상황 어때",
+            ))
+            and any(marker in lowered for marker in ("?", "니", "어", "요", "까"))
+        )
+        if status_followup_question:
+            # "찾아봤니?" and "어디까지 됐어?" are status questions about
+            # existing context. They need a direct chat answer, not a fresh
+            # worker card whose title is the question itself.
+            return None
 
         # Very short acknowledgements need the existing conversation context;
         # routing them would create vague cards like "진행해주세요".
@@ -6818,7 +7010,8 @@ class GatewayRunner:
         )
         question_only_markers = (
             "뭔가요", "무엇인가요", "뭐야", "무슨 뜻", "왜", "어떻게", "알려줘",
-            "설명", "가능한가요", "맞나요",
+            "설명", "가능한가요", "맞나요", "인가요", "입니까", "맞는지",
+            "무엇인지", "뭔지", "어떤가요",
         )
         actionish = any(marker in lowered for marker in action_markers)
         question_only = any(marker in lowered for marker in question_only_markers)
@@ -6832,13 +7025,25 @@ class GatewayRunner:
         capability_question_markers = (
             "없나요", "있나요", "되나요", "될까요", "가능할까요", "가능해요",
             "사용할 수", "사용할수", "쓸 수", "쓸수", "활용할 수", "활용할수",
+            "할 수 있어", "할수있어", "할 수 있나", "할수있나",
+            "할 수 없어", "할수없어", "할 수 없나", "할수없나",
+            "가능한지", "가능해?", "가능합니까",
         )
         explicit_imperative_markers = (
             "진행해줘", "진행해주세요", "처리해줘", "처리해주세요",
             "수정해줘", "수정해주세요", "반영해줘", "반영해주세요",
             "적용해줘", "적용해주세요", "설치해줘", "설치해주세요",
             "삭제해줘", "삭제해주세요", "테스트해줘", "테스트해주세요",
+            "확인해줘", "확인해주세요", "점검해줘", "점검해주세요",
+            "찾아줘", "찾아주세요", "보내줘", "보내주세요",
         )
+        if (
+            question_only
+            and not has_media
+            and not recent_incident_question
+            and not any(marker in lowered for marker in explicit_imperative_markers)
+        ):
+            return None
         if (
             not has_media
             and any(marker in lowered for marker in capability_question_markers)
@@ -6919,6 +7124,7 @@ class GatewayRunner:
                 "권한", "크론", "mcp", "서버", "재시작", "최적화", "텔레그램",
                 "봇", "큐드라이버", "cuadriver", "computer use", "컴퓨터 유즈",
                 "라우팅", "오케스트레이션", "상주", "프로세스",
+                "지도", "주소", "링크", "url", "공개 접속", "외부 접속",
             )),
             ("researcher", "조사/검색", (
                 "조사", "찾아", "최신", "검색", "스크래핑", "법률", "자료",
@@ -6959,7 +7165,7 @@ class GatewayRunner:
             or (has_media and executionish)
             or (source_room_required and executionish)
         )
-        pm_root = bool(multi_step and assignee in {"planner", "reviewer", "researcher", "writer"})
+        pm_root = bool(multi_step and assignee in {"planner", "reviewer", "researcher", "writer", "ops"})
         if pm_root:
             assignee, reason = ("planner", "PM 오케스트레이션")
 
@@ -6978,6 +7184,8 @@ class GatewayRunner:
                 media_type = ""
             media_lines.append(f"- {path}" + (f" ({media_type})" if media_type else ""))
 
+        worker_brief = self._yuri_worker_brief(compact, assignee, reason)
+        user_interpretation = self._yuri_user_interpretation(compact, assignee, reason)
         body_parts = [
             (
                 "유리 PM 오케스트레이션 루트 업무입니다."
@@ -6985,8 +7193,11 @@ class GatewayRunner:
                 "유리 자동 라우팅으로 맡겨진 텔레그램 업무입니다."
             ),
             "",
-            "정리한 업무지시:",
-            f"- 목표: {self._yuri_worker_brief(compact, assignee, reason)}",
+            "유리가 대표님께 설명한 해석:",
+            f"- {user_interpretation}",
+            "",
+            "작업자 실행 해석:",
+            f"- {worker_brief}",
             f"- 분류: {reason}",
             "",
             "처리 규칙:",
@@ -6999,26 +7210,31 @@ class GatewayRunner:
             "- 대표님 말을 그대로 인용해 넘기지 말고, 작업자가 실행하기 쉬운 지시/완료 기준/주의사항으로 정리해 처리합니다.",
             "- 보고문에는 로컬 경로, URL 파라미터, 내부 JSON 같은 지저분한 내용을 노출하지 않습니다.",
             "- 오류가 나면 원시 로그 대신 원인/영향/다음 조치만 보고합니다.",
+            "- 속도를 우선합니다. 브라우저/비전/GUI는 처음부터 쓰지 말고, HTTP/API/파일/DB/CLI로 먼저 확인한 뒤 화면 검증이 필요한 경우에만 씁니다.",
+            "- 가벼운 확인은 단일 worker가 끝냅니다. 독립 reviewer는 공개 배포, 사용자 전달 파일, 보안/권한, 실패 재현, 명시적 검증 요청처럼 리스크가 큰 경우에만 붙입니다.",
             "- 파일 생성 시 초안은 md 우선, 최종 산출물은 요청 포맷으로 만듭니다.",
             "- 표시 파일명은 생성일 YYMMDD_한글파일명 형식을 지킵니다.",
             "- 대표님 지시를 이해한 목표/필요 자료/완료 기준으로 먼저 해석하고, 맥락이 부족하면 추측 완료하지 말고 차단합니다.",
+            "- '방금/아까/1번/그거' 같은 후속 지시는 최근 텔레그램 대화, 활성 카드, 최근 완료 카드 순서로 먼저 대상을 복구합니다.",
             "- 파일 전송 요청은 kanban_complete의 artifacts에 실제 파일 경로를 넣고, 유리 알림이 첨부를 처리하게 합니다.",
             "- worker 본인 봇/개별 DM으로 결과·파일·완료문구를 직접 보내지 않습니다.",
             "- 실제 첨부 성공 전까지 '전달했습니다'라고 보고하지 않습니다.",
+            "- 페이커/올리비아처럼 다른 사람의 봇이나 외부 에이전트는 내부 worker처럼 지휘하지 않습니다. 관찰/요약만 하고 유리의 담당 업무와 분리합니다.",
         ]
         if media_lines:
             body_parts.extend([
                 "- 대표님이 함께 보낸 이미지/파일은 아래 작업자료로 같이 전달되었습니다.",
                 "- worker는 새로 찾기 전에 전달된 첨부 작업자료를 먼저 열어 확인합니다.",
+                "- 첨부만으로 요청이 모호하면 먼저 '제가 이해한 요청'을 짧게 정리하고, 확신이 없으면 차단합니다.",
             ])
         if pm_root:
             body_parts.extend([
                 "",
                 "PM 진행 방식:",
                 "- 먼저 목표/현재 맥락/필요 자료/실행 업무/검수 기준/대표님 보고 방식을 한 번에 정리합니다.",
-                "- 필요한 경우 researcher, planner, docslead, ops, reviewer, writer 하위 업무로 분해합니다.",
+                "- 필요한 경우 researcher, planner, docslead, ops, writer 하위 업무로 분해합니다.",
                 "- 하위 업무는 대표님께 직접 보고하지 않게 만들고, 루트 업무에 결과를 모아 최종 보고합니다.",
-                "- reviewer는 처음 실행자가 아니라 작업 완료 후 품질 확인자로 둡니다.",
+                "- reviewer는 기본으로 붙이지 않습니다. 공개 배포, 사용자 전달 파일, 보안/권한, 실패 재현, 명시적 검증 요청처럼 리스크가 큰 경우에만 작업 완료 후 품질 확인자로 둡니다.",
                 "- 대표님 후속 메시지는 새 흐름이 아니라 이 루트 업무의 추가 요구사항으로 붙입니다.",
             ])
         if source_room_required:
@@ -7057,6 +7273,8 @@ class GatewayRunner:
             "body": "\n".join(body_parts),
             "idempotency_key": idempotency_key,
             "max_runtime_seconds": 1800,
+            "user_interpretation": user_interpretation,
+            "worker_brief": worker_brief,
             "active_work_followup": active_work_followup,
             "contextual_followup": contextual_followup,
             "delivery_followup": delivery_followup,
@@ -7078,6 +7296,8 @@ class GatewayRunner:
             return "에르메스에서 Codex 관련 기능을 찾아 기능명, 용도, 현재 사용 가능 여부, 적용 방법을 정리한다."
         if "점프데스크탑" in lowered or "jump" in lowered:
             return "Jump Desktop 접속 상태와 최근 변경점을 확인해 원인, 영향, 되돌릴 항목을 분리해 보고한다."
+        if any(marker in lowered for marker in ("주소", "링크", "url", "공개 접속", "외부 접속")):
+            return "요청한 산출물의 실제 접속 주소 후보를 찾고, 접근 가능 여부와 공개 안전성을 확인해 대표님께 전달 가능한 주소만 정리한다."
         if "커뮤니티" in lowered or "크롤링" in lowered or "스크래핑" in lowered:
             return "커뮤니티 수집/정제 작업의 범위, 도구 조합, 품질 필터 적용 상태를 확인하고 다음 실행안을 정리한다."
         if "파일" in lowered or "첨부" in lowered or "문서" in lowered:
@@ -7095,6 +7315,115 @@ class GatewayRunner:
         if assignee == "writer":
             return "요청 취지에 맞는 보고/문안 초안을 정리한다."
         return f"업무를 실행 가능한 하위 작업으로 나누고 담당자별 완료 기준을 정리한다. 분류 사유: {reason}"
+
+    @staticmethod
+    def _yuri_user_interpretation(text: str, assignee: str, reason: str) -> str:
+        """Natural, user-facing interpretation for Yuri's first reply."""
+        lowered = (text or "").casefold()
+        if (
+            any(marker in lowered for marker in ("방금", "아까", "지금", "최근", "마지막"))
+            and any(marker in lowered for marker in ("오류", "에러", "알림", "경고", "느낌표", "크론", "cron", "실패"))
+        ):
+            return "방금 보신 알림이 실제로 무엇이었는지, 대화 흐름과 운영 로그를 맞춰 원인을 가려내는 일로 보겠습니다."
+        if "코덱스" in lowered or "codex" in lowered:
+            return "에르메스 안에서 코덱스 관련 기능이 실제로 무엇을 할 수 있는지 찾아 현재 적용 여부까지 확인하는 일로 보겠습니다."
+        if "점프데스크탑" in lowered or "jump" in lowered:
+            return "원격 접속이 되는지 아닌지만 보는 게 아니라, 최근에 바뀐 설정과 끊김 원인을 분리해서 정상 접속 상태로 되돌리는 일로 보겠습니다."
+        if any(marker in lowered for marker in ("주소", "링크", "url", "공개 접속", "외부 접속")):
+            return "말씀하신 산출물을 먼저 찾고, 실제로 열리는 주소인지 확인한 뒤 바로 쓸 수 있는 링크만 가져오는 일로 보겠습니다."
+        if "커뮤니티" in lowered or "크롤링" in lowered or "스크래핑" in lowered:
+            return "자료를 많이 긁는 것보다, 쓸 수 있는 커뮤니티 흐름을 안정적으로 수집하고 품질을 걸러내는 일로 보겠습니다."
+        if "파일" in lowered or "첨부" in lowered or "문서" in lowered:
+            return "문서를 만드는 데서 끝내지 않고, 파일명·인코딩·첨부까지 실제로 받을 수 있는 상태로 마무리하는 일로 보겠습니다."
+        if "맥서버" in lowered or "게이트웨이" in lowered or "에르메스" in lowered or "유리" in lowered:
+            return "맥서버와 유리가 지금 일을 계속 맡아도 되는 상태인지, 설정과 로그, 동작 리스크를 같이 보는 일로 보겠습니다."
+        if assignee == "researcher":
+            return "자료를 찾아 나열하는 게 아니라, 판단에 쓸 수 있게 사실과 추천을 나눠 정리하는 일로 보겠습니다."
+        if assignee == "reviewer":
+            return "겉으로 정상처럼 보이는지보다, 실제로 재현되는 문제와 남은 리스크를 확인하는 일로 보겠습니다."
+        if assignee == "docslead":
+            return "산출물을 만들고 끝내는 게 아니라, 열렸을 때 깨지지 않고 전달까지 되는 상태를 만드는 일로 보겠습니다."
+        if assignee == "ops":
+            return "설정을 건드리는 일 자체보다, 운영이 안정적으로 유지되게 필요한 부분만 확인하고 보수하는 일로 보겠습니다."
+        if assignee == "writer":
+            return "문장을 쓰는 것보다, 대표님 의도에 맞는 톤과 전달력을 갖춘 초안으로 정리하는 일로 보겠습니다."
+        return "요청을 그대로 넘기는 대신, 목표와 완료 기준을 먼저 잡고 필요한 일만 나눠 진행하는 업무로 보겠습니다."
+
+    @staticmethod
+    def _yuri_orchestration_teams(text: str, assignee: str, *, pm_root: bool = False) -> list[str]:
+        """Human-facing team names for Yuri's first orchestration reply."""
+        lowered = (text or "").casefold()
+        teams: list[str] = []
+
+        def add(name: str) -> None:
+            if name not in teams:
+                teams.append(name)
+
+        if pm_root:
+            add("기획팀")
+        direct_labels = {
+            "planner": "기획팀",
+            "ops": "운영팀",
+            "researcher": "조사팀",
+            "writer": "작성팀",
+            "reviewer": "검증팀",
+            "docslead": "문서팀",
+        }
+        if assignee in direct_labels:
+            add(direct_labels[assignee])
+
+        explicit_review = any(marker in lowered for marker in (
+            "검증", "검수", "테스트", "정상인지", "무결", "리스크", "오류", "에러",
+            "보안", "권한", "공개", "배포", "외부 공유", "실패", "재현",
+        ))
+        if any(marker in lowered for marker in (
+            "사이트", "주소", "링크", "url", "지도", "서버", "게이트웨이",
+            "접속", "정상", "복구", "로그", "에러", "오류", "설정",
+        )):
+            add("운영팀")
+            if explicit_review:
+                add("검증팀")
+        if any(marker in lowered for marker in (
+            "문서", "파일", "첨부", "한글", "hwp", "hwpx", "md", "엑셀", "스프레드시트",
+        )):
+            add("문서팀")
+            if explicit_review:
+                add("검증팀")
+        if any(marker in lowered for marker in (
+            "찾아", "조사", "검색", "후기", "자료", "공식", "업데이트", "최신",
+        )):
+            add("조사팀")
+        if any(marker in lowered for marker in (
+            "초안", "보고", "문안", "요약", "정리",
+        )):
+            add("작성팀")
+        return teams or ["운영팀"]
+
+    def _yuri_secretary_protocol_prompt(self, event: MessageEvent, source: SessionSource) -> str:
+        """Extra turn-local guardrails for Yuri's human-facing Telegram chat."""
+        if getattr(event, "internal", False):
+            return ""
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return ""
+        if getattr(source, "is_bot", False):
+            return ""
+        try:
+            if getattr(self, "_active_profile_name", lambda: "default")() != "default":
+                return ""
+        except Exception:
+            return ""
+        return (
+            "[YURI secretary protocol]\n"
+            "- 먼저 사용자의 말이 간단 질문, 후속 질문, 실제 업무 지시, 오류 분석, 음성/첨부 확인 중 무엇인지 구분한다.\n"
+            "- '방금/아까/지금/마지막/1번/그거/이거'가 나오면 최근 텔레그램 대화, 활성 업무, 최근 완료 업무, gateway/cron 로그를 먼저 대조한다. 모르면 엉뚱하게 답하지 말고 어느 맥락이 필요한지 짧게 말한다.\n"
+            "- 음성이나 첨부만 근거로 진행할 때는 첫 문단에 '제가 이해한 요청은 ...'을 짧게 적어 사용자가 잘못 들은 부분을 고칠 수 있게 한다.\n"
+            "- 완료 보고는 실제 검증 후에만 한다. 로그인, 원격접속, 파일전송, 문서생성, 업데이트는 테스트/첨부/API 성공 증거가 없으면 '마무리했습니다'라고 말하지 않는다.\n"
+            "- 파일을 보냈다고 말하려면 실제 첨부나 전송 message_id 같은 증거가 있어야 한다. 없으면 '아직 전송 확인 전입니다'라고 말한다.\n"
+            "- cron/gateway/provider 원시 오류는 그대로 붙이지 말고 원인, 영향, 다음 조치만 사람 비서의 언어로 요약한다.\n"
+            "- 페이커, 올리비아처럼 다른 사람의 봇/외부 에이전트는 유리의 내부 작업자로 취급하지 않는다. 관찰과 요약만 하고 지휘하거나 규칙을 과잉 학습하지 않는다.\n"
+            "- 대표님의 캐주얼한 말, 농담, 감탄은 영구 운영규칙으로 저장하지 않는다. 반복된 명시 지시만 규칙 후보로 다룬다.\n"
+            "[/YURI secretary protocol]"
+        )
 
     def _record_yuri_gateway_turn(
         self,
@@ -7149,6 +7478,46 @@ class GatewayRunner:
         import asyncio
 
         source = event.source
+
+        def _visible_ack(created: dict[str, Any]) -> str:
+            interpretation = str(route.get("user_interpretation") or "").strip()
+            task_id = str(created.get("task_id") or "").strip()
+            teams = self._yuri_orchestration_teams(
+                str(route.get("title") or event.text or ""),
+                str(route.get("assignee") or ""),
+                pm_root=bool(route.get("pm_root")),
+            )
+            if len(teams) == 1:
+                team_phrase = f"{teams[0]}에 이관하겠습니다"
+            elif len(teams) == 2:
+                team_phrase = f"{teams[0]}과 {teams[1]}에 이관하겠습니다"
+            else:
+                team_phrase = f"{', '.join(teams[:-1])}, 그리고 {teams[-1]}에 나눠 이관하겠습니다"
+            if created.get("attached"):
+                if interpretation:
+                    return (
+                        "알겠습니다. 이건 새 일로 쪼개지 않고 진행 중인 일에 이어 붙이겠습니다.\n"
+                        f"{interpretation}\n"
+                        f"{team_phrase}. 끝나면 제가 판단과 남은 조치만 이 대화에 이어서 정리하겠습니다."
+                    )
+                return (
+                    "알겠습니다. 이건 새 일로 쪼개지 않고 진행 중인 일에 이어 붙이겠습니다. "
+                    f"{team_phrase}. 끝나면 제가 판단과 남은 조치만 정리하겠습니다."
+                )
+            if interpretation:
+                return (
+                    f"네. {interpretation}\n"
+                    f"{team_phrase}. 확인해야 할 상태, 실제 원인, 바로 할 조치를 분리해서 보겠습니다."
+                )
+            if task_id:
+                return (
+                    "네. 바로 확인할 일로 잡아두겠습니다. "
+                    f"{team_phrase}. 끝나면 제가 판단과 남은 조치만 정리하겠습니다."
+                )
+            return (
+                "네. 바로 확인하겠습니다. "
+                f"{team_phrase}. 끝나면 제가 판단과 남은 조치만 정리하겠습니다."
+            )
 
         def _create_and_subscribe() -> dict[str, Any]:
             from hermes_cli import kanban_db as _kb
@@ -7294,10 +7663,7 @@ class GatewayRunner:
             return response
         task_id = str(created.get("task_id") if isinstance(created, dict) else created)
         if isinstance(created, dict) and created.get("attached"):
-            response = (
-                "이어 챙겨두겠습니다. 새 일로 쪼개지 않고 지금 진행 중인 흐름에 붙였습니다.\n\n"
-                "담당자가 다음 진행에서 함께 반영하고, 유리가 최종 결과만 정리해 말씀드리겠습니다."
-            )
+            response = _visible_ack(created)
             self._record_yuri_gateway_turn(
                 source=source,
                 event=event,
@@ -7305,38 +7671,7 @@ class GatewayRunner:
                 assistant_text=response,
             )
             return response
-        labels = {
-            "planner": "기획/분해",
-            "ops": "운영/설정",
-            "researcher": "조사",
-            "writer": "작성",
-            "reviewer": "검증",
-            "docslead": "문서/파일",
-        }
-        assignee = str(route["assignee"])
-        label = labels.get(assignee, assignee)
-        if bool(route.get("pm_root")):
-            response = (
-                "맡아두겠습니다. 유리가 한 흐름으로 묶어서 진행하겠습니다.\n\n"
-                f"- 제가 이해한 일: {route.get('title') or '요청하신 업무'}\n"
-                "- 목표와 자료를 먼저 정리하고, 필요한 작업자에게 조용히 나눠 맡기겠습니다.\n"
-                "- 모호하면 추측해서 끝냈다고 하지 않고 막힌 지점부터 말씀드리겠습니다.\n"
-                "- 중간 카드번호나 내부 경로 대신 최종 결과와 막힌 지점만 정리해 말씀드리겠습니다."
-            )
-            self._record_yuri_gateway_turn(
-                source=source,
-                event=event,
-                user_text=event.text or "",
-                assistant_text=response,
-            )
-            return response
-        response = (
-            "챙기겠습니다. 이건 제가 조용히 나눠서 처리하겠습니다.\n\n"
-            f"- 제가 이해한 일: {route.get('title') or '요청하신 업무'}\n"
-            f"- 맡길 쪽: {label}\n"
-            "- 맥락이 부족하면 끝냈다고 하지 않고 막힌 지점부터 확인하겠습니다.\n\n"
-            "완료되거나 막히면 이 메시지에 답장으로, 원인/결과/다음 조치만 짧게 말씀드리겠습니다."
-        )
+        response = _visible_ack(created if isinstance(created, dict) else {"task_id": task_id})
         self._record_yuri_gateway_turn(
             source=source,
             event=event,
@@ -7461,6 +7796,10 @@ class GatewayRunner:
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        _liveness_response = self._quick_liveness_response(event, _quick_key)
+        if _liveness_response:
+            return _liveness_response
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -8883,6 +9222,9 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        _yuri_protocol = self._yuri_secretary_protocol_prompt(event, source)
+        if _yuri_protocol:
+            context_prompt = f"{context_prompt}\n\n{_yuri_protocol}"
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -18207,8 +18549,12 @@ class GatewayRunner:
                     f"[System note: Your previous turn in this session was interrupted "
                     f"by {_reason_phrase}. The conversation history below is intact. "
                     f"If it contains unfinished tool result(s), process them first and "
-                    f"summarize what was accomplished, then address the user's new "
-                    f"message below.]\n\n"
+                    f"summarize what was accomplished. Do not blend this resumed work "
+                    f"with a later unrelated Telegram conversation. If the new user "
+                    f"message below is empty, continue only the interrupted work and "
+                    f"reply to that original task; if it is not the same task, pause "
+                    f"and ask one short clarification instead of guessing. Then address "
+                    f"the user's new message below.]\n\n"
                     + message
                 )
             elif _has_fresh_tool_tail:
@@ -18216,8 +18562,11 @@ class GatewayRunner:
                     "[System note: Your previous turn was interrupted before you could "
                     "process the last tool result(s). The conversation history contains "
                     "tool outputs you haven't responded to yet. Please finish processing "
-                    "those results and summarize what was accomplished, then address the "
-                    "user's new message below.]\n\n"
+                    "those results and summarize what was accomplished. Do not blend this "
+                    "resumed work with a later unrelated Telegram conversation; if the "
+                    "new user message below is unrelated, pause and ask one short "
+                    "clarification instead of guessing. Then address the user's new "
+                    "message below.]\n\n"
                     + message
                 )
 

@@ -108,6 +108,49 @@ async def test_unknown_slash_command_returns_guidance(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_short_liveness_ping_bypasses_agent(monkeypatch):
+    """A quick "are you alive?" check must not inherit a long stale task."""
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("liveness ping leaked into the agent")
+    )
+
+    result = await runner._handle_message(_make_event("정신 차렸어?"))
+
+    assert result is not None
+    assert "살아있습니다" in result
+    assert "대기 중" in result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_liveness_ping_reports_active_agent_without_agent_turn(monkeypatch):
+    """If a run is active, liveness should answer with status, not wait."""
+    runner = _make_runner()
+    event = _make_event("지금 질문에 대답을 하지 않습니다")
+    sk = build_session_key(event.source)
+
+    active = MagicMock()
+    active.get_activity_summary.return_value = {
+        "api_call_count": 8,
+        "max_iterations": 90,
+        "current_tool": "terminal",
+    }
+    runner._running_agents[sk] = active
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("active liveness ping leaked into the agent")
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is not None
+    assert "이전 작업 처리 중" in result
+    assert "반복 8/90" in result
+    assert "terminal" in result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unknown_slash_command_underscored_form_also_guarded(monkeypatch):
     """Telegram may send /foo_bar — same guard must trigger for underscored
     commands that normalize to unknown hyphenated names."""

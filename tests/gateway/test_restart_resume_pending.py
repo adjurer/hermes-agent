@@ -164,8 +164,12 @@ def _simulate_note_injection(
             f"[System note: Your previous turn in this session was interrupted "
             f"by {reason_phrase}. The conversation history below is intact. "
             f"If it contains unfinished tool result(s), process them first and "
-            f"summarize what was accomplished, then address the user's new "
-            f"message below.]\n\n"
+            f"summarize what was accomplished. Do not blend this resumed work "
+            f"with a later unrelated Telegram conversation. If the new user "
+            f"message below is empty, continue only the interrupted work and "
+            f"reply to that original task; if it is not the same task, pause "
+            f"and ask one short clarification instead of guessing. Then address "
+            f"the user's new message below.]\n\n"
             + message
         )
     elif has_fresh_tool_tail:
@@ -173,8 +177,11 @@ def _simulate_note_injection(
             "[System note: Your previous turn was interrupted before you could "
             "process the last tool result(s). The conversation history contains "
             "tool outputs you haven't responded to yet. Please finish processing "
-            "those results and summarize what was accomplished, then address the "
-            "user's new message below.]\n\n"
+            "those results and summarize what was accomplished. Do not blend this "
+            "resumed work with a later unrelated Telegram conversation; if the "
+            "new user message below is unrelated, pause and ask one short "
+            "clarification instead of guessing. Then address the user's new "
+            "message below.]\n\n"
             + message
         )
     return message
@@ -450,6 +457,7 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
         assert "what happened?" in result
+        assert "Do not blend this resumed work" in result
 
     def test_resume_pending_shutdown_note_mentions_shutdown(self):
         entry = self._pending_entry(reason="shutdown_timeout")

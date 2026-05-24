@@ -38,6 +38,7 @@ def _make_telegram_adapter(*, allowed_chats=None, require_mention=None, guest_mo
     adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
     adapter._message_handler = AsyncMock()
     adapter._mention_patterns = adapter._compile_mention_patterns()
+    adapter._is_callback_user_authorized = lambda user_id, **_kw: True
     return adapter
 
 

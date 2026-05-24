@@ -15,7 +15,9 @@ def _make_adapter(
     allow_from=None,
     group_allow_from=None,
     allowed_chats=None,
+    group_allowed_chats=None,
     guest_mode=None,
+    observe_unmentioned_group_messages=None,
     bot_username="hermes_bot",
 ):
     from gateway.platforms.telegram import TelegramAdapter
@@ -49,8 +51,14 @@ def _make_adapter(
         # environment; production adapters without this explicit key still fall
         # back to the env var.
         extra["allowed_chats"] = []
+    if group_allowed_chats is not None:
+        extra["group_allowed_chats"] = group_allowed_chats
+    else:
+        extra["group_allowed_chats"] = []
     if guest_mode is not None:
         extra["guest_mode"] = guest_mode
+    if observe_unmentioned_group_messages is not None:
+        extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -88,9 +96,12 @@ def _group_message(
         caption=caption,
         entities=entities or [],
         caption_entities=caption_entities or [],
+        message_id=1001,
+        date=None,
+        is_topic_message=thread_id is not None,
         message_thread_id=thread_id,
-        chat=SimpleNamespace(id=chat_id, type="group"),
-        from_user=SimpleNamespace(id=from_user_id),
+        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=False),
+        from_user=SimpleNamespace(id=from_user_id, full_name=f"User {from_user_id}", username=None),
         reply_to_message=reply_to_message,
     )
 
@@ -101,9 +112,12 @@ def _dm_message(text="hello", *, from_user_id=111):
         caption=None,
         entities=[],
         caption_entities=[],
+        message_id=1002,
+        date=None,
+        is_topic_message=False,
         message_thread_id=None,
-        chat=SimpleNamespace(id=from_user_id, type="private"),
-        from_user=SimpleNamespace(id=from_user_id),
+        chat=SimpleNamespace(id=from_user_id, type="private", full_name=f"User {from_user_id}"),
+        from_user=SimpleNamespace(id=from_user_id, full_name=f"User {from_user_id}", username=None),
         reply_to_message=None,
     )
 
@@ -126,6 +140,19 @@ def _bot_command_entity(text, command):
     """
     offset = text.index(command)
     return SimpleNamespace(type="bot_command", offset=offset, length=len(command))
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.sessions = []
+        self.entries = []
+
+    def get_or_create_session(self, source):
+        self.sessions.append(source)
+        return SimpleNamespace(session_id="session-1")
+
+    def append_to_transcript(self, session_id, entry):
+        self.entries.append((session_id, entry))
 
 
 def test_group_messages_can_be_opened_via_config():
@@ -368,6 +395,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_TOPICS", raising=False)
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
 
     config = load_gateway_config()
 
@@ -385,6 +413,55 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
     assert tg_cfg.extra.get("exclusive_bot_mentions") is True
+
+
+def test_config_bridges_telegram_observe_group_context(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  observe_unmentioned_group_messages: true\n"
+        "  group_allowed_chats:\n"
+        "    - \"-100\"\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
+    monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    assert __import__("os").environ["TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] == "true"
+    assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_CHATS"] == "-100"
+    tg_cfg = config.platforms.get(Platform.TELEGRAM)
+    assert tg_cfg is not None
+    assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
+    assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
+
+
+def test_observes_unmentioned_group_message_from_non_owner_without_dispatch():
+    adapter = _make_adapter(
+        require_mention=False,
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    adapter._session_store = _FakeSessionStore()
+    adapter._is_callback_user_authorized = lambda user_id, **_kw: user_id == "111"
+
+    message = _group_message("다른 사람이 남긴 업무 맥락", chat_id=-100, from_user_id=222)
+
+    assert adapter._should_process_message(message) is False
+    assert adapter._should_observe_unmentioned_group_message(message) is True
+    adapter._observe_unmentioned_group_message(message, __import__(
+        "gateway.platforms.base", fromlist=["MessageType"]
+    ).MessageType.TEXT)
+
+    assert adapter._session_store.sessions[0].chat_id == "-100"
+    assert adapter._session_store.sessions[0].user_id is None
+    assert adapter._session_store.entries[0][1]["observed"] is True
+    assert "[User 222|222]" in adapter._session_store.entries[0][1]["content"]
 
 
 def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):

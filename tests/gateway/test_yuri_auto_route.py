@@ -3,8 +3,12 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
-from gateway.run import GatewayRunner
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.run import (
+    GatewayRunner,
+    _kanban_text_claims_artifact_delivery,
+    _secretary_clean_kanban_text,
+)
 from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
 
@@ -31,9 +35,16 @@ class _TranscriptStore:
         self.updated.append(session_key)
 
 
-def _event(text: str, *, media: bool = False, is_bot: bool = False) -> MessageEvent:
+def _event(
+    text: str,
+    *,
+    media: bool = False,
+    is_bot: bool = False,
+    message_type: MessageType = MessageType.TEXT,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
+        message_type=message_type,
         source=SessionSource(
             platform=Platform.TELEGRAM,
             chat_id="c1",
@@ -56,6 +67,41 @@ def test_yuri_auto_route_keeps_plain_questions_in_chat():
     assert _runner()._classify_yuri_auto_route(_event("큐드라이버가 대체 뭔가요?")) is None
 
 
+def test_yuri_auto_route_keeps_capability_questions_in_chat_even_with_action_words():
+    assert _runner()._classify_yuri_auto_route(
+        _event("스프레드시트가 업데이트 되면 트리거가 되어서 바로 지도에 반영할수없어?")
+    ) is None
+
+
+def test_yuri_auto_route_keeps_ordinal_followup_in_chat():
+    assert _runner()._classify_yuri_auto_route(
+        _event("1번에 대해 더 자세하게 보고해")
+    ) is None
+
+
+def test_yuri_auto_route_keeps_understanding_checks_in_chat():
+    assert _runner()._classify_yuri_auto_route(
+        _event("[테스트] 파일 만들지 말고 메시지 이해 여부만 확인해주세요")
+    ) is None
+
+
+def test_yuri_auto_route_keeps_status_followup_questions_in_chat():
+    assert _runner()._classify_yuri_auto_route(_event("찾아봤니?")) is None
+    assert _runner()._classify_yuri_auto_route(_event("어디까지 됐어?")) is None
+
+
+def test_yuri_auto_route_keeps_question_style_data_checks_in_chat():
+    assert _runner()._classify_yuri_auto_route(
+        _event("클린버전으로 다시 수집하기로 했었는데 클린버전으로 수집된 데이터인가요?")
+    ) is None
+
+
+def test_yuri_auto_route_does_not_blind_route_voice_only_messages():
+    assert _runner()._classify_yuri_auto_route(
+        _event("", media=True, message_type=MessageType.VOICE)
+    ) is None
+
+
 def test_yuri_auto_route_recent_error_questions_go_to_review():
     route = _runner()._classify_yuri_auto_route(
         _event("방금 난 오류 알림은 뭐야?")
@@ -74,10 +120,23 @@ def test_yuri_auto_route_sends_ops_work_to_ops():
     assert route is not None
     assert route["assignee"] == "ops"
     assert "유리 자동 라우팅" in route["body"]
-    assert "정리한 업무지시" in route["body"]
+    assert "유리가 대표님께 설명한 해석" in route["body"]
+    assert "작업자 실행 해석" in route["body"]
+    assert "HTTP/API/파일/DB/CLI" in route["body"]
+    assert "리스크가 큰 경우에만" in route["body"]
     assert "대표님 원문" not in route["body"]
     assert "그대로 인용" in route["body"]
     assert "접수" not in route["body"]
+
+
+def test_yuri_auto_route_sends_address_lookup_to_ops_not_planner():
+    route = _runner()._classify_yuri_auto_route(
+        _event("주소 보내줘 아마 유나피시에서 개발하던게 있을꺼야.")
+    )
+
+    assert route is not None
+    assert route["assignee"] == "ops"
+    assert "접속 주소 후보" in route["body"]
 
 
 def test_yuri_auto_route_sends_document_work_to_docslead():
@@ -127,7 +186,7 @@ def test_yuri_auto_route_complex_execution_becomes_pm_root():
     assert route["source_room_required"] is True
     assert "유리 PM 오케스트레이션 루트 업무" in route["body"]
     assert "telegram-user MCP" in route["body"]
-    assert "reviewer는 처음 실행자가 아니라" in route["body"]
+    assert "reviewer는 기본으로 붙이지 않습니다" in route["body"]
     assert "첨부 작업자료" in route["body"]
     assert "/tmp/example.png" in route["body"]
     assert "작업자료로 같이 전달" in route["body"]
@@ -159,9 +218,32 @@ def test_yuri_file_negation_does_not_route_to_docslead():
         _event("[테스트] 파일 만들지 말고 메시지 이해 여부만 확인해주세요")
     )
 
+    assert route is None
+
+
+def test_yuri_worker_brief_includes_followup_context_recovery_rules():
+    route = _runner()._classify_yuri_auto_route(
+        _event("맥서버 상태 점검하고 게이트웨이 로그 확인해주세요")
+    )
+
     assert route is not None
-    assert route["assignee"] == "reviewer"
-    assert route["reason"] == "요청 이해/검증"
+    assert "방금/아까/1번/그거" in route["body"]
+    assert "다른 사람의 봇" in route["body"]
+
+
+def test_yuri_protocol_prompt_is_injected_for_telegram_default_profile():
+    runner = _runner()
+    prompt = runner._yuri_secretary_protocol_prompt(_event("방금 오류 뭐야?"), _event("x").source)
+
+    assert "YURI secretary protocol" in prompt
+    assert "마무리했습니다" in prompt
+    assert "페이커, 올리비아" in prompt
+
+
+def test_yuri_protocol_prompt_ignores_worker_profiles():
+    runner = _runner("researcher")
+
+    assert runner._yuri_secretary_protocol_prompt(_event("방금 오류 뭐야?"), _event("x").source) == ""
 
 
 @pytest.mark.asyncio
@@ -194,8 +276,8 @@ async def test_yuri_followup_attaches_to_active_session_task(tmp_path, monkeypat
         route,
     )
 
-    assert "이어 챙겨두겠습니다" in response
-    assert parent_id not in response
+    assert response is not None
+    assert "이어 붙" in response
     conn = kb.connect()
     try:
         children = kb.child_ids(conn, parent_id)
@@ -226,10 +308,11 @@ async def test_yuri_auto_route_persists_intake_context_for_short_followups(tmp_p
         route,
     )
 
-    assert response
+    assert response is not None
+    assert "코덱스" in response
     assert [entry[1]["role"] for entry in store.entries] == ["user", "assistant"]
     assert "코덱스에 관련된 기능" in store.entries[0][1]["content"]
-    assert "제가 이해한 일" in store.entries[1][1]["content"]
+    assert "코덱스" in store.entries[1][1]["content"]
     assert store.updated == ["key-ctx"]
 
 
@@ -261,7 +344,9 @@ async def test_yuri_delivery_followup_links_to_recent_done_task(tmp_path, monkey
         route,
     )
 
-    assert "제가 이해한 일" in response
+    assert response is not None
+    assert "문서팀에 이관하겠습니다" in response
+    assert "확인해야 할 상태" in response
     conn = kb.connect()
     try:
         children = kb.child_ids(conn, parent_id)
@@ -322,8 +407,9 @@ async def test_yuri_pm_root_creates_single_visible_root_task(tmp_path, monkeypat
         route,
     )
 
-    assert "맡아두겠습니다" in response
-    assert "루트 업무" not in response
+    assert response is not None
+    assert "이관하겠습니다" in response
+    assert "운영팀" in response
     conn = kb.connect()
     try:
         tasks = kb.list_tasks(conn, session_id="session-2")
@@ -365,7 +451,8 @@ async def test_yuri_contextual_followup_attaches_to_active_root(tmp_path, monkey
         route,
     )
 
-    assert "이어 챙겨두겠습니다" in response
+    assert response is not None
+    assert "이어 붙" in response
     conn = kb.connect()
     try:
         tasks = kb.list_tasks(conn, session_id="session-3")
@@ -399,3 +486,19 @@ def test_kanban_artifact_status_reports_missing_declared_file():
     assert status["declared"] == 1
     assert status["existing"] == 0
     assert status["missing"] == ["/tmp/hermes-missing-artifact.md"]
+
+
+def test_kanban_file_delivery_claim_detector_requires_artifact_evidence():
+    assert _kanban_text_claims_artifact_delivery("파일 전송 완료했습니다.") is True
+    assert _kanban_text_claims_artifact_delivery("내용 정리 완료했습니다.") is False
+
+
+def test_secretary_clean_kanban_text_summarizes_raw_failures():
+    cleaned = _secretary_clean_kanban_text(
+        "telegram",
+        "⚠️ Cron job 'poll' failed: Script exited with code 255\nConnection closed by UNKNOWN port 65535",
+    )
+
+    assert "예약 작업에서 오류" in cleaned
+    assert "Script exited" not in cleaned
+    assert "UNKNOWN port" not in cleaned

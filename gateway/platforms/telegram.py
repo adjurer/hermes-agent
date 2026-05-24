@@ -8,12 +8,14 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
 import tempfile
 import html as _html
 import re
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,13 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace
+
+
+class _SkippedTelegramMessage:
+    """Placeholder return object when a send is intentionally muted."""
+
+    def __init__(self, message_id: Optional[int] = None):
+        self.message_id = message_id
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -497,12 +506,18 @@ class TelegramAdapter(BasePlatformAdapter):
         In "important" mode, all message sends are silently delivered
         (disable_notification=True) unless the caller explicitly requests a
         notification by setting ``metadata["notify"] = True``.
+
+        "off" is a hard mute mode. The caller should skip outbound sends
+        entirely when this mode is active.
         """
         if getattr(self, "_notifications_mode", "important") != "important":
             return {}
         if (metadata or {}).get("notify"):
             return {}
         return {"disable_notification": True}
+
+    def _notifications_muted(self) -> bool:
+        return getattr(self, "_notifications_mode", "important") == "off"
 
     def _is_callback_user_authorized(
         self,
@@ -693,6 +708,9 @@ class TelegramAdapter(BasePlatformAdapter):
         reset_media: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
+        if self._notifications_muted():
+            return _SkippedTelegramMessage()
+
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
@@ -1290,11 +1308,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     # Send a seed message so the topic is visible in Telegram's client.
                     # Empty topics are hidden by the client UI until they contain a message.
+                    if self._notifications_muted():
+                        continue
                     try:
                         await self._bot.send_message(
                             chat_id=int(chat_id),
                             message_thread_id=thread_id,
                             text=f"\U0001f4cc {topic_name}",
+                            **self._notification_kwargs(None),
                         )
                     except Exception as seed_err:
                         logger.debug(
@@ -1676,6 +1697,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        if self._notifications_muted():
+            return SendResult(success=True, message_id=None)
 
         content = _strip_telegram_local_delivery_noise(content)
         
@@ -2263,6 +2287,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+
+        if self._notifications_muted():
+            return SendResult(success=True, message_id=None)
+
         if not hasattr(self._bot, "send_message_draft"):
             return SendResult(success=False, error="api_unavailable")
 
@@ -2307,12 +2335,18 @@ class TelegramAdapter(BasePlatformAdapter):
         (PR #3390) at the body of ``send``; this helper applies the
         same retry pattern to the non-streaming control paths.
         """
+        if self._notifications_muted():
+            return _SkippedTelegramMessage()
+
         if not self._bot:
             raise RuntimeError("Not connected")
 
         message_thread_id = kwargs.get("message_thread_id")
+        send_kwargs = dict(kwargs)
+        send_kwargs.update(self._notification_kwargs(kwargs))
+
         try:
-            return await self._bot.send_message(**kwargs)
+            return await self._bot.send_message(**send_kwargs)
         except Exception as send_err:
             if (
                 message_thread_id is not None
@@ -2324,7 +2358,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     message_thread_id,
                 )
-                retry_kwargs = dict(kwargs)
+                retry_kwargs = dict(send_kwargs)
                 retry_kwargs.pop("message_thread_id", None)
                 return await self._bot.send_message(**retry_kwargs)
             raise
@@ -4173,6 +4207,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_observe_unmentioned_group_messages(self) -> bool:
+        """Return whether skipped unmentioned group messages are stored as context."""
+        configured = self.config.extra.get("observe_unmentioned_group_messages")
+        if configured is None:
+            configured = self.config.extra.get("ingest_unmentioned_group_messages")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
         configured = self.config.extra.get("guest_mode")
@@ -4213,6 +4258,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_group_allowed_chats(self) -> set[str]:
+        """Return Telegram chats authorized at group-observe scope."""
+        raw = self.config.extra.get("group_allowed_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_observe_allowed_chats(self) -> set[str]:
+        """Return chats where observed group context may use a shared source."""
+        group_allowed = self._telegram_group_allowed_chats()
+        if not group_allowed:
+            return set()
+        response_allowed = self._telegram_allowed_chats()
+        if response_allowed:
+            return group_allowed & response_allowed
+        return group_allowed
 
     def _telegram_allowed_topics(self) -> set[str]:
         """Return the whitelist of Telegram forum topic IDs this bot handles.
@@ -4461,6 +4525,135 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
+    def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
+        """Return True when a group message should be stored but not dispatched."""
+        if not self._telegram_observe_unmentioned_group_messages():
+            return False
+        if not self._is_group_chat(message):
+            return False
+
+        thread_id = getattr(message, "message_thread_id", None)
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+            if topic_id not in allowed_topics:
+                return False
+
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
+
+        allowed = self._telegram_observe_allowed_chats()
+        if not allowed or chat_id_str not in allowed:
+            return False
+
+        _user = getattr(message, "from_user", None)
+        _user_id = str(getattr(_user, "id", "")) if _user else ""
+        _chat = getattr(message, "chat", None)
+        _chat_type = str(getattr(_chat, "type", "")).split(".")[-1].lower() if _chat else None
+        _user_name = getattr(_user, "username", None) or getattr(_user, "full_name", None)
+        authorized_user = self._is_callback_user_authorized(
+            _user_id,
+            chat_id=chat_id_str,
+            chat_type=_chat_type,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=str(_user_name).strip() if _user_name else None,
+        )
+        if not authorized_user:
+            return True
+
+        if chat_id_str in self._telegram_free_response_chats():
+            return False
+        if not self._telegram_require_mention():
+            return False
+        if self._is_reply_to_bot(message):
+            return False
+        if self._message_mentions_bot(message):
+            return False
+        if self._message_matches_mention_patterns(message):
+            return False
+        return True
+
+    def _telegram_group_observe_shared_source(self, source):
+        """Return a chat/topic-scoped source for observed Telegram group context."""
+        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+
+    def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
+        user_id = event.source.user_id or "unknown"
+        sender = event.source.user_name or user_id
+        return f"[{sender}|{user_id}]\n{event.text or ''}"
+
+    def _telegram_group_observe_channel_prompt(self) -> str:
+        username = getattr(getattr(self, "_bot", None), "username", None) or "unknown"
+        bot_id = getattr(getattr(self, "_bot", None), "id", None) or "unknown"
+        return (
+            "You are handling a Telegram group chat message.\n"
+            f"- Your identity: user_id={bot_id}, @-mention name in this group=@{username}\n"
+            "- Lines in history prefixed with `[nickname|user_id]` are observed Telegram group context "
+            "and are not necessarily addressed to you.\n"
+            "- Treat only the current new message as a request explicitly directed at you, "
+            "and answer it directly."
+        )
+
+    def _apply_telegram_group_observe_attribution(self, event: MessageEvent) -> MessageEvent:
+        """Align triggered group turns with observed-history attribution."""
+        if not self._telegram_observe_unmentioned_group_messages():
+            return event
+        raw_message = getattr(event, "raw_message", None)
+        if not raw_message or not self._is_group_chat(raw_message):
+            return event
+        chat_id_str = str(getattr(getattr(raw_message, "chat", None), "id", ""))
+        allowed = self._telegram_observe_allowed_chats()
+        if not allowed or chat_id_str not in allowed:
+            return event
+        shared_source = self._telegram_group_observe_shared_source(event.source)
+        observe_prompt = self._telegram_group_observe_channel_prompt()
+        channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
+        return dataclasses.replace(
+            event,
+            text=self._telegram_group_observe_attributed_text(event),
+            source=shared_source,
+            channel_prompt=channel_prompt,
+        )
+
+    def _observe_unmentioned_group_message(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> None:
+        """Append skipped group chatter to the target session without dispatching."""
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            event = self._build_message_event(message, msg_type, update_id=update_id)
+            shared_source = self._telegram_group_observe_shared_source(event.source)
+            session_entry = store.get_or_create_session(shared_source)
+            entry = {
+                "role": "user",
+                "content": self._telegram_group_observe_attributed_text(event),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "observed": True,
+            }
+            if event.message_id:
+                entry["message_id"] = str(event.message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            logger.info(
+                "[%s] Telegram group message observed (no bot trigger): chat=%s from=%s",
+                getattr(self, "name", "telegram"),
+                getattr(getattr(message, "chat", None), "id", "unknown"),
+                event.source.user_id or "unknown",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to observe Telegram group message: %s",
+                getattr(self, "name", "telegram"),
+                exc,
+            )
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules and user allowlist.
 
@@ -4605,11 +4798,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg):
+            if self._should_observe_unmentioned_group_message(msg):
+                self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4618,10 +4814,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg or not msg.text:
             return
         if not self._should_process_message(msg, is_command=True):
+            if self._should_observe_unmentioned_group_message(msg):
+                self._observe_unmentioned_group_message(msg, MessageType.COMMAND, update_id=update.update_id)
             return
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4630,6 +4829,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg:
             return
         if not self._should_process_message(msg):
+            if self._should_observe_unmentioned_group_message(msg):
+                self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
             return
 
         venue = getattr(msg, "venue", None)
@@ -4659,6 +4860,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
+        event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -4803,6 +5005,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not update.message:
             return
         if not self._should_process_message(update.message):
+            if self._should_observe_unmentioned_group_message(update.message):
+                self._observe_unmentioned_group_message(update.message, MessageType.DOCUMENT, update_id=update.update_id)
             return
         
         msg = update.message
@@ -4828,6 +5032,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Add caption as text
         if msg.caption:
             event.text = self._clean_bot_trigger_text(msg.caption)
+        event = self._apply_telegram_group_observe_attribution(event)
         
         # Handle stickers: describe via vision tool with caching
         if msg.sticker:
@@ -5415,6 +5620,23 @@ class TelegramAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _reaction_from_env(name: str, default: str) -> str:
+        """Return a configured reaction emoji, falling back to a safe default."""
+        value = os.getenv(name, "").strip()
+        return value or default
+
+    @staticmethod
+    def _optional_reaction_from_env(name: str, default: Optional[str] = None) -> Optional[str]:
+        """Return a configured reaction emoji, or None when the final state should be blank."""
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        value = raw.strip()
+        if not value or value.lower() in {"none", "clear", "off", "false", "0", "no"}:
+            return None
+        return value
+
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
         if not self._bot:
@@ -5429,6 +5651,20 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
             return False
+
+    async def _set_reaction_with_fallback(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+        fallback: str,
+    ) -> bool:
+        """Set a reaction and retry with a known-supported emoji if configured one fails."""
+        if await self._set_reaction(chat_id, message_id, emoji):
+            return True
+        if fallback and fallback != emoji:
+            return await self._set_reaction(chat_id, message_id, fallback)
+        return False
 
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
         """Clear all reactions from a Telegram message.
@@ -5457,11 +5693,16 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
             if self._reactions_enabled():
-                await self._set_reaction(chat_id, message_id, "\U0001f440")
+                await self._set_reaction_with_fallback(
+                    chat_id,
+                    message_id,
+                    self._reaction_from_env("TELEGRAM_REACTION_START", "\U0001f440"),
+                    "\U0001f440",
+                )
             # Optional visible active-work marker. On busy personal chats this
             # creates noisy Telegram service messages, so deployments can keep
             # recovery on the durable ledger only by setting pin_active_work=false.
-            if self._pin_active_work and self._bot:
+            if getattr(self, "_pin_active_work", False) and self._bot:
                 try:
                     await self._bot.pin_chat_message(
                         chat_id=int(chat_id),
@@ -5491,15 +5732,30 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._reactions_enabled():
             if outcome == ProcessingOutcome.CANCELLED:
                 await self._clear_reactions(chat_id, message_id)
+            elif outcome == ProcessingOutcome.FAILURE:
+                failure_reaction = self._optional_reaction_from_env(
+                    "TELEGRAM_REACTION_FAILURE",
+                    None,
+                )
+                if failure_reaction:
+                    await self._set_reaction_with_fallback(
+                        chat_id,
+                        message_id,
+                        failure_reaction,
+                        "\U0001f44e",
+                    )
+                else:
+                    await self._clear_reactions(chat_id, message_id)
             else:
-                await self._set_reaction(
+                await self._set_reaction_with_fallback(
                     chat_id,
                     message_id,
-                    "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
+                    self._reaction_from_env("TELEGRAM_REACTION_SUCCESS", "\U0001f525"),
+                    "\U0001f525",
                 )
         # Unpin the message when processing is complete, but only if this
         # adapter was configured to create the temporary pin in the first place.
-        if self._pin_active_work and self._bot:
+        if getattr(self, "_pin_active_work", False) and self._bot:
             try:
                 await self._bot.unpin_chat_message(
                     chat_id=int(chat_id),
