@@ -46,6 +46,15 @@ def test_yuri_quality_detects_raw_cron_failure():
     assert "raw_failure_leaked" in {i.code for i in issues}
 
 
+def test_yuri_quality_detects_simple_check_overrouting():
+    issues = yq.scan_messages([
+        {"id": "6a", "sender": "대표님", "text": "유리야 진단 응답 테스트입니다. OK라고만 답해줘."},
+        {"id": "6b", "sender": "YURI", "text": "네. 운영팀에 이관하겠습니다."},
+    ])
+
+    assert "simple_check_overrouted" in {i.code for i in issues}
+
+
 def test_yuri_quality_backtests_pass():
     result = yq.run_backtests()
 

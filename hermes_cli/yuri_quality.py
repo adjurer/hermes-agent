@@ -9,6 +9,7 @@ pre-flight check for the behaviors that have caused friction in Telegram:
 * worker/profile bots reporting directly instead of through Yuri,
 * losing obvious recent context,
 * surfacing raw cron/gateway failures without secretary-style synthesis.
+* routing exact-response/simple health checks into subagents.
 
 The functions accept plain message dictionaries so tests and future Telegram
 readers can feed the same scanner without coupling this module to Telethon.
@@ -46,6 +47,17 @@ CONTEXT_LOST_RE = re.compile(
 CONTEXT_HINT_RE = re.compile(
     r"(scrapling|스크래핑|크롤링|조합|방금|아까|그 방식|그 조합|커뮤니티|파일|산출물)",
     re.IGNORECASE,
+)
+
+SIMPLE_CHECK_RE = re.compile(
+    r"(OK라고만\s*답|오케이만\s*답|가능\s*여부만\s*답|상태\s*확인|정신차렸어|"
+    r"진단\s*응답\s*테스트|테스트.*답해줘)",
+    re.IGNORECASE,
+)
+
+ORCHESTRATION_CLAIM_RE = re.compile(
+    r"(이관하겠습니다|배정하겠습니다|넘기겠습니다|라우팅하겠습니다|"
+    r"(운영|기획|조사|문서|검증|작성)팀에\s*(?:이관|배정|넘기))"
 )
 
 WORKER_COMPLETE_RE = re.compile(
@@ -161,6 +173,17 @@ def scan_messages(messages: Iterable[Mapping[str, Any]], *, context_window: int 
                     recommendation="최근 대화/활성 카드/직전 완료 카드 순서로 referent를 복구한 뒤, 그래도 모호할 때만 짧게 되묻습니다.",
                 ))
 
+        if _is_yuri(sender) and ORCHESTRATION_CLAIM_RE.search(text):
+            recent = " ".join(_text(prev) for prev in rows[max(0, idx - 3):idx])
+            if SIMPLE_CHECK_RE.search(recent):
+                issues.append(QualityIssue(
+                    code="simple_check_overrouted",
+                    severity="medium",
+                    message_id=mid,
+                    summary="간단 진단/정확 응답 요청을 서브에이전트 업무처럼 라우팅했습니다.",
+                    recommendation="건강 확인, OK-only, 가능 여부 질문은 직접 짧게 답하고 실제 다단계 업무만 Kanban/subagent로 보냅니다.",
+                ))
+
     return issues
 
 
@@ -257,6 +280,14 @@ def run_backtests() -> dict[str, Any]:
             "name": "raw cron failures should be summarized",
             "messages": [{"id": "m5", "sender": "YURI", "text": "⚠️ Cron job 'poll' failed: Script exited with code 255"}],
             "expect": {"raw_failure_leaked"},
+        },
+        {
+            "name": "simple checks should not be routed to subagents",
+            "messages": [
+                {"id": "m6a", "sender": "대표님", "text": "유리야 진단 응답 테스트입니다. OK라고만 답해줘."},
+                {"id": "m6b", "sender": "YURI", "text": "네. 운영팀에 이관하겠습니다."},
+            ],
+            "expect": {"simple_check_overrouted"},
         },
     ]
     results = []
