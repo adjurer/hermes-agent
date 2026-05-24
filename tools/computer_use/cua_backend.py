@@ -58,6 +58,50 @@ def _default_cua_driver_cmd() -> str:
 _CUA_DRIVER_CMD = os.environ.get("HERMES_CUA_DRIVER_CMD") or _default_cua_driver_cmd()
 _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport
 
+
+def _image_size_from_bytes(data: bytes) -> Tuple[int, int]:
+    """Return image dimensions for PNG/JPEG screenshots without extra deps."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+    if data.startswith(b"\xff\xd8"):
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            i += 2
+            while marker == 0xFF and i < len(data):
+                marker = data[i]
+                i += 1
+            if marker in {0xD8, 0xD9}:
+                continue
+            if i + 2 > len(data):
+                break
+            segment_len = int.from_bytes(data[i:i + 2], "big")
+            if segment_len < 2 or i + segment_len > len(data):
+                break
+            if marker in {
+                0xC0, 0xC1, 0xC2, 0xC3,
+                0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB,
+                0xCD, 0xCE, 0xCF,
+            } and segment_len >= 7:
+                height = int.from_bytes(data[i + 3:i + 5], "big")
+                width = int.from_bytes(data[i + 5:i + 7], "big")
+                return width, height
+            i += segment_len
+
+    return 0, 0
+
+
+def _image_size_from_b64(image_b64: str) -> Tuple[int, int]:
+    try:
+        return _image_size_from_bytes(base64.b64decode(image_b64, validate=False))
+    except Exception:
+        return 0, 0
+
 # Regex to parse list_windows text output lines:
 #   "- AppName (pid 12345) "Title" [window_id: 67890]"
 _WINDOW_LINE_RE = re.compile(
@@ -473,9 +517,12 @@ class CuaDriverBackend(ComputerUseBackend):
         png_bytes_len = 0
         if png_b64:
             try:
-                png_bytes_len = len(base64.b64decode(png_b64, validate=False))
+                png_bytes = base64.b64decode(png_b64, validate=False)
+                png_bytes_len = len(png_bytes)
+                width, height = _image_size_from_bytes(png_bytes)
             except Exception:
                 png_bytes_len = len(png_b64) * 3 // 4
+                width, height = _image_size_from_b64(png_b64)
 
         return CaptureResult(
             mode=mode,
@@ -505,6 +552,15 @@ class CuaDriverBackend(ComputerUseBackend):
                                 message="No active window — call capture() first.")
 
         # Choose tool based on button and click_count.
+        if button == "middle":
+            return ActionResult(
+                ok=False,
+                action="middle_click",
+                message=(
+                    "middle_click is not supported by cua-driver; use click, "
+                    "double_click, right_click, or a keyboard shortcut instead."
+                ),
+            )
         if button == "right":
             tool = "right_click"
         elif click_count == 2:

@@ -1204,6 +1204,11 @@ def _make_cua_backend_with_windows(windows: List[Dict[str, Any]]):
     return backend
 
 
+_TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAADCAIAAADZrBkAAAAAD0lEQVR4nGNgYGAAAAAEAAGjChXjAAAAAElFTkSuQmCC"
+)
+
+
 class TestCaptureAppFilterNoMatch:
     """capture(app=X) must not silently fall back to the frontmost window
     when X matches nothing — on a non-English macOS, list_windows returns
@@ -1275,6 +1280,39 @@ class TestCaptureAppFilterNoMatch:
         cap = backend.capture(mode="ax", app=None)
 
         assert backend._active_pid == 100
+
+    def test_capture_sets_dimensions_from_screenshot_header(self):
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        backend._session.call_tool.side_effect = [
+            {"data": "", "images": [], "isError": False,
+             "structuredContent": {"windows": windows}},
+            {"data": '✅ Fuwari — 0 elements\n', "images": [_TINY_PNG_B64],
+             "isError": False, "structuredContent": None},
+        ]
+
+        cap = backend.capture(mode="som", app=None)
+
+        assert cap.width == 2
+        assert cap.height == 3
+
+    def test_middle_click_fails_explicitly_instead_of_left_clicking(self):
+        windows = [
+            {"app_name": "Fuwari", "pid": 100, "window_id": 1,
+             "is_on_screen": True, "title": "menu bar", "z_index": 0},
+        ]
+        backend = _make_cua_backend_with_windows(windows)
+        backend._active_pid = 100
+        backend._active_window_id = 1
+
+        res = backend.click(element=1, button="middle")
+
+        assert res.ok is False
+        assert res.action == "middle_click"
+        backend._session.call_tool.assert_not_called()
 
 
 class TestFocusAppFilterNoMatch:
