@@ -85,7 +85,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -1848,6 +1848,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -2923,6 +2924,8 @@ def complete_task(
     else:
         verified_cards = []
 
+    metadata = _preserve_completion_artifacts(conn, task_id, metadata)
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -3036,6 +3039,91 @@ def complete_task(
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
+
+
+def _preserve_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Copy scratch-workspace artifacts to a durable per-board handoff dir.
+
+    Scratch workspaces are deleted after completion. If workers pass an
+    artifact path inside that workspace, downstream child tasks and the
+    gateway notifier would otherwise see a dead path. Keep non-scratch
+    artifacts untouched, but rewrite scratch-local artifact paths to the
+    preserved copy.
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+    raw = metadata.get("artifacts")
+    if isinstance(raw, str):
+        raw_items: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        raw_items = list(raw)
+    else:
+        return metadata
+
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+        return metadata
+
+    workspace = Path(str(row["workspace_path"])).expanduser()
+    try:
+        workspace_resolved = workspace.resolve()
+    except Exception:
+        workspace_resolved = workspace
+
+    board_artifact_root = workspace.parent.parent / "artifacts" / task_id
+    preserved: list[str] = []
+    changed = False
+
+    for item in raw_items:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        original = Path(os.path.expanduser(item.strip()))
+        replacement = original
+        try:
+            original_resolved = original.resolve()
+        except Exception:
+            original_resolved = original
+        try:
+            is_inside_workspace = (
+                original_resolved == workspace_resolved
+                or workspace_resolved in original_resolved.parents
+            )
+        except Exception:
+            is_inside_workspace = False
+        if is_inside_workspace and original.is_file():
+            try:
+                board_artifact_root.mkdir(parents=True, exist_ok=True)
+                target = board_artifact_root / original.name
+                if target.exists():
+                    stem, suffix = target.stem, target.suffix
+                    idx = 2
+                    while target.exists():
+                        target = board_artifact_root / f"{stem}_{idx}{suffix}"
+                        idx += 1
+                import shutil
+                shutil.copy2(original, target)
+                replacement = target
+                changed = True
+            except Exception as exc:
+                _log.debug(
+                    "Could not preserve scratch artifact for %s: %s",
+                    task_id,
+                    exc,
+                )
+        preserved.append(str(replacement))
+
+    if not changed:
+        return metadata
+    new_metadata = dict(metadata)
+    new_metadata["artifacts"] = preserved
+    return new_metadata
 
 
 # ---------------------------------------------------------------------------

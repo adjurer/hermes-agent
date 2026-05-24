@@ -461,6 +461,46 @@ async def test_notifier_suppresses_intermediate_child_completion(kanban_home, tm
     assert len(child_subs) == 1
 
 
+def test_completion_preserves_scratch_artifacts_for_handoff(kanban_home):
+    """Artifacts created inside scratch workspaces must outlive workspace cleanup."""
+    import json
+    import os
+    import hermes_cli.kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="make handoff", assignee="worker1")
+        workspace = kb.workspaces_root() / tid
+        workspace.mkdir(parents=True)
+        report = workspace / "260524_중간보고.md"
+        report.write_text("handoff", encoding="utf-8")
+        kb.set_workspace_path(conn, tid, str(workspace))
+    finally:
+        conn.close()
+
+    os.environ["HERMES_KANBAN_TASK"] = tid
+    try:
+        out = kt._handle_complete({
+            "summary": "중간 보고를 만들었습니다.",
+            "artifacts": [str(report)],
+        })
+    finally:
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, tid)
+    finally:
+        conn.close()
+    completed = [e for e in events if e.kind == "completed"][-1]
+    artifact_path = completed.payload["artifacts"][0]
+    assert "/artifacts/" in artifact_path
+    assert Path(artifact_path).is_file()
+    assert not workspace.exists()
+
+
 @pytest.mark.asyncio
 async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_home):
     """The gateway for the profile that created/subscribed the task reports it."""
