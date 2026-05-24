@@ -2132,12 +2132,12 @@ class GatewayRunner:
         if raw in {None, ""}:
             return None
         if isinstance(raw, bool):
-            return "all" if raw else "off"
+            return "all" if raw else "important"
         mode = str(raw).strip().lower()
         if mode in {"1", "true", "yes", "on", "all"}:
             return "all"
         if mode in {"0", "false", "no", "off", "silent"}:
-            return "off"
+            return "important"
         if mode in {"important"}:
             return "important"
         return mode
