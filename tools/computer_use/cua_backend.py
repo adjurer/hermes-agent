@@ -340,6 +340,18 @@ class _CuaDriverSession:
         self._require_started()
         return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
 
+    async def _list_tools_async(self) -> set[str]:
+        result = await self._session.list_tools()
+        return {
+            str(getattr(tool, "name", ""))
+            for tool in getattr(result, "tools", []) or []
+            if getattr(tool, "name", None)
+        }
+
+    def list_tools(self, timeout: float = 10.0) -> set[str]:
+        self._require_started()
+        return self._bridge.run(self._list_tools_async(), timeout=timeout)
+
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     """Convert an mcp CallToolResult into a plain dict.
@@ -392,6 +404,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
+        self._tool_names: Optional[set[str]] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
@@ -649,10 +662,8 @@ class CuaDriverBackend(ComputerUseBackend):
         if pid is None:
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
-        # Safari/WebKit AXTextField does not reliably accept AX attribute writes
-        # through type_text, so synthesize characters instead. This also avoids
-        # leaving the target app in a half-focused state after failed input.
-        return self._action("type_text_chars", {"pid": pid, "text": text})
+        tool = "type_text_chars" if self._has_tool("type_text_chars") else "type_text"
+        return self._action(tool, {"pid": pid, "text": text})
 
     def key(self, keys: str) -> ActionResult:
         pid = self._active_pid
@@ -759,6 +770,28 @@ class CuaDriverBackend(ComputerUseBackend):
                             message=f"No on-screen window found for app '{app}'.")
 
     # ── Internal ───────────────────────────────────────────────────
+    def _available_tool_names(self) -> set[str]:
+        if self._tool_names is not None:
+            return self._tool_names
+        try:
+            listed = self._session.list_tools()
+            if isinstance(listed, set):
+                self._tool_names = {str(name) for name in listed}
+            elif isinstance(listed, (list, tuple)):
+                self._tool_names = {
+                    str(getattr(item, "name", item))
+                    for item in listed
+                    if getattr(item, "name", item)
+                }
+            else:
+                self._tool_names = set()
+        except Exception:
+            self._tool_names = set()
+        return self._tool_names
+
+    def _has_tool(self, name: str) -> bool:
+        return name in self._available_tool_names()
+
     def _action(self, name: str, args: Dict[str, Any]) -> ActionResult:
         try:
             out = self._session.call_tool(name, args)

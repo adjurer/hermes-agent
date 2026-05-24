@@ -1314,6 +1314,42 @@ class TestCaptureAppFilterNoMatch:
         assert res.action == "middle_click"
         backend._session.call_tool.assert_not_called()
 
+    def test_type_text_uses_installed_cua_driver_tool_name(self):
+        backend = _make_cua_backend_with_windows([])
+        backend._session.list_tools.return_value = {"type_text"}
+        backend._session.call_tool.return_value = {
+            "data": "typed",
+            "images": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+        backend._active_pid = 100
+
+        res = backend.type_text("hello")
+
+        assert res.ok is True
+        backend._session.call_tool.assert_called_once_with(
+            "type_text", {"pid": 100, "text": "hello"}
+        )
+
+    def test_type_text_prefers_char_tool_when_available(self):
+        backend = _make_cua_backend_with_windows([])
+        backend._session.list_tools.return_value = {"type_text", "type_text_chars"}
+        backend._session.call_tool.return_value = {
+            "data": "typed",
+            "images": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+        backend._active_pid = 100
+
+        res = backend.type_text("hello")
+
+        assert res.ok is True
+        backend._session.call_tool.assert_called_once_with(
+            "type_text_chars", {"pid": 100, "text": "hello"}
+        )
+
 
 class TestFocusAppFilterNoMatch:
     """focus_app(app=X) must return ok=False when X matches nothing —
