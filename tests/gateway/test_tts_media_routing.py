@@ -62,6 +62,10 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
     return media_file.resolve()
 
 
+def _reply_metadata():
+    return {"telegram_reply_to_message_id": "msg-1"}
+
+
 @pytest.mark.asyncio
 async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
@@ -76,7 +80,7 @@ async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tm
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
         file_path=str(media_file),
-        metadata=None,
+        metadata=_reply_metadata(),
     )
     adapter.send_voice.assert_not_awaited()
 
@@ -95,7 +99,7 @@ async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_
     adapter.send_document.assert_awaited_once_with(
         chat_id="chat-1",
         file_path=str(media_file),
-        metadata=None,
+        metadata=_reply_metadata(),
     )
     adapter.send_voice.assert_not_awaited()
 
@@ -116,7 +120,7 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
     adapter.send_voice.assert_awaited_once_with(
         chat_id="chat-1",
         audio_path=str(media_file),
-        metadata=None,
+        metadata=_reply_metadata(),
     )
     adapter.send_document.assert_not_awaited()
 
