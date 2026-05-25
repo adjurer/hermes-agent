@@ -290,7 +290,28 @@ def _secretary_clean_kanban_text(platform: Any, text: str, *, limit: int = 260) 
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip(" \n\t-—:")
     if limit > 0 and len(cleaned) > limit:
-        cleaned = cleaned[:limit].rstrip() + "..."
+        window = cleaned[:limit].rstrip()
+        # Telegram handoff summaries should never end in the middle of a
+        # number/bucket label such as "A 14,944건/B". Prefer a sentence or
+        # bullet boundary; fall back to a clean word boundary with ellipsis.
+        cut_candidates = [
+            window.rfind("\n\n"),
+            window.rfind("\n"),
+            window.rfind("다. "),
+            window.rfind("요. "),
+            window.rfind("습니다. "),
+            window.rfind(". "),
+            window.rfind("! "),
+            window.rfind("? "),
+        ]
+        cut_at = max(cut_candidates)
+        if cut_at >= max(80, limit // 3):
+            window = window[: cut_at + 2].rstrip()
+        else:
+            soft = max(window.rfind(" "), window.rfind(","), window.rfind("·"))
+            if soft >= max(80, limit // 3):
+                window = window[:soft].rstrip()
+        cleaned = window.rstrip(" ,/·-—:;") + "..."
     return cleaned
 
 
@@ -5109,23 +5130,43 @@ class GatewayRunner:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
-                                open_child_count = 0
                                 open_child_ids: list[str] = []
                                 try:
                                     for child_id in _kb.child_ids(conn, sub["task_id"]):
                                         child = _kb.get_task(conn, child_id)
                                         if child and child.status not in {"done", "archived", "blocked"}:
-                                            open_child_count += 1
                                             open_child_ids.append(str(child_id))
                                 except Exception:
-                                    open_child_count = 0
                                     open_child_ids = []
+                                try:
+                                    for ev in events:
+                                        payload = getattr(ev, "payload", None)
+                                        if not isinstance(payload, dict):
+                                            continue
+                                        verified_cards = payload.get("verified_cards") or []
+                                        if not isinstance(verified_cards, list):
+                                            continue
+                                        for card_id in verified_cards:
+                                            card_id = str(card_id or "").strip()
+                                            if not card_id or card_id in open_child_ids:
+                                                continue
+                                            child = _kb.get_task(conn, card_id)
+                                            if child and child.status not in {"done", "archived", "blocked"}:
+                                                open_child_ids.append(card_id)
+                                except Exception:
+                                    logger.debug(
+                                        "kanban notifier: verified card handoff lookup failed for %s",
+                                        sub["task_id"],
+                                        exc_info=True,
+                                    )
+                                open_child_count = len(open_child_ids)
                                 if open_child_ids:
                                     # PM/root cards often finish by creating
-                                    # child work. The visible conversation must
-                                    # follow those children, otherwise Yuri
-                                    # says work was delegated and then goes
-                                    # quiet until the user asks for status.
+                                    # child work. Some decomposers write those
+                                    # cards only to verified_cards instead of
+                                    # linking them immediately; follow both
+                                    # sources so Yuri does not say work was
+                                    # delegated and then go quiet.
                                     for child_id in open_child_ids:
                                         try:
                                             _kb.add_notify_sub(
@@ -5218,6 +5259,22 @@ class GatewayRunner:
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
+                            full_run_summary = payload_summary
+                            try:
+                                run_id = getattr(ev, "run_id", None)
+                                if run_id is not None:
+                                    row = conn.execute(
+                                        "SELECT summary FROM task_runs WHERE id = ?",
+                                        (int(run_id),),
+                                    ).fetchone()
+                                    if row is not None and row["summary"]:
+                                        full_run_summary = str(row["summary"])
+                            except Exception:
+                                logger.debug(
+                                    "kanban notifier: full run summary lookup failed for %s",
+                                    sub["task_id"],
+                                    exc_info=True,
+                                )
                             task_result_text = str(task.result) if task and task.result else ""
                             if (
                                 artifact_status["declared"] > 0
@@ -5259,16 +5316,14 @@ class GatewayRunner:
                                 # task.result for legacy rows written before
                                 # runs shipped.
                                 handoff = ""
-                                if payload_summary:
-                                    h = _sanitize_gateway_final_response(sub["platform"], payload_summary)
-                                    h = _secretary_clean_kanban_text(sub["platform"], h, limit=220)
-                                    h = h.strip().splitlines()[0][:220] if h.strip() else ""
+                                if full_run_summary:
+                                    h = _sanitize_gateway_final_response(sub["platform"], full_run_summary)
+                                    h = _secretary_clean_kanban_text(sub["platform"], h, limit=420)
                                     if h:
                                         handoff = f"\n{h}"
                                 elif task and task.result:
                                     r = _sanitize_gateway_final_response(sub["platform"], task.result)
-                                    r = _secretary_clean_kanban_text(sub["platform"], r, limit=180)
-                                    r = r.strip().splitlines()[0][:180] if r.strip() else ""
+                                    r = _secretary_clean_kanban_text(sub["platform"], r, limit=360)
                                     if r:
                                         handoff = f"\n{r}"
                                 msg = f"마무리했습니다.\n{handoff.strip() if handoff.strip() else title}"
@@ -7098,6 +7153,23 @@ class GatewayRunner:
         compact = re.sub(r"\s+", " ", text)
         lowered = compact.casefold()
         bare = re.sub(r"[\s.!?。！？~…]+", "", lowered)
+        exact_reply_request = (
+            not has_media
+            and len(compact) <= 120
+            and (
+                bool(re.search(r"['\"“”‘’`]?[^'\"“”‘’`\s]{1,30}['\"“”‘’`]?\s*(?:라고|로)\s*만\s*(?:답|대답|응답|말)", compact, re.I))
+                or any(marker in lowered for marker in (
+                    "ok라고만", "ok 만", "ok만", "오케이라고만", "네라고만",
+                    "가능 여부만", "가능여부만", "네/아니오만", "예/아니오만",
+                    "한 단어로만", "한단어로만", "대답만", "답만",
+                ))
+            )
+        )
+        if exact_reply_request:
+            # Exact/terse reply tests are chat-control instructions, not work.
+            # Routing them through Kanban produced delayed, over-framed replies
+            # like "마무리했습니다. OK".
+            return None
         ordinal_followup = bool(re.search(r"(?:^|[^\d])\d+\s*번", compact)) and any(
             marker in lowered for marker in ("자세", "설명", "뭐", "무엇", "무슨", "보고")
         )
@@ -7223,6 +7295,21 @@ class GatewayRunner:
         if not actionish and not has_media:
             return None
 
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _full_cfg = _load_full_config()
+            yuri_work_mode = str(
+                cfg_get(
+                    _full_cfg,
+                    "telegram",
+                    "yuri_work_mode",
+                    default=cfg_get(_full_cfg, "kanban", "yuri_work_mode", default=""),
+                )
+                or ""
+            ).strip().lower()
+        except Exception:
+            yuri_work_mode = ""
+
         execution_markers = (
             "넣", "삽입", "수정", "반영", "적용", "고쳐", "만들", "키워",
             "줄여", "바꿔", "페이지", "화면", "박스", "디자인", "코드",
@@ -7235,6 +7322,16 @@ class GatewayRunner:
         orchestration_markers = (
             "분배", "분해", "오케스트레이션", "서브에이전트", "여러 에이전트",
             "각자", "취합", "검수까지", "반복 시도", "통과할때까지",
+        )
+        yuri_direct_first_markers = (
+            "직접", "붙잡", "유리가", "유리에게", "네가", "너가",
+            "대화", "맥락", "이전", "아까", "방금", "왜", "어떻게",
+        )
+        yuri_force_route_markers = (
+            "전 에이전트", "모든 에이전트", "서브에이전트", "오케스트레이션",
+            "분배", "분해", "각자", "동시에", "병렬", "다각도", "입체적",
+            "골든스냅샷", "전체 점검", "전반적으로 점검", "통과할때까지",
+            "장시간", "밤새", "백그라운드", "예약", "정기",
         )
         executionish = any(marker in lowered for marker in execution_markers)
         source_room_required = any(marker in lowered for marker in source_room_markers)
@@ -7280,6 +7377,31 @@ class GatewayRunner:
             "파일 만들지 말고", "파일은 만들지", "파일 생성하지", "파일을 만들지",
             "파일 만들지마", "파일 제작하지", "첨부하지 말고", "문서 만들지 말고",
         ))
+
+        if yuri_work_mode in {"hybrid", "hybrid_hold_first", "direct_first"}:
+            force_route = (
+                any(marker in lowered for marker in yuri_force_route_markers)
+                or sum(1 for marker in orchestration_markers if marker in lowered) >= 1
+                or (
+                    len(compact) > 220
+                    and sum(1 for marker in action_markers if marker in lowered) >= 4
+                )
+                or (
+                    source_room_required
+                    and any(marker in lowered for marker in ("전체", "전반", "오류", "정상", "점검"))
+                )
+            )
+            direct_bias = (
+                any(marker in lowered for marker in yuri_direct_first_markers)
+                or contextual_followup
+                or needs_prior_context
+                or delivery_followup
+                or status_followup_question
+                or question_only
+                or len(compact) <= 140
+            )
+            if not force_route and direct_bias:
+                return None
 
         buckets: list[tuple[str, str, tuple[str, ...]]] = [
             ("docslead", "문서/파일 제작", (
@@ -7330,6 +7452,7 @@ class GatewayRunner:
             or compact.count(",") + compact.count(" 그리고 ") + compact.count(" 추가") >= 2
             or sum(1 for marker in execution_markers if marker in lowered) >= 3
             or any(marker in lowered for marker in orchestration_markers)
+            or any(marker in lowered for marker in yuri_force_route_markers)
             or (has_media and executionish)
             or (source_room_required and executionish)
         )
@@ -7750,7 +7873,7 @@ class GatewayRunner:
                 if interpretation:
                     return (
                         f"알겠습니다. {interpretation}\n"
-                        f"진행 중인 일에 이어 붙이고 {team_phrase}. 끝나면 이 메시지 흐름에 맞춰 결과만 정리하겠습니다."
+                        f"진행 중인 일에 이어 붙이고 {team_phrase}. 끝나면 이어서 결과만 정리하겠습니다."
                     )
                 return (
                     "알겠습니다. 진행 중인 일에 이어 붙이겠습니다. "
@@ -7759,7 +7882,7 @@ class GatewayRunner:
             if interpretation:
                 return (
                     f"네. {interpretation}\n"
-                    f"{team_phrase}. 끝나면 원래 요청에 이어 결과만 보고하겠습니다."
+                    f"{team_phrase}. 끝나면 필요한 결과만 짧게 정리하겠습니다."
                 )
             if task_id:
                 return (

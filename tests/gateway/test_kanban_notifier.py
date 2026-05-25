@@ -189,6 +189,58 @@ def test_kanban_notifier_suppresses_planner_handoff_when_children_open(tmp_path,
     assert adapter.sent == []
 
 
+def test_kanban_notifier_hands_off_verified_cards_without_links(tmp_path, monkeypatch):
+    db_path = tmp_path / "verified-card-handoff-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(
+            conn,
+            title="패치 라우팅",
+            assignee="planner",
+            session_id="session-planner",
+        )
+        child_id = kb.create_task(
+            conn,
+            title="패치 검토",
+            assignee="reviewer",
+            created_by="planner",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=parent_id,
+            platform="telegram",
+            chat_id="chat-1",
+            reply_to_message_id="777",
+        )
+        kb.complete_task(
+            conn,
+            parent_id,
+            summary="배정 완료: reviewer에게 패치 검토를 연결했습니다.",
+            created_cards=[child_id],
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        parent_subs = kb.list_notify_subs(conn, parent_id)
+        child_subs = kb.list_notify_subs(conn, child_id)
+    finally:
+        conn.close()
+    assert parent_subs == []
+    assert len(child_subs) == 1
+    assert child_subs[0]["reply_to_message_id"] == "777"
+
+
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
     db_path = tmp_path / "single-owner.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

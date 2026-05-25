@@ -952,9 +952,70 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 # Connection helpers
 # ---------------------------------------------------------------------------
 
-_INITIALIZED_PATHS: set[str] = set()
+class _InitializedPathCache:
+    """Process-local cache of DB paths already migrated, keyed by file signature."""
+
+    def __init__(self) -> None:
+        self._entries: Dict[str, tuple[Any, ...]] = {}
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def discard(self, path: str) -> None:
+        self._entries.pop(str(path), None)
+
+    def add(self, path: str) -> None:
+        # Back-compat for tests/helpers that still use set-like ``add``.
+        self._entries[str(path)] = ()
+
+    def mark(self, path: str, signature: tuple[Any, ...]) -> None:
+        self._entries[str(path)] = signature
+
+    def is_current(self, path: str, signature: tuple[Any, ...]) -> bool:
+        return self._entries.get(str(path)) == signature
+
+    def __contains__(self, path: object) -> bool:
+        return str(path) in self._entries
+
+
+_INITIALIZED_PATHS = _InitializedPathCache()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_KANBAN_DB_CORRUPTION_MARKERS = (
+    "database disk image is malformed",
+    "malformed",
+    "file is not a database",
+    "disk i/o error",
+)
+
+
+def _db_signature(path: Path) -> tuple[Any, ...]:
+    """Return a cheap identity/content signature for a kanban DB and sidecars.
+
+    The cache must not be path-only in long-running gateway processes: live
+    recovery, atomic replacement, or WAL/SHM sidecar churn can leave the same
+    path pointing at different bytes after it was first proven healthy.  Include
+    device/inode/size/mtime/ctime for the main DB plus WAL/SHM sidecars so a
+    changed or replaced board gets probed and migrated again on the next open.
+    """
+    parts: list[Any] = []
+    for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        try:
+            st = candidate.stat()
+        except FileNotFoundError:
+            parts.append((candidate.name, None))
+        except OSError as exc:
+            parts.append((candidate.name, "stat-error", type(exc).__name__, str(exc)))
+        else:
+            parts.append((
+                candidate.name,
+                st.st_dev,
+                st.st_ino,
+                st.st_size,
+                st.st_mtime_ns,
+                st.st_ctime_ns,
+            ))
+    return tuple(parts)
 
 
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
@@ -997,6 +1058,10 @@ def _validate_sqlite_header(path: Path) -> None:
         return
     if head.startswith(_SQLITE_HEADER):
         return
+    try:
+        _INITIALIZED_PATHS.discard(str(path.resolve()))
+    except OSError:
+        pass
     signature = ""
     if head.startswith(b"SQLit") and _looks_like_tls_record_at(head, 5):
         signature = " (TLS record header detected at byte offset 5)"
@@ -1107,11 +1172,14 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     except OSError:
         return
     try:
-        if not resolved.exists() or resolved.stat().st_size == 0:
+        stat = resolved.stat()
+        if not resolved.exists() or stat.st_size == 0:
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    resolved_str = str(resolved)
+    current_signature = _db_signature(resolved)
+    if _INITIALIZED_PATHS.is_current(resolved_str, current_signature):
         return
     reason: Optional[str] = None
     try:
@@ -1122,13 +1190,20 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             probe.close()
         if not row or (row[0] or "").lower() != "ok":
             reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
-    except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
-        raise
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if any(marker in msg for marker in _KANBAN_DB_CORRUPTION_MARKERS):
+            reason = f"sqlite integrity_check failed: {exc}"
+        else:
+            # Lock contention, busy, transient non-corruption errors are NOT
+            # treated as corruption; they propagate raw so no spurious
+            # ``.corrupt`` backup is made.
+            raise
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
+    _INITIALIZED_PATHS.discard(resolved_str)
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
@@ -1165,8 +1240,12 @@ def connect(
     # and other invalid-header cases without opening a sqlite connection.
     _validate_sqlite_header(path)
     # Full integrity probe — catches corruption past the header (malformed
-    # pages, broken internal metadata). Cached per-path after first success
-    # via _INITIALIZED_PATHS so it only runs once per process per path.
+    # pages, broken internal metadata). Cached per file signature after a
+    # successful open; if the DB or WAL/SHM sidecars change under a long-lived
+    # gateway process, the next connect re-runs the guard instead of trusting a
+    # stale path-only cache. Stop gateway/dispatcher before live .recover or DB
+    # replacement whenever possible so existing SQLite connections and sidecars
+    # cannot race the recovered file.
     _guard_existing_db_is_healthy(path)
     resolved = str(path.resolve())
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
@@ -1184,17 +1263,20 @@ def connect(
             apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            needs_init = resolved not in _INITIALIZED_PATHS
+            current_signature = _db_signature(path)
+            needs_init = not _INITIALIZED_PATHS.is_current(resolved, current_signature)
             if needs_init:
                 # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                 # migrations. Cached so subsequent connect() calls in the same
-                # process are cheap. The lock prevents same-process dispatcher
-                # threads from racing through the additive ALTER TABLE pass with
-                # stale PRAGMA snapshots during gateway startup.
+                # process are cheap while the DB/WAL/SHM signature is unchanged.
+                # The lock prevents same-process dispatcher threads from racing
+                # through the additive ALTER TABLE pass with stale PRAGMA
+                # snapshots during gateway startup.
                 conn.executescript(SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
-                _INITIALIZED_PATHS.add(resolved)
+            _INITIALIZED_PATHS.mark(resolved, _db_signature(path))
     except Exception:
+        _INITIALIZED_PATHS.discard(resolved)
         conn.close()
         raise
     return conn

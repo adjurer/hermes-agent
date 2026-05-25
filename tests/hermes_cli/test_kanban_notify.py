@@ -128,7 +128,13 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    msg = fake_adapter.send.call_args[0][1]
+    expected_fragment = {
+        "gave_up": "반복해서 실패",
+        "crashed": "중간에 멈췄",
+        "timed_out": "시간이 길어져",
+    }[kind]
+    assert expected_fragment in msg
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
@@ -164,7 +170,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     delivered_msgs: list[str] = []
 
-    async def _capture_send(chat_id, msg, metadata=None):
+    async def _capture_send(chat_id, msg, metadata=None, **_kw):
         delivered_msgs.append(msg)
 
     fake_adapter = MagicMock()
@@ -214,13 +220,12 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
-    assert "second block" not in blocked_deliveries[0]
-    assert "second block" in blocked_deliveries[1]
-    assert len(blocked_deliveries) == 2, (
-        f"Should receive 2 blocked notification, but only get {len(blocked_deliveries)} count\n"
+    assert len(delivered_msgs) == 2, (
+        f"Should receive 2 blocked notifications, but only get {len(delivered_msgs)} count\n"
         f"Message {delivered_msgs}"
     )
+    assert "first block" in delivered_msgs[0]
+    assert "second block" in delivered_msgs[1]
 
 
 # ---------------------------------------------------------------------------

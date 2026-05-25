@@ -110,14 +110,19 @@ class TestApplyWalWithFallback:
         assert mode == "delete"
         conn.close()
 
-    def test_falls_back_on_disk_io_error(self, tmp_path):
-        """Flaky network FS → disk I/O error → still fall back."""
+    def test_disk_io_error_is_not_treated_as_wal_incompatible(self, tmp_path, caplog):
+        """disk I/O error may indicate storage/DB damage, not simple WAL incompat."""
         conn, _ = _open_blocking(
             tmp_path / "flaky.db", reason="disk I/O error", isolation_level=None
         )
-        mode = apply_wal_with_fallback(conn)
-        assert mode == "delete"
+        with caplog.at_level("ERROR", logger="hermes_state"):
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+                apply_wal_with_fallback(conn, db_label="flaky.db")
         conn.close()
+
+        msg = "\n".join(r.getMessage() for r in caplog.records)
+        assert "not being treated as WAL-incompatible filesystem fallback" in msg
+        assert "WAL journal_mode unsupported on this filesystem" not in msg
 
     def test_reraises_unrelated_operational_error(self, tmp_path):
         """Non-WAL-compat errors must NOT be silently swallowed by the fallback."""

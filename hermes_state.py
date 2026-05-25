@@ -54,7 +54,17 @@ SCHEMA_VERSION = 13
 _WAL_INCOMPAT_MARKERS = (
     "locking protocol",       # SQLITE_PROTOCOL on NFS/SMB
     "not authorized",         # Some FUSE mounts block WAL pragma outright
-    "disk i/o error",         # Flaky network FS during WAL setup
+)
+
+# These errors can appear while setting WAL, but they are not evidence that the
+# filesystem simply does not support WAL. In practice they can mean a damaged
+# DB, stale sidecar files, or an underlying storage problem; falling back to
+# DELETE would hide the root cause and keep long-running daemons touching a bad
+# database.
+_WAL_IO_OR_CORRUPTION_MARKERS = (
+    "disk i/o error",
+    "database disk image is malformed",
+    "file is not a database",
 )
 
 # Last SessionDB() init error, per-process.  Surfaced in /resume and
@@ -153,6 +163,9 @@ def apply_wal_with_fallback(
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
+        if any(marker in msg for marker in _WAL_IO_OR_CORRUPTION_MARKERS):
+            _log_wal_io_or_corruption_once(db_label, exc)
+            raise
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
             # Unrelated OperationalError — don't silently swallow.
             raise
@@ -178,6 +191,23 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
         "mode; reduces concurrency but works on NFS/SMB/FUSE). See "
         "https://www.sqlite.org/wal.html for details. This warning "
         "fires once per process per database.",
+        db_label,
+        exc,
+    )
+
+
+def _log_wal_io_or_corruption_once(db_label: str, exc: Exception) -> None:
+    """Log a single ERROR for WAL setup failures that need operator action."""
+    dedup_key = f"io-or-corruption:{db_label}"
+    with _wal_fallback_warned_lock:
+        if dedup_key in _wal_fallback_warned_paths:
+            return
+        _wal_fallback_warned_paths.add(dedup_key)
+    logger.error(
+        "%s: WAL journal_mode failed with a storage/DB error (%s). "
+        "This is not being treated as WAL-incompatible filesystem fallback; "
+        "check database integrity, WAL/SHM sidecars, and underlying storage "
+        "before retrying.",
         db_label,
         exc,
     )

@@ -3084,6 +3084,83 @@ def test_init_db_allows_missing_then_healthy(tmp_path):
     assert [t.title for t in tasks] == ["keeps"]
 
 
+def test_integrity_guard_reruns_when_db_signature_changes(tmp_path, monkeypatch):
+    """Same path + changed inode/mtime/size must not hit a stale healthy cache."""
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    kb._INITIALIZED_PATHS.clear()
+
+    real_connect = sqlite3.connect
+    integrity_checks = []
+
+    class _CountingConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if sql.strip().lower().startswith("pragma integrity_check"):
+                integrity_checks.append(sql)
+            return super().execute(sql, *args, **kwargs)
+
+    def counting_connect(*args, **kwargs):
+        return real_connect(*args, factory=_CountingConnection, **kwargs)
+
+    monkeypatch.setattr(kb.sqlite3, "connect", counting_connect)
+
+    with kb.connect(db_path=db_path):
+        pass
+    assert len(integrity_checks) == 1
+
+    replacement = tmp_path / "replacement.db"
+    conn = real_connect(str(replacement), isolation_level=None)
+    try:
+        conn.executescript(kb.SCHEMA_SQL)
+    finally:
+        conn.close()
+    os.replace(replacement, db_path)
+
+    with kb.connect(db_path=db_path):
+        pass
+    assert len(integrity_checks) == 2
+
+
+def test_corrupt_detection_removes_initialized_cache_entry(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    resolved = str(db_path.resolve())
+    assert resolved in kb._INITIALIZED_PATHS
+
+    _write_corrupt_db(db_path)
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+
+    assert resolved not in kb._INITIALIZED_PATHS
+
+
+def test_integrity_operational_malformed_removes_cache_entry(tmp_path, monkeypatch):
+    """OperationalError('database disk image is malformed') is fail-fast corruption."""
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    resolved = str(db_path.resolve())
+    assert resolved in kb._INITIALIZED_PATHS
+    os.utime(db_path, (time.time() + 2, time.time() + 2))
+
+    real_connect = sqlite3.connect
+
+    class _MalformedIntegrityConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+            if sql.strip().lower().startswith("pragma integrity_check"):
+                raise sqlite3.OperationalError("database disk image is malformed")
+            return super().execute(sql, *args, **kwargs)
+
+    def malformed_connect(*args, **kwargs):
+        return real_connect(*args, factory=_MalformedIntegrityConnection, **kwargs)
+
+    monkeypatch.setattr(kb.sqlite3, "connect", malformed_connect)
+
+    with pytest.raises(kb.KanbanDbCorruptError, match="database disk image is malformed"):
+        kb.connect(db_path=db_path)
+
+    assert resolved not in kb._INITIALIZED_PATHS
+
+
 # ---------------------------------------------------------------------------
 # First-use tip for scratch workspaces
 # ---------------------------------------------------------------------------
