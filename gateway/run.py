@@ -5035,6 +5035,13 @@ class GatewayRunner:
         # consecutive send failures the sub is dropped so we don't spin
         # against a dead chat every 5 seconds forever.
         MAX_SEND_FAILURES = 3
+        retry_notify_mode = os.getenv(
+            "HERMES_KANBAN_RETRY_NOTIFY_MODE", "all"
+        ).strip().lower()
+        retry_notice_seen: dict[tuple, bool] = getattr(
+            self, "_kanban_retry_notice_seen", {}
+        )
+        self._kanban_retry_notice_seen = retry_notice_seen
         sub_fail_counts: dict[tuple, int] = getattr(
             self, "_kanban_sub_fail_counts", {}
         )
@@ -5359,6 +5366,22 @@ class GatewayRunner:
                             )
                         else:
                             continue
+                        if kind in {"crashed", "timed_out"} and retry_notify_mode in {
+                            "first",
+                            "first_only",
+                            "quiet_retries",
+                        }:
+                            retry_key = (
+                                sub["task_id"], sub["platform"], sub["chat_id"],
+                                sub.get("thread_id") or "", kind,
+                            )
+                            if retry_notice_seen.get(retry_key):
+                                logger.debug(
+                                    "kanban notifier: suppressing repeated %s event for %s",
+                                    kind, sub["task_id"],
+                                )
+                                continue
+                            retry_notice_seen[retry_key] = True
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]

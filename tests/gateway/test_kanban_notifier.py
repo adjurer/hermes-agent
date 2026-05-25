@@ -386,3 +386,37 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "중간에 멈췄습니다" in adapter.sent[1]["text"]
+
+
+def test_notifier_can_suppress_repeated_retry_notifications(tmp_path, monkeypatch):
+    """Operators can keep retry recovery alive without flooding chat."""
+    db_path = tmp_path / "quiet-retry-cycle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_RETRY_NOTIFY_MODE", "first_only")
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet cycle test", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+
+    conn = kb.connect()
+    try:
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert _unseen_terminal_events(tid) == []
