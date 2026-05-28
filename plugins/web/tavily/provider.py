@@ -1,33 +1,24 @@
-"""Tavily web search + content extraction + crawl — plugin form.
+"""Tavily web search + content extraction — plugin form.
 
-Subclasses :class:`agent.web_search_provider.WebSearchProvider`. Three
+Subclasses :class:`agent.web_search_provider.WebSearchProvider`. Two
 capabilities advertised:
 
 - ``supports_search()``  -> True (Tavily ``/search``)
 - ``supports_extract()`` -> True (Tavily ``/extract``)
-- ``supports_crawl()``   -> True (Tavily ``/crawl``) — sync HTTP crawl;
-  Firecrawl also advertises ``supports_crawl=True`` (async)
 
-All three are sync — the underlying call is ``httpx.post(...)``. The
-dispatcher in :func:`tools.web_tools.web_crawl_tool` (which is itself
-async) will run sync providers in a thread when appropriate.
+Both are sync — the underlying call is ``httpx.post(...)``.
 
 Config keys this provider responds to::
 
     web:
       search_backend: "tavily"     # explicit per-capability
       extract_backend: "tavily"    # explicit per-capability
-      crawl_backend: "tavily"      # explicit per-capability
-      backend: "tavily"            # shared fallback for all three
+      backend: "tavily"            # shared fallback for both
 
 Env vars::
 
     TAVILY_API_KEY=...           # https://app.tavily.com/home (required)
     TAVILY_BASE_URL=...          # optional override of https://api.tavily.com
-
-Auth note: Tavily uses ``api_key`` in the JSON body for /search and
-/extract, but **also requires** ``Authorization: Bearer <key>`` for /crawl
-(body-only auth returns 401 on /crawl). The plugin handles both.
 """
 
 from __future__ import annotations
@@ -178,11 +169,7 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{base_url}/{endpoint.lstrip('/')}"
     logger.info("Tavily %s request to %s", endpoint, url)
 
-    # Tavily /crawl requires Bearer header auth in addition to body auth;
-    # /search and /extract are body-only.
-    headers = {"Authorization": f"Bearer {api_key}"} if endpoint.strip("/") == "crawl" else {}
-
-    response = httpx.post(url, json=payload, headers=headers, timeout=60)
+    response = httpx.post(url, json=payload, timeout=60)
     response.raise_for_status()
     data = response.json()
     _record_tavily_budget(endpoint_name, payload, data)
@@ -207,7 +194,7 @@ def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]
 def _normalize_tavily_documents(
     response: Dict[str, Any], fallback_url: str = ""
 ) -> List[Dict[str, Any]]:
-    """Map Tavily ``/extract`` or ``/crawl`` response to standard documents.
+    """Map Tavily ``/extract`` response to standard documents.
 
     Documents follow the legacy LLM post-processing shape::
 
@@ -256,7 +243,7 @@ def _normalize_tavily_documents(
 
 
 class TavilyWebSearchProvider(WebSearchProvider):
-    """Tavily search + extract + crawl provider."""
+    """Tavily search + extract provider."""
 
     @property
     def name(self) -> str:
@@ -274,9 +261,6 @@ class TavilyWebSearchProvider(WebSearchProvider):
         return True
 
     def supports_extract(self) -> bool:
-        return True
-
-    def supports_crawl(self) -> bool:
         return True
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
@@ -412,7 +396,7 @@ class TavilyWebSearchProvider(WebSearchProvider):
         return {
             "name": "Tavily",
             "badge": "paid",
-            "tag": "Search + extract + crawl in one provider.",
+            "tag": "Search + extract in one provider.",
             "env_vars": [
                 {
                     "key": "TAVILY_API_KEY",

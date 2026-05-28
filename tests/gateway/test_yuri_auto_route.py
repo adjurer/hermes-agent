@@ -44,6 +44,7 @@ def _event(
     *,
     media: bool = False,
     is_bot: bool = False,
+    chat_type: str = "dm",
     message_type: MessageType = MessageType.TEXT,
 ) -> MessageEvent:
     return MessageEvent(
@@ -54,7 +55,7 @@ def _event(
             chat_id="c1",
             user_id="u1",
             user_name="tester",
-            chat_type="dm",
+            chat_type=chat_type,
             is_bot=is_bot,
         ),
         message_id="m1",
@@ -92,6 +93,17 @@ def test_yuri_auto_route_keeps_understanding_checks_in_chat():
 def test_yuri_auto_route_keeps_status_followup_questions_in_chat():
     assert _runner()._classify_yuri_auto_route(_event("찾아봤니?")) is None
     assert _runner()._classify_yuri_auto_route(_event("어디까지 됐어?")) is None
+
+
+def test_yuri_auto_route_keeps_multi_bot_status_rollcalls_in_chat():
+    assert _runner()._classify_yuri_auto_route(
+        _event(
+            "@Kairos0409_bot @Olivia0309_bot @Faker2341_bot @Bara_6688bot "
+            "@ellia_hermes_8v89d8gf_bot @beanslab_bot\n\n"
+            "각자 지금 주인/담당자 일 잘 챙기고 있는지 짧게 보고해줘.\n"
+            "없으면 정상 / 요청사항 없음이라고 답해줘."
+        )
+    ) is None
 
 
 def test_yuri_auto_route_keeps_question_style_data_checks_in_chat():
@@ -385,7 +397,7 @@ async def test_yuri_delivery_followup_links_to_recent_done_task(tmp_path, monkey
     )
 
     assert response is not None
-    assert "문서팀에 이관하겠습니다" in response
+    assert "문서팀에 맡기겠습니다" in response
     assert "원래 요청에 이어 결과만 보고하겠습니다" in response
     conn = kb.connect()
     try:
@@ -448,7 +460,7 @@ async def test_yuri_pm_root_creates_single_visible_root_task(tmp_path, monkeypat
     )
 
     assert response is not None
-    assert "이관하겠습니다" in response
+    assert "맡기겠습니다" in response
     assert "운영팀" in response
     conn = kb.connect()
     try:
@@ -461,6 +473,30 @@ async def test_yuri_pm_root_creates_single_visible_root_task(tmp_path, monkeypat
         assert "63지선 텔레그램 방 미디어 조회가 1순위" in (task.body or "")
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_yuri_public_group_ack_hides_internal_team_names(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    runner = _runner()
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-public")
+    )
+    event = _event(
+        "유리야 사이트 오류 원인 찾아서 수정하고 검증까지 진행해주세요",
+        chat_type="group",
+    )
+    route = runner._classify_yuri_auto_route(event)
+    response = await runner._route_yuri_message_to_kanban(event, route)
+
+    assert response is not None
+    assert "이관하겠습니다" not in response
+    assert "운영팀" not in response
+    assert "검증팀" not in response
+    assert "필요한 팀에 조용히 나눠 맡기겠습니다" in response
 
 
 @pytest.mark.asyncio

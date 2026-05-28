@@ -3,8 +3,8 @@
 Coverage:
   _tavily_request() — API key handling, endpoint construction, error propagation.
   _normalize_tavily_search_results() — search response normalization.
-  _normalize_tavily_documents() — extract/crawl response normalization, failed_results.
-  web_search_tool / web_extract_tool / web_crawl_tool — Tavily dispatch paths.
+  _normalize_tavily_documents() — extract response normalization, failed_results.
+  web_search_tool / web_extract_tool — Tavily dispatch paths.
 """
 
 import json

@@ -436,7 +436,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
     Platform.API_SERVER: lambda cfg: True,
     Platform.WEBHOOK: lambda cfg: True,
-    Platform.MSGRAPH_WEBHOOK: lambda cfg: True,
+    Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
+        str(cfg.extra.get("client_state") or "").strip()
+    ),
     Platform.FEISHU: lambda cfg: bool(cfg.extra.get("app_id")),
     Platform.WECOM: lambda cfg: bool(cfg.extra.get("bot_id")),
     Platform.WECOM_CALLBACK: lambda cfg: bool(
@@ -1116,22 +1118,8 @@ def load_gateway_config() -> GatewayConfig:
                         allowed = ",".join(str(v) for v in allowed)
                     os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
 
-            # Mattermost settings → env vars (env vars take precedence)
-            mattermost_cfg = yaml_cfg.get("mattermost", {})
-            if isinstance(mattermost_cfg, dict):
-                if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
-                    os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
-                frc = mattermost_cfg.get("free_response_channels")
-                if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
-                    if isinstance(frc, list):
-                        frc = ",".join(str(v) for v in frc)
-                    os.environ["MATTERMOST_FREE_RESPONSE_CHANNELS"] = str(frc)
-                # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
-                ac = mattermost_cfg.get("allowed_channels")
-                if ac is not None and not os.getenv("MATTERMOST_ALLOWED_CHANNELS"):
-                    if isinstance(ac, list):
-                        ac = ",".join(str(v) for v in ac)
-                    os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
+            # Mattermost config bridge moved into plugins/platforms/mattermost/
+            # adapter.py::_apply_yaml_config — see #25443 (apply_yaml_config_fn).
 
             # Matrix settings → env vars (env vars take precedence)
             matrix_cfg = yaml_cfg.get("matrix", {})
@@ -1834,73 +1822,111 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             pass
 
     # Registry-driven enable for plugin platforms.  Built-ins have explicit
-    # blocks above.  For plugins, check_fn() means "dependencies are present",
-    # not necessarily "credentials are configured"; only auto-enable when an
-    # env/config connectivity signal is present.  This avoids starting
-    # installed-but-unconfigured adapters (notably Discord) in profile
-    # gateways, where they otherwise retry forever with no token.
+    # blocks above; plugins expose check_fn() which is the single source of
+    # truth for "are my env vars set?".  Plugins that need to seed
+    # ``PlatformConfig.extra`` from env vars can supply ``env_enablement_fn``.
+    #
+    # Enablement gate (#31116): when a plugin registers ``is_connected``
+    # (the "has the user actually configured credentials for this?" check),
+    # consult it before flipping ``enabled = True``.  This preserves our
+    # local no-noisy-unconfigured-platform stance for Discord/Feishu-style
+    # adapters while keeping the official plugin enablement path.
     try:
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             platform = Platform(entry.name)
-            platform_cfg = config.platforms.get(platform) or PlatformConfig()
-            seed = None
-            connected_by_env = False
-
+            existing_cfg = config.platforms.get(platform)
+            # Seed candidate extras from ``env_enablement_fn`` so plugins
+            # whose ``is_connected`` reads ``config.extra`` (e.g. Google
+            # Chat's ``_is_connected`` checks ``config.extra["project_id"]``)
+            # see the same state they will after enablement. Without this,
+            # Google-Chat-on-env-vars-only setups silently fail the gate
+            # below even though the user is configured.  Plugins whose
+            # ``is_connected`` reads env vars directly (Discord, IRC,
+            # Teams, LINE, ntfy, Simplex) are unaffected; this only
+            # restores Google Chat.
+            seed_for_probe = None
             if entry.env_enablement_fn is not None:
                 try:
-                    seed = entry.env_enablement_fn()
+                    seed_for_probe = entry.env_enablement_fn()
                 except Exception as e:
                     logger.debug(
                         "env_enablement_fn for %s raised: %s", entry.name, e
                     )
-                    seed = None
-                if isinstance(seed, dict) and seed:
-                    connected_by_env = True
+                    seed_for_probe = None
 
-            if not connected_by_env and entry.required_env:
-                connected_by_env = all(
+            if existing_cfg is None or not existing_cfg.enabled:
+                if entry.required_env and not all(
                     bool(os.getenv(env_name, "").strip())
                     for env_name in entry.required_env
-                )
-
-            if not connected_by_env and entry.validate_config is not None:
-                try:
-                    connected_by_env = bool(entry.validate_config(platform_cfg))
-                except Exception as e:
-                    logger.debug("validate_config for %s raised: %s", entry.name, e)
-
-            if not connected_by_env and entry.is_connected is not None:
-                try:
-                    connected_by_env = bool(entry.is_connected(platform_cfg))
-                except Exception as e:
-                    logger.debug("is_connected for %s raised: %s", entry.name, e)
-
-            if not connected_by_env and not (
-                entry.required_env or entry.validate_config or entry.is_connected
-            ):
-                try:
-                    connected_by_env = bool(entry.check_fn())
-                except Exception as e:
-                    logger.debug("check_fn for %s raised: %s", entry.name, e)
-
-            if not connected_by_env:
-                continue
-
-            try:
-                if not entry.check_fn():
+                ):
+                    logger.debug(
+                        "Plugin platform '%s' available but missing required env — "
+                        "skipping enable",
+                        entry.name,
+                    )
                     continue
-            except Exception as e:
-                logger.debug("check_fn for %s raised: %s", entry.name, e)
-                continue
 
+            # Only consult is_connected for platforms that are NOT already
+            # explicitly configured in YAML / env (existing_cfg with
+            # enabled=True means the user wrote it themselves or another
+            # env-var bridge enabled it — keep that decision).
+            if existing_cfg is None or not existing_cfg.enabled:
+                if entry.is_connected is not None:
+                    try:
+                        # Probe with ``enabled=True`` since we're asking
+                        # "would this plugin BE configured if we enabled
+                        # it?" not "is it currently enabled?". Google
+                        # Chat's ``_is_connected`` short-circuits on
+                        # ``config.enabled`` being False, which on the
+                        # default ``PlatformConfig()`` would fail the
+                        # gate even with proper env vars set.
+                        if existing_cfg is not None:
+                            probe_cfg = existing_cfg
+                            if not probe_cfg.enabled:
+                                probe_cfg = PlatformConfig(
+                                    enabled=True,
+                                    extra=dict(probe_cfg.extra or {}),
+                                )
+                        else:
+                            probe_cfg = PlatformConfig(enabled=True)
+                        if isinstance(seed_for_probe, dict) and seed_for_probe:
+                            # Don't mutate ``existing_cfg``; the probe gets
+                            # a transient view with env-seeded extras layered
+                            # on top of whatever's already there.
+                            probe_extra = dict(getattr(probe_cfg, "extra", {}) or {})
+                            for k, v in seed_for_probe.items():
+                                if k == "home_channel":
+                                    continue
+                                probe_extra.setdefault(k, v)
+                            probe_cfg = PlatformConfig(
+                                enabled=True,
+                                extra=probe_extra,
+                            )
+                        configured = bool(entry.is_connected(probe_cfg))
+                    except Exception as exc:
+                        logger.debug(
+                            "is_connected for %s raised: %s — skipping enablement",
+                            entry.name, exc,
+                        )
+                        configured = False
+                    if not configured:
+                        logger.debug(
+                            "Plugin platform '%s' available but not configured "
+                            "(is_connected returned False) — skipping enable",
+                            entry.name,
+                        )
+                        continue
             if platform not in config.platforms:
-                config.platforms[platform] = platform_cfg
+                config.platforms[platform] = PlatformConfig()
             config.platforms[platform].enabled = True
-            # Seed extras from env if the plugin opted in.
-            if isinstance(seed, dict) and seed:
+            # Commit env-seeded extras onto the now-enabled platform.
+            # We've already called ``env_enablement_fn`` above (for the
+            # probe); reuse that result instead of calling it twice.
+            if isinstance(seed_for_probe, dict) and seed_for_probe:
+                seed = dict(seed_for_probe)
                 # Extract the home_channel dict (if provided) so we wire it
                 # up as a proper HomeChannel dataclass.  Everything else is
                 # merged into ``extra``.

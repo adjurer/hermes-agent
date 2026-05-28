@@ -1046,6 +1046,42 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
 
+    def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
+        """agent.disabled_toolsets must be honoured in cron — issue #25752.
+
+        The bug: per-job enabled_toolsets was returned verbatim, letting an
+        LLM-supplied cronjob() call re-enable tools the operator had globally
+        disabled. The fix: ALWAYS include agent.disabled_toolsets in the
+        disabled_toolsets passed to AIAgent, on top of the cron baseline
+        (cronjob/messaging/clarify). AIAgent's disabled_toolsets takes
+        precedence over enabled_toolsets, so this stops the bypass.
+        """
+        (tmp_path / "config.yaml").write_text(
+            "agent:\n"
+            "  disabled_toolsets:\n"
+            "    - terminal\n"
+            "    - file\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "policy-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": ["web", "terminal", "file"],
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert set(kwargs["disabled_toolsets"]) >= {
+            "cronjob", "messaging", "clarify", "terminal", "file",
+        }
+
     def test_run_job_enabled_toolsets_resolves_from_platform_config_when_not_set(self, tmp_path):
         """When a job has no explicit enabled_toolsets, the scheduler now
         resolves them from ``hermes tools`` platform config for ``cron``
@@ -1439,9 +1475,19 @@ class TestRunJobConfigLogging:
             "prompt": "hello",
         }
 
+        # Mock heavy post-yaml work so the test only exercises the warning
+        # path. Without these mocks, _run_job_impl continues into provider
+        # resolution and MCP discovery, both of which can spawn subprocesses
+        # / hit the network and have caused this test to time out on CI
+        # (>30s wall clock) under load. See PR #33661 follow-up.
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("dotenv.load_dotenv"), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value={"provider": "openrouter", "api_key": "x",
+                                 "base_url": "https://example.invalid",
+                                 "api_mode": "chat_completions"}), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
@@ -1471,6 +1517,11 @@ class TestRunJobConfigLogging:
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("dotenv.load_dotenv"), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value={"provider": "openrouter", "api_key": "x",
+                                 "base_url": "https://example.invalid",
+                                 "api_mode": "chat_completions"}), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
