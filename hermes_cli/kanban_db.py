@@ -2511,28 +2511,28 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"``, *not* ``"blocked"``.  Treat it as sticky too:
+      without an explicit unblock, ``recompute_ready`` can immediately
+      promote the card again, respawn another worker, and flood the
+      user with the same failure loop.
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    ``"blocked"`` / ``"gave_up"`` / ``"unblocked"`` event for the
+    task.  If the most recent one is ``"blocked"`` or ``"gave_up"``
+    (and no ``"unblocked"`` event has fired since), the task is sticky
+    and ``recompute_ready`` must *not* auto-promote it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    was set to ``status='blocked'`` by direct DB manipulation) —
+    preserves the pre-#28712 auto-recover semantics for that path.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'gave_up', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "gave_up"}
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
@@ -2543,12 +2543,13 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* when the most recent block event was a
-    worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).  Without that guard, a
-    ``review-required`` handoff would auto-respawn, the fresh worker
-    would find nothing to do, exit cleanly, get recorded as a protocol
-    violation, and the cycle would repeat indefinitely.
+    parent completes), *except* when the most recent stop event was a
+    worker-initiated ``kanban_block`` or circuit-breaker ``gave_up``.
+    Those stay blocked until an explicit ``kanban_unblock`` (#28712).
+    Without that guard, a ``review-required`` or crash-loop handoff
+    would auto-respawn, the fresh worker would find nothing to do, exit
+    cleanly, get recorded as a protocol violation, and the cycle would
+    repeat indefinitely.
     """
     promoted = 0
     with write_txn(conn):
@@ -2559,10 +2560,11 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
             task_id = row["id"]
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+                # Worker / operator asked for human review, or the
+                # circuit breaker already gave up — do not silently
+                # auto-recover. ``unblock_task`` is the legitimate exit
+                # (it emits ``"unblocked"`` which flips this predicate
+                # back).
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "

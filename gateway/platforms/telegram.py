@@ -141,6 +141,20 @@ def _strip_telegram_local_delivery_noise(text: str) -> str:
     return cleaned.strip()
 
 
+_TELEGRAM_INTERNAL_STATUS_RE = re.compile(
+    r"(?is)^\s*(?:[⚡⏳↻]\s*)?"
+    r"(?:Interrupting current task|Queued for the next turn|"
+    r"Thinking-only response|Subagent working|Steered into current run|"
+    r"네,\s*국장님\s*\(iteration\s+\d+/\d+\)|"
+    r".*prefilling to continue.*)"
+)
+
+
+def _suppress_telegram_internal_notice(text: str) -> bool:
+    """Return True for internal progress/debug strings that must not hit Telegram."""
+    return bool(_TELEGRAM_INTERNAL_STATUS_RE.search(str(text or "").strip()))
+
+
 MAX_COMMANDS_PER_SCOPE = 30
 
 
@@ -1864,6 +1878,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         content = _strip_telegram_local_delivery_noise(content)
+        if _suppress_telegram_internal_notice(content):
+            logger.info("[%s] Suppressed internal Telegram status notice", self.name)
+            return SendResult(success=True, message_id=None)
 
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
@@ -2180,6 +2197,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        content = _strip_telegram_local_delivery_noise(content)
+        if _suppress_telegram_internal_notice(content):
+            logger.info("[%s] Suppressed internal Telegram edit notice", self.name)
+            return SendResult(success=True, message_id=message_id)
 
         # Pre-flight: if content already exceeds the limit, split-and-deliver
         # without round-tripping a doomed edit.

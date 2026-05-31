@@ -4222,6 +4222,10 @@ class GatewayRunner:
         message, or on the next gateway startup.
         """
         window = _auto_continue_freshness_window()
+        active_ledger = self._load_active_work_ledger()
+        active_items = active_ledger.get("items") if isinstance(active_ledger, dict) else {}
+        if not isinstance(active_items, dict):
+            active_items = {}
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
@@ -4239,6 +4243,23 @@ class GatewayRunner:
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            ledger_row = active_items.get(entry.session_key)
+            if not isinstance(ledger_row, dict):
+                ledger_row = {}
+            if entry.resume_reason != "pinned_message_recovery" and not ledger_row:
+                logger.info(
+                    "Skipping auto-resume for %s: no active-work ledger entry; clearing stale resume marker",
+                    entry.session_key,
+                )
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception:
+                    logger.debug(
+                        "clear stale resume_pending failed for %s",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                continue
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
@@ -4256,8 +4277,17 @@ class GatewayRunner:
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
+            preview = " ".join(str(ledger_row.get("message_preview") or "").split())
+            resume_text = ""
+            if preview:
+                resume_text = (
+                    "[internal restart resume directive]\n"
+                    "Continue only this interrupted user request. Do not reuse an older roadmap, "
+                    "topic, or prior answer unless it directly explains this request.\n"
+                    f"Interrupted request: {preview}"
+                )
             event = MessageEvent(
-                text="",
+                text=resume_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
@@ -5266,7 +5296,7 @@ class GatewayRunner:
         # against a dead chat every 5 seconds forever.
         MAX_SEND_FAILURES = 3
         retry_notify_mode = os.getenv(
-            "HERMES_KANBAN_RETRY_NOTIFY_MODE", "all"
+            "HERMES_KANBAN_RETRY_NOTIFY_MODE", "quiet_retries"
         ).strip().lower()
         retry_notice_seen: dict[tuple, bool] = getattr(
             self, "_kanban_retry_notice_seen", {}
@@ -5575,12 +5605,10 @@ class GatewayRunner:
                                 f"{reason or '확인이 필요한 지점이 있어 멈춰두었습니다.'}"
                             )
                         elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = _secretary_clean_kanban_text(
-                                    sub["platform"], str(ev.payload["error"]), limit=220,
-                                )
-                            msg = "작업이 반복해서 실패했습니다.\n" + (err or "원인을 다시 점검하겠습니다.")
+                            msg = (
+                                "작업이 멈춰 안전하게 보류했습니다.\n"
+                                "원시 오류를 반복해서 보내지 않고, 원인과 다음 조치만 정리하겠습니다."
+                            )
                         elif kind == "crashed":
                             msg = (
                                 "작업자가 중간에 멈췄습니다.\n"
@@ -5596,7 +5624,7 @@ class GatewayRunner:
                             )
                         else:
                             continue
-                        if kind in {"crashed", "timed_out"} and retry_notify_mode in {
+                        if kind in {"crashed", "timed_out", "gave_up"} and retry_notify_mode in {
                             "first",
                             "first_only",
                             "quiet_retries",
@@ -7711,7 +7739,7 @@ class GatewayRunner:
                 "권한", "크론", "mcp", "서버", "재시작", "최적화", "텔레그램",
                 "봇", "큐드라이버", "cuadriver", "computer use", "컴퓨터 유즈",
                 "라우팅", "오케스트레이션", "상주", "프로세스",
-                "지도", "주소", "링크", "url", "공개 접속", "외부 접속",
+                "주소", "링크", "url", "공개 접속", "외부 접속",
             )),
             ("researcher", "조사/검색", (
                 "조사", "찾아", "최신", "검색", "스크래핑", "법률", "자료",
@@ -7865,6 +7893,15 @@ class GatewayRunner:
             )
         if media_lines:
             body_parts.extend(["", "첨부 작업자료:", *media_lines])
+        execution_contract = self._yuri_execution_location_contract(
+            "\n".join(
+                part
+                for part in (compact, title, worker_brief, recent_context)
+                if part
+            )
+        )
+        if execution_contract:
+            body_parts.extend(["", execution_contract])
 
         source_platform = source.platform.value if getattr(source.platform, "value", None) else str(source.platform)
         idempotency_key = (
@@ -7893,7 +7930,7 @@ class GatewayRunner:
         source: SessionSource,
         *,
         current_message_id: str = "",
-        max_rows: int = 2,
+        max_rows: int = 4,
         max_chars: int = 180,
     ) -> str:
         """Return compact prior-chat context for worker handoff cards."""
@@ -7912,6 +7949,19 @@ class GatewayRunner:
 
         rows: list[str] = []
         seen_message_id = str(current_message_id or "")
+        operational_noise_markers = (
+            "작업이 반복해서 실패했습니다",
+            "worker exited cleanly",
+            "protocol violation",
+            "작업자가 중간에 멈췄습니다",
+            "게이트웨이가 다시 시도",
+            "queued for the next turn",
+            "interrupting current task",
+            "thinking-only response",
+            "prefilling to continue",
+            "api call failed",
+            "ratelimiterror",
+        )
         for item in reversed(history):
             if not isinstance(item, dict):
                 continue
@@ -7926,6 +7976,11 @@ class GatewayRunner:
                 continue
             if content.startswith("[YURI secretary protocol]"):
                 continue
+            lowered = content.casefold()
+            if any(marker in lowered for marker in operational_noise_markers):
+                continue
+            if re.search(r"\biteration\s+\d+/\d+\b", content, re.IGNORECASE):
+                continue
             summary = self._yuri_compact_context_line(content, max_chars=max_chars)
             if not summary:
                 continue
@@ -7935,6 +7990,106 @@ class GatewayRunner:
                 break
         rows.reverse()
         return "\n".join(rows)
+
+    @staticmethod
+    def _yuri_execution_location_contract(text: str) -> str:
+        """Return a fail-closed execution location contract for routed Telegram work."""
+        lowered = (text or "").casefold()
+        if not lowered:
+            return ""
+
+        pdf_reader_markers = (
+            "v1.8", "v1_8", "pdf 판독", "pdf판독", "문서 인식", "문서인식",
+            "ocr", "engine_gap", "header anchor", "boundary", "value-window",
+            "recognition coverage", "kg 서버", "리눅스", "poll-normalization-v18",
+            "판독 레일", "인식 레일", "표 엔진", "layout", "layout-aware",
+        )
+        dashboard_markers = (
+            "8787", "대시보드", "그래프", "후보자", "후보자 지지도",
+            "정당지지도", "비공표", "여론조사", "선거 전략판", "드롭박스",
+            "필터", "개별 여론조사 결과 데이터", "로딩 속도", "경기도 전체",
+            "경기도지사", "기초단체장", "재보궐",
+            "192.168.10.4", "192.168.10.9", "8088", "unified_graphs",
+            "선거 지도", "지도에 표현", "지도에 표시",
+        )
+        hermes_markers = (
+            "에르메스", "헤르메스", "유리", "게이트웨이", "텔레그램",
+            "봇", "칸반", "오케스트레이션", "mcp", "큐드라이버",
+            "cuadriver", "computer use", "컴퓨터 유즈", "재시작", "크론",
+        )
+        community_markers = (
+            "커뮤니티", "뉴스", "scrapling", "팸코", "지역신문",
+            "수집기", "크롤링", "스크래핑",
+        )
+
+        target: dict[str, str] | None = None
+        if any(marker in lowered for marker in pdf_reader_markers):
+            target = {
+                "name": "Linux PDF 판독 서버",
+                "host": "kg@192.168.10.14",
+                "root": "/home/kg/poll-normalization-v18",
+                "url": "없음. run 산출물과 JSONL/MD 증거 파일로 검증",
+                "run": "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ProxyCommand='/Users/tbd/.local/bin/tailscale nc %h %p' kg@192.168.10.14",
+            }
+        elif any(marker in lowered for marker in dashboard_markers):
+            target = {
+                "name": "Windows 여론조사 대시보드 서버",
+                "host": "user@192.168.10.4",
+                "root": r"C:\Users\user\poll-normalization",
+                "url": "http://192.168.10.4:8787",
+                "run": "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ProxyCommand='/Users/tbd/.local/bin/tailscale nc %h %p' user@192.168.10.4",
+            }
+        elif any(marker in lowered for marker in hermes_markers):
+            target = {
+                "name": "Mac 로컬 Hermes/Yuri 운영 환경",
+                "host": "local Mac",
+                "root": "/Users/tbd/.hermes/hermes-agent ; 설정은 /Users/tbd/.hermes/config.yaml",
+                "url": "없음. gateway/kanban/Telegram 동작으로 검증",
+                "run": "로컬 실행. 원격 서버나 scratch 프로젝트에서 Hermes 설정을 수정하지 않음",
+            }
+        elif any(marker in lowered for marker in community_markers):
+            target = {
+                "name": "Mac 로컬 커뮤니티/뉴스 수집 프로젝트",
+                "host": "local Mac",
+                "root": "/Users/tbd/Documents/Codex/2026-05-01/gui",
+                "url": "작업별 로컬 서비스/산출물 기준",
+                "run": "로컬 실행. Windows/Linux 서버가 명시된 경우에만 그쪽으로 전환",
+            }
+        else:
+            return (
+                "[YURI 작업 위치 계약]\n"
+                "- Telegram 대화방/첨부/최근 메시지는 맥락 확인용입니다. 실제 작업 위치로 간주하지 않습니다.\n"
+                "- 실행 위치가 명확하지 않으면 파일 수정, 서버 재시작, 데이터 쓰기, 배포를 하지 말고 kanban_block으로 차단합니다.\n"
+                "- 작업 전 반드시 `pwd` 또는 원격 호스트/프로젝트 루트/서비스 URL을 확인하고, 사용자 지시와 맞지 않으면 멈춥니다.\n"
+                "[/YURI 작업 위치 계약]"
+            )
+
+        return (
+            "[YURI 작업 위치 계약]\n"
+            "- Telegram 대화방/첨부/최근 메시지는 맥락 확인용입니다. 실제 작업 위치로 간주하지 않습니다.\n"
+            f"- 실제 실행 대상: {target['name']}\n"
+            f"- 대상 호스트: {target['host']}\n"
+            f"- 프로젝트 루트: {target['root']}\n"
+            f"- 검증 기준: {target['url']}\n"
+            f"- 접속/실행 방법: {target['run']}\n"
+            "- 작업 전 반드시 대상 호스트와 프로젝트 루트를 확인합니다.\n"
+            "- 위 대상이 아니면 파일 수정, 서버 재시작, 데이터 쓰기, 배포를 하지 말고 kanban_block으로 차단합니다.\n"
+            "- 다른 위치의 Telegram 대화/스크린샷/캐시는 증거 자료로만 읽고, 산출물 반영은 위 대상에서만 합니다.\n"
+            "[/YURI 작업 위치 계약]"
+        )
+
+    @staticmethod
+    def _yuri_extract_execution_contract(text: str) -> str:
+        start_marker = "[YURI 작업 위치 계약]"
+        end_marker = "[/YURI 작업 위치 계약]"
+        if not text or start_marker not in text:
+            return ""
+        try:
+            start = text.index(start_marker)
+            end = text.index(end_marker, start) + len(end_marker)
+            return text[start:end].strip()
+        except ValueError:
+            return ""
 
     @staticmethod
     def _yuri_compact_context_line(text: str, *, max_chars: int = 180) -> str:
@@ -8089,6 +8244,7 @@ class GatewayRunner:
             "- Telegram 공개/단체방에서는 내부 부서명, 카드 ID, 로컬 경로, '이관하겠습니다' 같은 운영 속살을 노출하지 않는다. 필요한 경우 '필요한 팀에 조용히 맡기겠습니다' 정도로만 짧게 말하고 결과는 대표님께 정리한다.\n"
             "- '진행과 검증은 나눠 진행하고, 결과는 제가 모아서 짧게 보고드리겠습니다' 같은 반복 멘트는 쓰지 않는다. 대신 이번 업무의 구체적 해석을 말한다.\n"
             "- '방금/아까/지금/마지막/1번/그거/이거'가 나오면 최근 텔레그램 대화, 활성 업무, 최근 완료 업무, gateway/cron 로그를 먼저 대조한다. 모르면 엉뚱하게 답하지 말고 어느 맥락이 필요한지 짧게 말한다.\n"
+            "- 텔레그램 대화방은 맥락 확인용 자료실이지 실제 작업 위치가 아니다. 실행/수정/배포는 요청 주제에 맞는 서버와 프로젝트 루트를 확인한 뒤에만 진행한다.\n"
             "- 음성이나 첨부만 근거로 진행할 때는 첫 문단에 '제가 이해한 요청은 ...'을 짧게 적어 사용자가 잘못 들은 부분을 고칠 수 있게 한다.\n"
             "- 작업 결과는 가능하면 원래 사용자 메시지에 답장으로 붙인다. worker/부서 봇이 대표님께 직접 완료 보고하지 않게 한다.\n"
             "- 완료 보고는 실제 검증 후에만 한다. 로그인, 원격접속, 파일전송, 문서생성, 업데이트는 테스트/첨부/API 성공 증거가 없으면 '마무리했습니다'라고 말하지 않는다.\n"
@@ -8250,6 +8406,9 @@ class GatewayRunner:
                     )
                     and getattr(prior_parent, "status", None) in {"running", "ready", "todo"}
                 ):
+                    execution_contract = self._yuri_extract_execution_contract(
+                        str(route.get("body") or "")
+                    )
                     _kb.add_comment(
                         conn,
                         prior_parent_id,
@@ -8258,6 +8417,7 @@ class GatewayRunner:
                             "대표님 후속 요구사항:\n"
                             f"{str(route.get('title') or '').strip()}\n\n"
                             "이 메시지는 새 업무로 분리하지 않고 현재 진행 중인 업무의 추가 요구사항으로 붙였습니다."
+                            + (f"\n\n{execution_contract}" if execution_contract else "")
                         ),
                     )
                     return {"task_id": prior_parent_id, "attached": True}

@@ -132,11 +132,13 @@ def test_circuit_breaker_block_still_auto_promotes(kanban_home: Path) -> None:
         assert task.last_failure_error is None
 
 
-def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> None:
-    """The circuit-breaker emits ``gave_up`` (not ``blocked``).  Make
-    sure ``_has_sticky_block`` doesn't accidentally treat ``gave_up``
-    as sticky — otherwise we'd regress the safety net for genuinely
-    transient crashes."""
+def test_gave_up_event_stays_sticky_until_unblocked(kanban_home: Path) -> None:
+    """Local gateway policy treats ``gave_up`` like a human-review stop.
+
+    The upstream default auto-recovers circuit-breaker blocks.  On this
+    always-on Telegram gateway, that can respawn failed work and flood the
+    room, so ``gave_up`` must remain sticky until an explicit unblock.
+    """
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         child = kb.create_task(conn, title="child", parents=[parent])
@@ -155,7 +157,14 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         conn.commit()
 
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child)
+        promoted = kb.recompute_ready(conn)
+        # unblock_task itself releases the task; recompute has nothing left
+        # to promote.
+        assert promoted == 0
         assert kb.get_task(conn, child).status == "ready"
 
 
