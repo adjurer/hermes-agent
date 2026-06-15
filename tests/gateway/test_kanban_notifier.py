@@ -127,6 +127,47 @@ def test_kanban_notifier_replies_to_original_message(tmp_path, monkeypatch):
     assert adapter.sent[0]["metadata"]["telegram_reply_to_message_id"] == "462"
 
 
+def test_yuri_notifier_uses_approved_final_text_from_run_metadata(tmp_path, monkeypatch):
+    db_path = tmp_path / "yuri-approved-final.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="[YURI intake] TID=WRK-T01 업무형 검토",
+            body=(
+                "YURI secretary intake from Telegram.\n"
+                "Original user text:\n"
+                "TID=WRK-T01 업무형 검토를 진행해주세요."
+            ),
+            assignee="planner",
+            initial_status="running",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="review_status=pass, intent_source=telethon: worker summary",
+            metadata={
+                "review_status": "pass",
+                "intent_source": "telethon",
+                "approved_final_text": "TID=WRK-T01 승인된 최종 문안입니다.",
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"] == "TID=WRK-T01 승인된 최종 문안입니다."
+
+
 def test_kanban_notifier_persists_completion_for_followup_context(tmp_path, monkeypatch):
     db_path = tmp_path / "context-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

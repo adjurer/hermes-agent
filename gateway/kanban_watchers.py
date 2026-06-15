@@ -191,6 +191,17 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                latest_run_summary = None
+                                latest_run_metadata = None
+                                try:
+                                    runs = _kb.list_runs(conn, sub["task_id"])
+                                    for run in reversed(runs):
+                                        if getattr(run, "summary", None) or getattr(run, "metadata", None):
+                                            latest_run_summary = getattr(run, "summary", None)
+                                            latest_run_metadata = getattr(run, "metadata", None)
+                                            break
+                                except Exception:
+                                    pass
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -202,6 +213,8 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "latest_run_summary": latest_run_summary,
+                                    "latest_run_metadata": latest_run_metadata,
                                 })
                         finally:
                             conn.close()
@@ -246,6 +259,7 @@ class GatewayKanbanWatchersMixin:
                         tag = f"@{who} " if who else ""
                         deliver_artifacts = True
                         if kind == "completed":
+                            approved = self._yuri_review_pass_from_metadata(d.get("latest_run_metadata"))
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -276,6 +290,8 @@ class GatewayKanbanWatchersMixin:
                                 part
                                 for part in [
                                     payload_summary or "",
+                                    str(d.get("latest_run_summary") or ""),
+                                    str(approved.get("approved_final_text", "") if approved else ""),
                                     str(getattr(task, "result", "") or "") if task else "",
                                 ]
                                 if part
@@ -309,9 +325,11 @@ class GatewayKanbanWatchersMixin:
                                         )
                                         and not self._yuri_review_gate_passed(
                                             payload_summary or "",
+                                            str(d.get("latest_run_summary") or ""),
+                                            approved.get("approved_final_text", "") if approved else "",
                                             str(getattr(task, "result", "") or "") if task else "",
                                             handoff_text,
-                                            event_payload=getattr(ev, "payload", None),
+                                            event_payload=d.get("latest_run_metadata") if isinstance(d.get("latest_run_metadata"), dict) else getattr(ev, "payload", None),
                                         )
                                     ):
                                         msg = self._yuri_review_gate_hold_message(task_instruction_text)
@@ -321,8 +339,12 @@ class GatewayKanbanWatchersMixin:
                                             sub["task_id"],
                                         )
                                     else:
-                                        clean = self._secretary_clean_kanban_text(platform_str, handoff_text or result_text or title)
-                                        msg = f"마무리했습니다.\n{clean}" if clean else "마무리했습니다."
+                                        final_text = approved.get("approved_final_text", "") if approved else ""
+                                        clean = self._secretary_clean_kanban_text(platform_str, final_text or handoff_text or result_text or title)
+                                        if clean.startswith("TID="):
+                                            msg = clean
+                                        else:
+                                            msg = f"마무리했습니다.\n{clean}" if clean else "마무리했습니다."
                             else:
                                 msg = (
                                     f"✔ {tag}Kanban {sub['task_id']} done"

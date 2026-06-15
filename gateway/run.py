@@ -3816,9 +3816,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _yuri_labeled_payload(text: str) -> str:
         raw = str(text or "").strip()
-        matches = list(re.finditer(r"(?:발화|내용|메시지)\s*:\s*", raw))
+        matches = list(re.finditer(r"(?:발화|내용|메시지|메모)\s*:\s*", raw))
         if matches:
             return raw[matches[-1].end() :].strip()
+        return raw
+
+    @staticmethod
+    def _yuri_instruction_prefix(text: str) -> str:
+        raw = str(text or "").strip()
+        matches = list(re.finditer(r"(?:발화|내용|메시지|메모)\s*:\s*", raw))
+        if matches:
+            return raw[: matches[-1].start()].strip()
         return raw
 
     def _yuri_brief_direct_reply(self, event: MessageEvent) -> Optional[str]:
@@ -3826,17 +3834,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         intent = self._classify_yuri_telegram_intent(event)
         text = intent.text
-        if not text or not _YURI_BRIEF_DIRECT_REQUEST_RE.search(text):
+        instruction = self._yuri_instruction_prefix(text)
+        if not text or not _YURI_BRIEF_DIRECT_REQUEST_RE.search(instruction):
             return None
-        if any(p in text for p in ("선호하는 보고", "원하는 보고 방식", "싫어하는 내부", "기억 리셋", "24시간 비서")):
+        if any(p in instruction for p in ("선호하는 보고", "원하는 보고 방식", "싫어하는 내부", "기억 리셋", "24시간 비서")):
+            return None
+        if re.search(r"(?:업무형|문제점\s*1\s*개|수정안\s*1\s*개|최종\s*보고|작성해\s*주세요|검토하고)", instruction):
             return None
         tid = self._yuri_requested_tid(text)
         payload = self._yuri_labeled_payload(text)
         if not tid and "TID=" in text:
             return None
 
-        if "업무 지시인지 단순 정보인지" in text or (
-            "단순 정보" in text and "업무" in text and "판단" in text
+        if "업무 지시인지 단순 정보인지" in instruction or (
+            "단순 정보" in instruction and "업무" in instruction and "판단" in instruction
         ):
             action_markers = (
                 "해줘",
@@ -3854,18 +3865,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             label = "업무 지시" if any(marker in payload for marker in action_markers) else "단순 정보"
             return f"{tid}{label}입니다. 바로 답하거나 필요한 범위만 확인하면 됩니다."
-        if "첫 행동만" in text:
+        if "첫 행동만" in instruction:
             return f"{tid}먼저 요청의 범위와 근거를 확인하고, 바로 답할 수 있는지부터 판단하면 됩니다."
-        if "핵심 포인트" in text:
+        if "핵심 포인트" in instruction:
             return f"{tid}대표님께 확인할 핵심은 기준, 범위, 그리고 실제로 원하는 결과물입니다."
-        if "리스크" in text:
+        if "리스크" in instruction:
             return f"{tid}리스크는 출처나 기준이 불명확하면 잘못된 판단으로 이어질 수 있다는 점입니다."
-        if "짧고 자연스럽게" in text:
+        if "짧고 자연스럽게" in instruction:
             return f"{tid}확인했습니다. 핵심만 짧게 정리해서 판단하겠습니다."
-        if "요약" in text:
+        if "요약" in instruction:
             compact = payload[:80].strip()
             return f"{tid}{compact}" if compact else f"{tid}핵심만 짧게 요약하겠습니다."
-        if "한 줄" in text or "한 문장" in text:
+        if "한 줄" in instruction or "한 문장" in instruction:
             return f"{tid}핵심은 기준을 먼저 확인하고 필요한 증거만 빠르게 보는 것입니다."
         return None
 
@@ -4122,7 +4133,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if status in {"pass", "passed", "ok"} and source in {"telethon", "telegram-safe", "telegram", "conversation"}:
                 return True
         joined = "\n".join(str(t or "") for t in texts)
-        return bool(re.search(r"검수\s*통과.*(?:텔레쏜|telethon|telegram|대화).*의도\s*일치", joined, re.IGNORECASE))
+        if re.search(r"검수\s*통과.*(?:텔레쏜|telethon|telegram|대화).*의도\s*일치", joined, re.IGNORECASE):
+            return True
+        return bool(
+            re.search(r"review_status\s*=\s*(?:pass|passed|ok)\b", joined, re.IGNORECASE)
+            and re.search(
+                r"intent_source\s*=\s*(?:telethon|telegram-safe|telegram|conversation)\b",
+                joined,
+                re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _yuri_review_gate_hold_message(instruction_text: str = "") -> str:
@@ -4137,6 +4157,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _yuri_handoff_mismatch_warning(instruction_text: str, handoff_text: str) -> Optional[str]:
         instruction = str(instruction_text or "")
         handoff = str(handoff_text or "")
+        tid = GatewayRunner._yuri_requested_tid(instruction)
         pairs = [
             (
                 bool(re.search(r"맥이 아니라\s*kg서버|kg서버를 이용", instruction, re.IGNORECASE))
@@ -4164,14 +4185,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "총선/국회",
             ),
             (
-                bool(re.search(r"전국", instruction))
+                bool(
+                    re.search(
+                        r"전국\s*(?:전체|범위|기준|자료|명단|후보|지역|시도|지방선거)",
+                        instruction,
+                    )
+                    or re.search(r"전국.{0,20}(?:확인|조사|분석|정리|비교)", instruction)
+                )
                 and bool(re.search(r"경기도", handoff)),
                 "전국 범위 요청이 경기도 기준으로 축소됨",
             ),
         ]
         for matched, reason in pairs:
             if matched:
-                return f"완료 보고를 보류했습니다. 검수 기준 불일치: {reason}"
+                return f"{tid}완료 보고를 보류했습니다. 검수 기준 불일치: {reason}"
         return None
 
     def _kanban_artifact_status(

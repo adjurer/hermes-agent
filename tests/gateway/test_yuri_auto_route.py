@@ -192,6 +192,9 @@ def test_yuri_review_gate_pass_requires_intent_source_evidence():
     assert runner._yuri_review_gate_passed("검수 통과: 텔레쏜 확인 후 의도 일치")
     assert not runner._yuri_review_gate_passed("검수 통과")
     assert not runner._yuri_review_gate_passed("완료했습니다")
+    assert runner._yuri_review_gate_passed(
+        "review_status=pass, intent_source=telethon: 검수된 최종 문안입니다."
+    )
 
 
 @pytest.mark.parametrize(
@@ -264,6 +267,37 @@ async def test_yuri_kanban_intake_ack_preserves_tid_when_work_must_route(tmp_pat
 
     assert response.startswith("TID=WORK-A1 ")
     assert "결과는 검수 후" in response
+
+
+def test_yuri_work_type_prompt_with_payload_summary_word_routes_to_kanban():
+    text = (
+        "TID=WRK50-47 업무형 50건 검증입니다. 아래 텔레쏜 메모를 업무 메모로 보고 "
+        "문제점 1개와 바로 쓸 수정안 1개를 작성해주세요. 최종 보고 첫머리는 반드시 "
+        "TID=WRK50-47 로 시작해야 합니다. 메모: 코인니스가 요약 정리해 송고한다."
+    )
+    runner = _runner()
+
+    assert runner._yuri_brief_direct_reply(_event(text)) is None
+    assert runner._yuri_should_route_to_kanban_intake(_event(text))
+
+
+def test_yuri_handoff_mismatch_does_not_treat_national_event_name_as_scope_error():
+    runner = _runner()
+
+    assert runner._yuri_handoff_mismatch_warning(
+        "TID=WRK50B-40 지방의원전국대회 참석 안내를 경기도 광역·기초의원에게 보내야 합니다.",
+        "TID=WRK50B-40 경기도 광역·기초의원 당선자 전체 명단 기준으로 안내합니다.",
+    ) is None
+
+
+def test_yuri_handoff_mismatch_preserves_tid_for_real_scope_error():
+    warning = _runner()._yuri_handoff_mismatch_warning(
+        "TID=SCOPE-1 전국 전체 지방선거 자료를 정리해주세요.",
+        "경기도 기준으로 정리했습니다.",
+    )
+
+    assert warning is not None
+    assert warning.startswith("TID=SCOPE-1 ")
 
 
 @pytest.mark.asyncio
