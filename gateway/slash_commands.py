@@ -2089,6 +2089,11 @@ class GatewaySlashCommandsMixin:
 
             query = " ".join(args[1:]).strip()
             return build_graph_export_report(query, limit=8)
+        if args and args[0] in {"okf-export", "okf"}:
+            from gateway.yuri_knowledge_spine import build_okf_export_report
+
+            query = " ".join(args[1:]).strip()
+            return build_okf_export_report(query, limit=50)
         session_key = self._session_key_for_source(event.source)
         config_path = _hermes_home / "config.yaml"
 

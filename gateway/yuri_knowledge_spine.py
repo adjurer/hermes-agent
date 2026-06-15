@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 SCHEMA_VERSION = "yuri-knowledge-spine-v1"
 GRAPH_SCHEMA_VERSION = "yuri-knowledge-graph-v1"
+OKF_VERSION = "0.1"
 
 OPERATING_RULES = [
     "Yuri is the front-desk chief of staff, not the sole worker.",
@@ -58,6 +59,10 @@ def _db_path() -> Path:
 
 def _graph_edges_path() -> Path:
     return _spine_root() / "graph_edges.jsonl"
+
+
+def _okf_bundle_path() -> Path:
+    return _spine_root() / "okf_bundle"
 
 
 def _utc_iso(ts: Optional[float] = None) -> str:
@@ -788,6 +793,239 @@ def build_graph_export_report(query: str = "", *, limit: int = 20) -> str:
             lines.append(f"  - {_edge_line(edge)}")
     else:
         lines.append("- edges: none")
+    return "\n".join(lines)
+
+
+_OKF_FILE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _okf_slug(value: Any, *, fallback: str = "unknown") -> str:
+    text = _safe_text(value, limit=120)
+    if not text:
+        text = fallback
+    slug = _OKF_FILE_RE.sub("_", text).strip("._")
+    return slug or fallback
+
+
+def _yaml_scalar(value: Any) -> str:
+    text = _safe_text(value, limit=2000)
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _yaml_list(values: list[Any]) -> str:
+    return "[" + ", ".join(_yaml_scalar(v) for v in values if str(v or "").strip()) + "]"
+
+
+def _okf_frontmatter(fields: dict[str, Any]) -> str:
+    lines = ["---"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, list):
+            lines.append(f"{key}: {_yaml_list(value)}")
+        else:
+            lines.append(f"{key}: {_yaml_scalar(value)}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def _md_text(value: Any, *, limit: int = 2000) -> str:
+    return _safe_text(value, limit=limit).replace("\n", "\n\n")
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def _event_okf_doc(row: dict[str, Any]) -> tuple[str, str]:
+    payload = _event_payload(row)
+    event_id = str(row.get("event_id") or uuid.uuid4().hex)
+    kind = str(row.get("kind") or "event")
+    task_id = _event_task_id(payload)
+    title = f"{kind} {event_id[:8]}"
+    description = _summarize_event(row)
+    fields = {
+        "type": "Yuri Spine Event",
+        "title": title,
+        "description": description,
+        "resource": f"hermes://yuri-spine/events/{event_id}",
+        "tags": ["hermes", "yuri", "memory", kind],
+        "timestamp": row.get("created_at"),
+        "event_id": event_id,
+        "event_kind": kind,
+        "task_id": task_id,
+    }
+    body = [
+        _okf_frontmatter(fields),
+        f"# {title}",
+        "",
+        "## Summary",
+        _md_text(description, limit=1000),
+    ]
+    if task_id:
+        body.extend(["", "## Related Concepts", f"- [Task {task_id}](/tasks/{_okf_slug(task_id)}.md)"])
+    if kind == "yuri_intake":
+        body.extend(
+            [
+                "",
+                "## User Intent",
+                _md_text(payload.get("original_user_text"), limit=2000),
+                "",
+                "## Operating Rules",
+            ]
+        )
+        for rule in payload.get("operating_rules") or []:
+            body.append(f"- {_md_text(rule, limit=400)}")
+    elif kind == "review_finalized":
+        body.extend(
+            [
+                "",
+                "## Approved Result",
+                _md_text(payload.get("approved_final_text"), limit=2400),
+                "",
+                "## Review Metadata",
+                f"- intent_source: `{_safe_text(payload.get('intent_source'), limit=120) or 'unknown'}`",
+                f"- reviewer_task_id: `{_safe_text(payload.get('reviewer_task_id'), limit=120) or 'unknown'}`",
+                f"- board: `{_safe_text(payload.get('board'), limit=120) or 'unknown'}`",
+            ]
+        )
+    body.extend(
+        [
+            "",
+            "## Raw Payload",
+            "```json",
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            "```",
+        ]
+    )
+    return f"events/{_okf_slug(event_id)}.md", "\n".join(body)
+
+
+def _task_okf_doc(task_id: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
+    latest = rows[-1] if rows else {}
+    description = f"Yuri task memory concept with {len(rows)} related spine event(s)."
+    fields = {
+        "type": "Yuri Task",
+        "title": f"Yuri Task {task_id}",
+        "description": description,
+        "resource": f"hermes://kanban/tasks/{task_id}",
+        "tags": ["hermes", "yuri", "task", "memory"],
+        "timestamp": latest.get("created_at") or _utc_iso(),
+        "task_id": task_id,
+    }
+    body = [
+        _okf_frontmatter(fields),
+        f"# Yuri Task {task_id}",
+        "",
+        description,
+        "",
+        "## Related Spine Events",
+    ]
+    for row in rows:
+        event_id = str(row.get("event_id") or "")
+        body.append(
+            f"- [{_summarize_event(row)}](/events/{_okf_slug(event_id)}.md)"
+        )
+    return f"tasks/{_okf_slug(task_id)}.md", "\n".join(body)
+
+
+def export_okf_bundle(
+    query: str = "",
+    *,
+    limit: int = 200,
+    output_dir: Optional[str | Path] = None,
+) -> dict[str, Any]:
+    """Write a local OKF v0.1 bundle projected from Yuri knowledge-spine events."""
+    limit = max(1, int(limit))
+    query = _safe_text(query, limit=500)
+    rows = recall_relevant_events(query, limit=limit) if query else _all_events_from_jsonl(limit=limit)
+    root = Path(output_dir).expanduser() if output_dir else _okf_bundle_path()
+    root.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    task_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rel, doc = _event_okf_doc(row)
+        _write_text(root / rel, doc)
+        written.append(rel)
+        task_id = _event_task_id(_event_payload(row))
+        if task_id:
+            task_rows.setdefault(task_id, []).append(row)
+
+    for task_id, related in sorted(task_rows.items()):
+        rel, doc = _task_okf_doc(task_id, related)
+        _write_text(root / rel, doc)
+        written.append(rel)
+
+    events_index = ["# Events", ""]
+    for row in rows:
+        event_id = str(row.get("event_id") or "")
+        events_index.append(
+            f"* [{_summarize_event(row)}]({_okf_slug(event_id)}.md)"
+        )
+    if len(events_index) == 2:
+        events_index.append("* No event concepts exported.")
+    _write_text(root / "events" / "index.md", "\n".join(events_index))
+
+    tasks_index = ["# Tasks", ""]
+    for task_id, related in sorted(task_rows.items()):
+        tasks_index.append(
+            f"* [Yuri Task {task_id}]({_okf_slug(task_id)}.md) - {len(related)} related event(s)"
+        )
+    if len(tasks_index) == 2:
+        tasks_index.append("* No task concepts exported.")
+    _write_text(root / "tasks" / "index.md", "\n".join(tasks_index))
+
+    index = [
+        _okf_frontmatter({"okf_version": OKF_VERSION}),
+        "# Yuri Knowledge Spine OKF Bundle",
+        "",
+        "This bundle projects Hermes Yuri knowledge-spine memory into OKF v0.1 Markdown concepts.",
+        "",
+        "# Concepts",
+        f"* [Events](events/) - {len(rows)} exported spine event concept(s).",
+        f"* [Tasks](tasks/) - {len(task_rows)} exported task concept(s).",
+    ]
+    _write_text(root / "index.md", "\n".join(index))
+
+    today = _utc_iso()[:10]
+    log = [
+        "# Bundle Update Log",
+        "",
+        f"## {today}",
+        f"* **Export**: Generated {len(rows)} event concept(s) and {len(task_rows)} task concept(s) from Yuri knowledge spine.",
+    ]
+    _write_text(root / "log.md", "\n".join(log))
+
+    return {
+        "bundle_root": str(root),
+        "okf_version": OKF_VERSION,
+        "query": query,
+        "events_exported": len(rows),
+        "tasks_exported": len(task_rows),
+        "files_written": len(written) + 4,
+        "concept_files_written": len(written),
+    }
+
+
+def build_okf_export_report(
+    query: str = "",
+    *,
+    limit: int = 200,
+    output_dir: Optional[str | Path] = None,
+) -> str:
+    result = export_okf_bundle(query=query, limit=limit, output_dir=output_dir)
+    lines = [
+        "Yuri OKF export",
+        f"- query: {result['query'] or '(recent/all)'}",
+        f"- okf_version: {result['okf_version']}",
+        f"- bundle_root: {result['bundle_root']}",
+        f"- events_exported: {result['events_exported']}",
+        f"- tasks_exported: {result['tasks_exported']}",
+        f"- concept_files_written: {result['concept_files_written']}",
+        "- conformance: non-reserved concept files include YAML frontmatter with type; index.md/log.md reserved files generated.",
+    ]
     return "\n".join(lines)
 
 

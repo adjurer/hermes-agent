@@ -70,6 +70,26 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default="jsonl",
         help="Output JSONL for ingestion or a compact human summary",
     )
+    _okf_parser = memory_sub.add_parser(
+        "okf-export",
+        help="Export Yuri knowledge-spine memory as an OKF v0.1 markdown bundle",
+    )
+    _okf_parser.add_argument(
+        "query",
+        nargs="*",
+        help="Optional free-text query; omitted means recent/all spine events",
+    )
+    _okf_parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum spine events to export",
+    )
+    _okf_parser.add_argument(
+        "--output",
+        default=None,
+        help="Output directory; defaults to the Yuri spine okf_bundle directory",
+    )
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",

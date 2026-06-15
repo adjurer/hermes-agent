@@ -158,3 +158,37 @@ def test_yuri_memory_audit_report_includes_spine_and_kanban_trace(
     assert "kanban_trace" in report
     assert "review_status=pass" in report
     assert "intent_source=telethon" in report
+
+
+def test_yuri_knowledge_spine_exports_okf_bundle(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+
+    pack = spine.build_context_pack(
+        original_user_text="텔레쏜 대화 기준으로 유리 원인을 확인해주세요.",
+        platform="telegram",
+        message_id="m-okf",
+    )
+    spine.record_intake(pack, task_id="t_okf")
+    spine.record_review_result(
+        root_task_id="t_okf",
+        reviewer_task_id="t_review_okf",
+        approved_final_text="검수팀 확인 후 의도가 반영되었습니다.",
+        intent_source="telethon",
+        board="telegram-inbox",
+    )
+
+    out_dir = tmp_path / "bundle"
+    result = spine.export_okf_bundle(output_dir=out_dir)
+    report = spine.build_okf_export_report(output_dir=out_dir)
+
+    assert result["okf_version"] == "0.1"
+    assert result["events_exported"] == 2
+    assert result["tasks_exported"] == 1
+    assert (out_dir / "index.md").is_file()
+    assert (out_dir / "log.md").is_file()
+    assert (out_dir / "events" / "index.md").is_file()
+    assert (out_dir / "tasks" / "t_okf.md").is_file()
+    assert "okf_version: \"0.1\"" in (out_dir / "index.md").read_text(encoding="utf-8")
+    assert "type: \"Yuri Task\"" in (out_dir / "tasks" / "t_okf.md").read_text(encoding="utf-8")
+    assert "Yuri OKF export" in report
+    assert "conformance" in report

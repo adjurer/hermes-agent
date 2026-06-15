@@ -62,3 +62,25 @@ async def test_memory_graph_export_command_returns_yuri_graph_report(tmp_path, m
     assert "Yuri graph export" in out
     assert "HAS_USER_INTENT" in out
     assert "task:t_graph" in out
+
+
+@pytest.mark.asyncio
+async def test_memory_okf_export_command_returns_yuri_okf_report(tmp_path, monkeypatch):
+    from gateway import yuri_knowledge_spine as spine
+
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+
+    pack = spine.build_context_pack(
+        original_user_text="텔레쏜 대화 기준으로 유리 원인을 확인해주세요.",
+        platform="telegram",
+    )
+    spine.record_intake(pack, task_id="t_okf_cmd")
+
+    runner = object.__new__(GatewayRunner)
+    out = await runner._handle_memory_command(
+        _event("/memory okf-export 유리 원인 확인")
+    )
+
+    assert "Yuri OKF export" in out
+    assert "okf_version: 0.1" in out
+    assert "events_exported: 1" in out
