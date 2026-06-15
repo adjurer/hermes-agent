@@ -22,13 +22,10 @@ import base64
 import json
 import logging
 import os
-import platform
 import re
 import shutil
-import subprocess
 import sys
 import threading
-from concurrent.futures import Future
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
@@ -47,60 +44,8 @@ logger = logging.getLogger(__name__)
 
 PINNED_CUA_DRIVER_VERSION = os.environ.get("HERMES_CUA_DRIVER_VERSION", "0.5.0")
 
-
-def _default_cua_driver_cmd() -> str:
-    safe_wrapper = os.path.expanduser("~/.hermes/bin/cua-driver-safe")
-    if os.path.isfile(safe_wrapper) and os.access(safe_wrapper, os.X_OK):
-        return safe_wrapper
-    return "cua-driver"
-
-
-_CUA_DRIVER_CMD = os.environ.get("HERMES_CUA_DRIVER_CMD") or _default_cua_driver_cmd()
+_CUA_DRIVER_CMD = os.environ.get("HERMES_CUA_DRIVER_CMD", "cua-driver")
 _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport
-
-
-def _image_size_from_bytes(data: bytes) -> Tuple[int, int]:
-    """Return image dimensions for PNG/JPEG screenshots without extra deps."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
-        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
-
-    if data.startswith(b"\xff\xd8"):
-        i = 2
-        while i + 9 < len(data):
-            if data[i] != 0xFF:
-                i += 1
-                continue
-            marker = data[i + 1]
-            i += 2
-            while marker == 0xFF and i < len(data):
-                marker = data[i]
-                i += 1
-            if marker in {0xD8, 0xD9}:
-                continue
-            if i + 2 > len(data):
-                break
-            segment_len = int.from_bytes(data[i:i + 2], "big")
-            if segment_len < 2 or i + segment_len > len(data):
-                break
-            if marker in {
-                0xC0, 0xC1, 0xC2, 0xC3,
-                0xC5, 0xC6, 0xC7,
-                0xC9, 0xCA, 0xCB,
-                0xCD, 0xCE, 0xCF,
-            } and segment_len >= 7:
-                height = int.from_bytes(data[i + 3:i + 5], "big")
-                width = int.from_bytes(data[i + 5:i + 7], "big")
-                return width, height
-            i += segment_len
-
-    return 0, 0
-
-
-def _image_size_from_b64(image_b64: str) -> Tuple[int, int]:
-    try:
-        return _image_size_from_bytes(base64.b64decode(image_b64, validate=False))
-    except Exception:
-        return 0, 0
 
 # Regex to parse list_windows text output lines:
 #   "- AppName (pid 12345) "Title" [window_id: 67890]"
@@ -131,10 +76,6 @@ _ELEMENT_LINE_RE = re.compile(
 
 def _is_macos() -> bool:
     return sys.platform == "darwin"
-
-
-def _is_arm_mac() -> bool:
-    return _is_macos() and platform.machine() == "arm64"
 
 
 def cua_driver_binary_available() -> bool:
@@ -183,6 +124,45 @@ def _parse_elements_from_tree(markdown: str) -> List[UIElement]:
             bounds=(0, 0, 0, 0),
         ))
     return elements
+
+
+def _image_dimensions_from_bytes(raw: bytes) -> Tuple[int, int]:
+    """Best-effort PNG/JPEG dimension sniffing without extra dependencies."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n") and len(raw) >= 24:
+        width = int.from_bytes(raw[16:20], "big")
+        height = int.from_bytes(raw[20:24], "big")
+        if width > 0 and height > 0:
+            return width, height
+
+    if raw.startswith(b"\xff\xd8"):
+        i = 2
+        n = len(raw)
+        while i + 9 < n:
+            if raw[i] != 0xFF:
+                i += 1
+                continue
+            marker = raw[i + 1]
+            i += 2
+            if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+                continue
+            if i + 2 > n:
+                break
+            segment_len = int.from_bytes(raw[i:i + 2], "big")
+            if segment_len < 2 or i + segment_len > n:
+                break
+            if marker in {
+                0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+            }:
+                if segment_len >= 7:
+                    height = int.from_bytes(raw[i + 3:i + 5], "big")
+                    width = int.from_bytes(raw[i + 5:i + 7], "big")
+                    if width > 0 and height > 0:
+                        return width, height
+                break
+            i += segment_len
+
+    return 0, 0
 
 
 def _split_tree_text(full_text: str) -> Tuple[str, str]:
@@ -336,21 +316,42 @@ class _CuaDriverSession:
         result = await self._session.call_tool(name, args)
         return _extract_tool_result(result)
 
+    @staticmethod
+    def _is_closed_session_error(exc: Exception) -> bool:
+        """Return True for MCP/stdio failures that are recoverable by reconnecting."""
+        name = exc.__class__.__name__
+        module = getattr(exc.__class__, "__module__", "")
+        return (
+            name in {"ClosedResourceError", "BrokenResourceError", "EndOfStream"}
+            or (module.startswith("anyio") and "Resource" in name)
+            or isinstance(exc, (BrokenPipeError, EOFError))
+        )
+
+    def _restart_session_locked(self) -> None:
+        """Recreate the MCP session after the daemon/stdin transport was closed."""
+        try:
+            if self._started:
+                self._bridge.run(self._aexit(), timeout=5.0)
+        except Exception as e:
+            logger.debug("cua-driver session cleanup before reconnect failed: %s", e)
+        self._started = False
+        self._bridge.run(self._aenter(), timeout=15.0)
+        self._started = True
+
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         self._require_started()
-        return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
-
-    async def _list_tools_async(self) -> set[str]:
-        result = await self._session.list_tools()
-        return {
-            str(getattr(tool, "name", ""))
-            for tool in getattr(result, "tools", []) or []
-            if getattr(tool, "name", None)
-        }
-
-    def list_tools(self, timeout: float = 10.0) -> set[str]:
-        self._require_started()
-        return self._bridge.run(self._list_tools_async(), timeout=timeout)
+        try:
+            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+        except Exception as e:
+            if not self._is_closed_session_error(e):
+                raise
+            # Daemon restart closes the cached stdio channel. Reconnect once and
+            # retry exactly one more time — never loop, to avoid hammering a
+            # genuinely dead daemon.
+            logger.warning("cua-driver MCP session closed during %s; reconnecting once", name)
+            with self._lock:
+                self._restart_session_locked()
+            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
 
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
@@ -404,7 +405,6 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
-        self._tool_names: Optional[set[str]] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
@@ -530,12 +530,14 @@ class CuaDriverBackend(ComputerUseBackend):
         png_bytes_len = 0
         if png_b64:
             try:
-                png_bytes = base64.b64decode(png_b64, validate=False)
-                png_bytes_len = len(png_bytes)
-                width, height = _image_size_from_bytes(png_bytes)
+                raw = base64.b64decode(png_b64, validate=False)
+                png_bytes_len = len(raw)
+                detected_width, detected_height = _image_dimensions_from_bytes(raw)
+                if detected_width and detected_height:
+                    width = detected_width
+                    height = detected_height
             except Exception:
                 png_bytes_len = len(png_b64) * 3 // 4
-                width, height = _image_size_from_b64(png_b64)
 
         return CaptureResult(
             mode=mode,
@@ -565,15 +567,6 @@ class CuaDriverBackend(ComputerUseBackend):
                                 message="No active window — call capture() first.")
 
         # Choose tool based on button and click_count.
-        if button == "middle":
-            return ActionResult(
-                ok=False,
-                action="middle_click",
-                message=(
-                    "middle_click is not supported by cua-driver; use click, "
-                    "double_click, right_click, or a keyboard shortcut instead."
-                ),
-            )
         if button == "right":
             tool = "right_click"
         elif click_count == 2:
@@ -662,8 +655,7 @@ class CuaDriverBackend(ComputerUseBackend):
         if pid is None:
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
-        tool = "type_text_chars" if self._has_tool("type_text_chars") else "type_text"
-        return self._action(tool, {"pid": pid, "text": text})
+        return self._action("type_text", {"pid": pid, "text": text})
 
     def key(self, keys: str) -> ActionResult:
         pid = self._active_pid
@@ -770,28 +762,6 @@ class CuaDriverBackend(ComputerUseBackend):
                             message=f"No on-screen window found for app '{app}'.")
 
     # ── Internal ───────────────────────────────────────────────────
-    def _available_tool_names(self) -> set[str]:
-        if self._tool_names is not None:
-            return self._tool_names
-        try:
-            listed = self._session.list_tools()
-            if isinstance(listed, set):
-                self._tool_names = {str(name) for name in listed}
-            elif isinstance(listed, (list, tuple)):
-                self._tool_names = {
-                    str(getattr(item, "name", item))
-                    for item in listed
-                    if getattr(item, "name", item)
-                }
-            else:
-                self._tool_names = set()
-        except Exception:
-            self._tool_names = set()
-        return self._tool_names
-
-    def _has_tool(self, name: str) -> bool:
-        return name in self._available_tool_names()
-
     def _action(self, name: str, args: Dict[str, Any]) -> ActionResult:
         try:
             out = self._session.call_tool(name, args)
@@ -807,29 +777,3 @@ class CuaDriverBackend(ComputerUseBackend):
             message = data
         return ActionResult(ok=ok, action=name, message=message,
                             meta=data if isinstance(data, dict) else {})
-
-
-def _parse_element(d: Dict[str, Any]) -> UIElement:
-    bounds = d.get("bounds") or (0, 0, 0, 0)
-    if isinstance(bounds, dict):
-        bounds = (
-            int(bounds.get("x", 0)),
-            int(bounds.get("y", 0)),
-            int(bounds.get("w", bounds.get("width", 0))),
-            int(bounds.get("h", bounds.get("height", 0))),
-        )
-    elif isinstance(bounds, (list, tuple)) and len(bounds) == 4:
-        bounds = tuple(int(v) for v in bounds)
-    else:
-        bounds = (0, 0, 0, 0)
-    return UIElement(
-        index=int(d.get("index", 0)),
-        role=str(d.get("role", "") or ""),
-        label=str(d.get("label", "") or ""),
-        bounds=bounds,  # type: ignore[arg-type]
-        app=str(d.get("app", "") or ""),
-        pid=int(d.get("pid", 0) or 0),
-        window_id=int(d.get("windowId", 0) or 0),
-        attributes={k: v for k, v in d.items()
-                    if k not in {"index", "role", "label", "bounds", "app", "pid", "windowId"}},
-    )

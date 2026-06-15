@@ -7,10 +7,7 @@ Covers: get_document_cache_dir, cache_document_from_bytes,
 
 import os
 import time
-import unicodedata
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -18,10 +15,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     cache_document_from_bytes,
     cleanup_document_cache,
-    decode_text_document_bytes,
     get_document_cache_dir,
-    normalize_document_filename,
-    prepare_outbound_document_for_send,
 )
 
 # ---------------------------------------------------------------------------
@@ -104,78 +98,6 @@ class TestCacheDocumentFromBytes:
         path = cache_document_from_bytes(b"data", None)
         assert "document" in os.path.basename(path)
 
-    def test_korean_filename_is_nfc_normalized(self):
-        decomposed = unicodedata.normalize("NFD", "한글보고서.md")
-        path = cache_document_from_bytes(b"data", decomposed)
-        basename = os.path.basename(path)
-        assert "한글보고서.md" in basename
-        assert basename == unicodedata.normalize("NFC", basename)
-
-
-class TestDocumentEncoding:
-    def test_decode_cp949_korean_markdown(self):
-        text, encoding = decode_text_document_bytes("# 제목\n한글 내용".encode("cp949"))
-        assert text == "# 제목\n한글 내용"
-        assert encoding == "cp949"
-
-    def test_decode_utf16_korean_markdown(self):
-        text, encoding = decode_text_document_bytes("# 제목\n한글 내용".encode("utf-16"))
-        assert text == "# 제목\n한글 내용"
-        assert encoding == "utf-16"
-
-    def test_normalize_filename_strips_control_characters(self):
-        assert normalize_document_filename("보고서\n\t.md") == "보고서.md"
-
-    def test_prepare_outbound_text_document_uses_utf8_sig_copy(self, tmp_path):
-        decomposed_name = unicodedata.normalize("NFD", "한글보고서.md")
-        source = tmp_path / decomposed_name
-        source.write_bytes("# 제목\n한글 내용".encode("cp949"))
-        written_at = datetime(2026, 5, 20, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
-        os.utime(source, (written_at, written_at))
-
-        send_path, display_name = prepare_outbound_document_for_send(source)
-
-        assert display_name == "260520_한글보고서.md"
-        assert send_path != str(source)
-        sent_bytes = Path(send_path).read_bytes()
-        assert sent_bytes.startswith(b"\xef\xbb\xbf")
-        assert sent_bytes.decode("utf-8-sig") == "# 제목\n한글 내용"
-        assert source.read_bytes() == "# 제목\n한글 내용".encode("cp949")
-
-    def test_prepare_outbound_binary_document_does_not_reencode(self, tmp_path):
-        source = tmp_path / unicodedata.normalize("NFD", "계약서.hwp")
-        source.write_bytes(b"\xd0\xcf\x11\xe0binary-hwp")
-        written_at = datetime(2026, 5, 20, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
-        os.utime(source, (written_at, written_at))
-
-        send_path, display_name = prepare_outbound_document_for_send(source)
-
-        assert send_path == str(source)
-        assert display_name == "260520_계약서.hwp"
-        assert source.read_bytes() == b"\xd0\xcf\x11\xe0binary-hwp"
-
-    def test_prepare_outbound_json_does_not_add_bom(self, tmp_path):
-        source = tmp_path / "data.json"
-        source.write_bytes('{"name":"한글"}'.encode("utf-8"))
-        written_at = datetime(2026, 5, 20, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
-        os.utime(source, (written_at, written_at))
-
-        send_path, display_name = prepare_outbound_document_for_send(source)
-
-        assert send_path == str(source)
-        assert display_name == "260520_data.json"
-        assert source.read_bytes() == '{"name":"한글"}'.encode("utf-8")
-
-    def test_prepare_outbound_document_uses_file_written_date_prefix(self, tmp_path):
-        source = tmp_path / "policy_report.md"
-        source.write_bytes("# 보고서\n".encode("utf-8"))
-        written_at = datetime(2026, 5, 18, 9, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
-        os.utime(source, (written_at, written_at))
-
-        _, display_name = prepare_outbound_document_for_send(source)
-
-        assert display_name == "260518_보고서.md"
-
 
 # ---------------------------------------------------------------------------
 # TestCleanupDocumentCache
@@ -229,7 +151,79 @@ class TestSupportedDocumentTypes:
 
     @pytest.mark.parametrize(
         "ext",
-        [".pdf", ".md", ".markdown", ".txt", ".zip", ".docx", ".xlsx", ".pptx"],
+        [
+            ".pdf",
+            ".md",
+            ".txt",
+            ".zip",
+            ".doc",
+            ".docx",
+            ".xls",
+            ".xlsx",
+            ".ppt",
+            ".pptx",
+        ],
     )
     def test_expected_extensions_present(self, ext):
         assert ext in SUPPORTED_DOCUMENT_TYPES
+
+
+# ---------------------------------------------------------------------------
+# TestCacheMediaBytes — the unified, platform-agnostic caching primitive
+# ---------------------------------------------------------------------------
+
+# 1x1 transparent PNG (passes cache_image_from_bytes validation)
+_PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000d49444154789c6360000002000154a24f5f0000000049454e44ae426082"
+)
+
+
+class TestCacheMediaBytes:
+    def test_pdf_routes_to_document(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(b"%PDF-1.4 body", filename="report.pdf", mime_type="application/pdf")
+        assert result is not None
+        assert result.kind == "document"
+        assert result.media_type == "application/pdf"
+        assert "report.pdf" in result.display_name
+        assert os.path.exists(result.path)
+        assert "report.pdf" in result.context_note()
+
+    def test_png_routes_to_image(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(_PNG_1PX, filename="photo.png", mime_type="image/png")
+        assert result is not None
+        assert result.kind == "image"
+        assert result.media_type == "image/png"
+        assert os.path.exists(result.path)
+
+    def test_native_photo_without_filename_uses_default_kind(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(_PNG_1PX, filename="", mime_type="", default_kind="image")
+        assert result is not None
+        assert result.kind == "image"
+
+    def test_mp4_routes_to_video(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(b"\x00\x00\x00\x18ftypmp42", filename="clip.mp4", mime_type="video/mp4")
+        assert result is not None
+        assert result.kind == "video"
+        assert result.media_type == "video/mp4"
+
+    def test_mime_only_resolves_extension(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(b"col1,col2\n1,2", filename="", mime_type="text/csv")
+        assert result is not None
+        assert result.kind == "document"
+        assert result.media_type == "text/csv"
+
+    def test_unsupported_document_returns_none(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(b"MZ", filename="malware.exe", mime_type="application/x-msdownload")
+        assert result is None
+
+    def test_invalid_image_returns_none(self):
+        from gateway.platforms.base import cache_media_bytes
+        result = cache_media_bytes(b"<html>not an image</html>", filename="x.png", mime_type="image/png")
+        assert result is None

@@ -31,9 +31,7 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const websiteDir = resolve(scriptDir, "..");
 const extractScript = join(scriptDir, "extract-skills.py");
 const llmsScript = join(scriptDir, "generate-llms-txt.py");
-const repoRoot = resolve(websiteDir, "..");
-const venvPython = join(repoRoot, "venv", "bin", "python");
-const pythonCommand = existsSync(venvPython) ? venvPython : "python3";
+const cronBlueprintsScript = join(scriptDir, "extract-automation-blueprints.py");
 const outputFile = join(websiteDir, "static", "api", "skills.json");
 const unifiedIndexFile = join(websiteDir, "static", "api", "skills-index.json");
 const UNIFIED_INDEX_URL =
@@ -54,9 +52,9 @@ function runPython(script, label) {
     console.warn(`[prebuild] ${label} skipped (script missing)`);
     return false;
   }
-  const r = spawnSync(pythonCommand, [script], { stdio: "inherit", cwd: websiteDir });
+  const r = spawnSync("python3", [script], { stdio: "inherit", cwd: websiteDir });
   if (r.error && r.error.code === "ENOENT") {
-    console.warn(`[prebuild] ${label} skipped (${pythonCommand} not found)`);
+    console.warn(`[prebuild] ${label} skipped (python3 not found)`);
     return false;
   }
   if (r.status !== 0) {
@@ -128,12 +126,12 @@ await ensureUnifiedIndex();
 if (!existsSync(extractScript)) {
   writeEmptyFallback("extract script missing");
 } else {
-  const r = spawnSync(pythonCommand, [extractScript], {
+  const r = spawnSync("python3", [extractScript], {
     stdio: "inherit",
     cwd: websiteDir,
   });
   if (r.error && r.error.code === "ENOENT") {
-    writeEmptyFallback(`${pythonCommand} not found`);
+    writeEmptyFallback("python3 not found");
   } else if (r.status !== 0) {
     writeEmptyFallback(`extract-skills.py exited with status ${r.status}`);
   }
@@ -141,3 +139,7 @@ if (!existsSync(extractScript)) {
 
 // 2) llms.txt + llms-full.txt — agent-friendly docs entrypoints. Non-fatal.
 runPython(llmsScript, "generate-llms-txt.py");
+
+// 3) automation-blueprints-index.json — Automation Blueprints catalog page. Non-fatal; the page
+//    renders an empty state if the generator can't run.
+runPython(cronBlueprintsScript, "extract-automation-blueprints.py");

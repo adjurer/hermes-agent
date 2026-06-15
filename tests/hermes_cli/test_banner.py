@@ -135,22 +135,68 @@ def test_build_welcome_banner_title_falls_back_when_no_tag():
     assert "\x1b]8;" not in raw, "OSC-8 hyperlink should not be emitted without a tag"
 
 
-def test_update_cache_refs_include_head_and_origin(tmp_path):
-    import subprocess
+def test_build_welcome_banner_disabled_mcp_shows_disabled_not_failed():
+    """A disabled MCP server renders '— disabled' (dim), not '— failed' (red)."""
+    with (
+        patch.object(model_tools, "check_tool_availability", return_value=(["web"], [])),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(
+            tools.mcp_tool,
+            "get_mcp_status",
+            return_value=[
+                {"name": "linear", "transport": "http", "tools": 0,
+                 "connected": False, "disabled": True},
+                {"name": "broken", "transport": "stdio", "tools": 0,
+                 "connected": False, "disabled": False},
+            ],
+        ),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(
+            console=console, model="anthropic/test-model", cwd="/tmp/project",
+            tools=[{"function": {"name": "read_file"}}],
+            get_toolset_for_tool=lambda n: "file",
+        )
 
-    repo = tmp_path / "repo"
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-    (repo / "file.txt").write_text("hello\n")
-    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
-    subprocess.run(["git", "push", "-u", "origin", "HEAD:main"], cwd=repo, check=True, capture_output=True)
+    output = console.export_text()
+    # Disabled server is labeled "disabled", not "failed"
+    assert "linear" in output
+    assert "disabled" in output
+    # A genuinely unreachable server still reads "failed"
+    assert "broken" in output
+    assert "failed" in output
 
-    refs = banner._local_git_cache_refs(repo)
-    assert refs["head"]
-    assert refs["origin_main"]
-    assert refs["head"] == refs["origin_main"]
+
+def test_build_welcome_banner_configured_mcp_is_not_failed():
+    """A configured MCP server with no connection attempt yet is not a failure."""
+    with (
+        patch.object(model_tools, "check_tool_availability", return_value=(["web"], [])),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(
+            tools.mcp_tool,
+            "get_mcp_status",
+            return_value=[
+                {
+                    "name": "docker-profile",
+                    "transport": "stdio",
+                    "tools": 0,
+                    "connected": False,
+                    "disabled": False,
+                    "status": "configured",
+                },
+            ],
+        ),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(
+            console=console, model="anthropic/test-model", cwd="/tmp/project",
+            tools=[{"function": {"name": "read_file"}}],
+            get_toolset_for_tool=lambda n: "file",
+        )
+
+    output = console.export_text()
+    assert "docker-profile" in output
+    assert "configured" in output
+    assert "failed" not in output

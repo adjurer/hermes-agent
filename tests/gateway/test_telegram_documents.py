@@ -9,7 +9,6 @@ We mock the telegram module at import time to avoid collection errors.
 """
 
 import asyncio
-import importlib
 import os
 import sys
 import unicodedata
@@ -20,12 +19,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
-    SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_VIDEO_TYPES,
 )
 
