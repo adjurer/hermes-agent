@@ -6721,6 +6721,107 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_CODING_TASK_HINT_RE = re.compile(
+    r"("
+    r"code|coding|repo|repository|git|github|pull request|pr|"
+    r"python|javascript|typescript|node|react|api|cli|server|gateway|"
+    r"script|module|function|class|config|yaml|json|sqlite|database|"
+    r"test|pytest|unit test|integration test|lint|build|deploy|"
+    r"patch|bug|fix|refactor|implementation|automation|"
+    r"코드|개발|구현|패치|버그|오류|수정|리팩터|리팩토|"
+    r"테스트|스크립트|함수|모듈|서버|게이트웨이|설정|자동화|배포"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _skill_available_for_home(hermes_home: Optional[str], skill_name: str) -> bool:
+    """True when a worker running under ``hermes_home`` can load a skill."""
+    if not skill_name:
+        return False
+    from pathlib import Path as _Path
+
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    try:
+        for skill_md in skills_root.rglob("SKILL.md"):
+            if skill_md.parent.name == skill_name and skill_md.is_file():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _task_looks_coding_related(task: Task) -> bool:
+    text = "\n".join(
+        str(part or "")
+        for part in [
+            getattr(task, "title", ""),
+            getattr(task, "body", ""),
+        ]
+    )
+    return bool(_CODING_TASK_HINT_RE.search(text))
+
+
+def _auto_injected_worker_skills(
+    task: Task,
+    *,
+    hermes_home: Optional[str],
+) -> list[str]:
+    """Return configured skills that should be auto-loaded for this worker.
+
+    Root config controls this from ``skills.auto_inject.coding``.  Availability
+    is checked against the spawned worker's profile home so a missing skill
+    cannot crash the worker at CLI startup.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+    except Exception:
+        return []
+
+    skills_cfg = cfg.get("skills", {}) if isinstance(cfg, dict) else {}
+    auto_cfg = (
+        skills_cfg.get("auto_inject", {}) if isinstance(skills_cfg, dict) else {}
+    )
+    coding_cfg = (
+        auto_cfg.get("coding", {}) if isinstance(auto_cfg, dict) else {}
+    )
+    if isinstance(coding_cfg, list):
+        enabled = True
+        configured = coding_cfg
+    elif isinstance(coding_cfg, dict):
+        enabled = bool(coding_cfg.get("enabled", False))
+        configured = coding_cfg.get("skills", [])
+    else:
+        return []
+    if not enabled or not isinstance(configured, list):
+        return []
+    if not _task_looks_coding_related(task):
+        return []
+
+    out: list[str] = []
+    seen = {"kanban-worker"}
+    for raw in configured:
+        skill_name = str(raw or "").strip()
+        if not skill_name or skill_name in seen:
+            continue
+        if not _skill_available_for_home(hermes_home, skill_name):
+            _log.warning(
+                "kanban worker: auto-inject skill %s skipped for %s; not available under HERMES_HOME=%r",
+                skill_name,
+                task.id,
+                hermes_home,
+            )
+            continue
+        seen.add(skill_name)
+        out.append(skill_name)
+    return out
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -6841,6 +6942,12 @@ def _default_spawn(
     # contract still ships via KANBAN_GUIDANCE.
     if _kanban_worker_skill_available(env.get("HERMES_HOME")):
         cmd.extend(["--skills", "kanban-worker"])
+    auto_skills = _auto_injected_worker_skills(
+        task,
+        hermes_home=env.get("HERMES_HOME"),
+    )
+    for sk in auto_skills:
+        cmd.extend(["--skills", sk])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
@@ -6850,7 +6957,7 @@ def _default_spawn(
     # if a task author asks for it explicitly.
     if task.skills:
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
+            if sk and sk != "kanban-worker" and sk not in auto_skills:
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])

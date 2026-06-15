@@ -11,8 +11,10 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -330,7 +332,21 @@ class GatewayKanbanWatchersMixin:
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            if platform_str == "telegram" and self._yuri_is_review_required_block(task, ev):
+                                finalized = await asyncio.to_thread(
+                                    self._yuri_finalize_review_blocked_tasks_for_board,
+                                    board_slug,
+                                    sub["task_id"],
+                                )
+                                if finalized:
+                                    logger.info(
+                                        "Yuri review loop finalized %s from reviewer pass",
+                                        sub["task_id"],
+                                    )
+                                    continue
+                                msg = "검수 중입니다. 의도 일치와 결과 검증이 끝나면 최종 보고드리겠습니다."
+                            else:
+                                msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -508,6 +524,176 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    @staticmethod
+    def _yuri_is_review_required_block(task: Any, ev: Any) -> bool:
+        """True for Yuri intake blocks that are waiting on reviewer approval."""
+        text = "\n".join(
+            str(part or "")
+            for part in [
+                getattr(task, "title", ""),
+                getattr(task, "body", ""),
+                (getattr(ev, "payload", None) or {}).get("reason", "")
+                if isinstance(getattr(ev, "payload", None), dict)
+                else "",
+            ]
+        )
+        return bool(
+            ("YURI" in text or "Yuri" in text or "[YURI intake]" in text)
+            and re.search(r"review-required|검수|review_status|intent_source", text, re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _yuri_review_pass_from_metadata(raw: Any) -> Optional[dict[str, Any]]:
+        if not raw:
+            return None
+        if isinstance(raw, dict):
+            meta = raw
+        else:
+            try:
+                meta = json.loads(str(raw))
+            except Exception:
+                return None
+        status = str(meta.get("review_status", "") or "").strip().lower()
+        source = str(meta.get("intent_source", "") or "").strip().lower()
+        if status not in {"pass", "passed", "ok"}:
+            return None
+        if source not in {"telethon", "telegram-safe", "telegram", "conversation"}:
+            return None
+        final_text = (
+            meta.get("approved_final_text")
+            or meta.get("final_text")
+            or meta.get("approved_text")
+            or ""
+        )
+        final_text = str(final_text or "").strip()
+        if not final_text:
+            return None
+        out = dict(meta)
+        out["intent_source"] = source
+        out["approved_final_text"] = final_text
+        return out
+
+    def _yuri_finalize_review_blocked_tasks_for_board(
+        self,
+        board: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> list[str]:
+        """Close Yuri intake roots once a reviewer pass exists.
+
+        Some planner workers create review children but forget to link them
+        as dependencies of the original Yuri intake. The reviewer may still
+        complete with the required ``review_status=pass`` metadata, while the
+        root stays ``blocked`` forever. This repair pass finds those roots and
+        turns the approved reviewer text into the user-facing completion event.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        finalized: list[str] = []
+        try:
+            if task_id:
+                roots = conn.execute(
+                    """
+                    SELECT id, title, body, created_at
+                      FROM tasks
+                     WHERE id = ?
+                       AND status = 'blocked'
+                    """,
+                    (task_id,),
+                ).fetchall()
+            else:
+                roots = conn.execute(
+                    """
+                    SELECT id, title, body, created_at
+                      FROM tasks
+                     WHERE status = 'blocked'
+                       AND (
+                         title LIKE '[YURI intake]%'
+                         OR title LIKE 'Yuri intake:%'
+                         OR body LIKE '%YURI secretary intake%'
+                         OR body LIKE '%Yuri intake contract%'
+                       )
+                    """
+                ).fetchall()
+
+            for root in roots:
+                root_id = str(root["id"])
+                root_text = f"{root['title'] or ''}\n{root['body'] or ''}"
+                if "YURI" not in root_text and "Yuri" not in root_text:
+                    continue
+
+                needle = f"%{root_id}%"
+                reviewers = conn.execute(
+                    """
+                    SELECT t.id AS task_id, t.title, t.body,
+                           r.summary, r.metadata, r.ended_at
+                      FROM task_runs r
+                      JOIN tasks t ON t.id = r.task_id
+                     WHERE t.assignee = 'reviewer'
+                       AND r.outcome = 'completed'
+                       AND COALESCE(r.ended_at, 0) >= ?
+                       AND (
+                         t.body LIKE ?
+                         OR t.title LIKE ?
+                         OR r.summary LIKE ?
+                         OR r.metadata LIKE ?
+                       )
+                     ORDER BY r.ended_at DESC, r.id DESC
+                     LIMIT 20
+                    """,
+                    (
+                        int(root["created_at"] or 0),
+                        needle,
+                        needle,
+                        needle,
+                        needle,
+                    ),
+                ).fetchall()
+
+                approved: Optional[dict[str, Any]] = None
+                reviewer_task_id = ""
+                for reviewer in reviewers:
+                    approved = self._yuri_review_pass_from_metadata(
+                        reviewer["metadata"]
+                    )
+                    if approved:
+                        reviewer_task_id = str(reviewer["task_id"])
+                        break
+                if not approved:
+                    continue
+
+                final_text = str(approved["approved_final_text"]).strip()
+                metadata = {
+                    "review_status": "pass",
+                    "intent_source": approved.get("intent_source", "telethon"),
+                    "approved_final_text": final_text,
+                    "reviewer_task": reviewer_task_id,
+                    "auto_finalized_from_review": True,
+                }
+                if _kb.complete_task(
+                    conn,
+                    root_id,
+                    result=final_text,
+                    summary=final_text,
+                    metadata=metadata,
+                ):
+                    try:
+                        _kb.add_comment(
+                            conn,
+                            root_id,
+                            "yuri-review-loop",
+                            (
+                                f"Auto-finalized from reviewer {reviewer_task_id}: "
+                                f"review_status=pass, intent_source={metadata['intent_source']}."
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    finalized.append(root_id)
+        finally:
+            conn.close()
+        return finalized
 
     async def _deliver_kanban_artifacts(
         self,
@@ -858,6 +1044,7 @@ class GatewayKanbanWatchersMixin:
                     )
                 disabled_corrupt_boards.pop(slug, None)
             try:
+                self._yuri_finalize_review_blocked_tasks_for_board(slug)
                 conn = _kb.connect(board=slug)
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit

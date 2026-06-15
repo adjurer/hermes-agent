@@ -273,6 +273,73 @@ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypa
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
 
 
+def test_yuri_review_loop_finalizes_blocked_root_from_unlinked_reviewer_pass(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "yuri-review-loop-kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root_id = kb.create_task(
+            conn,
+            title="[YURI intake] 여론조사 인식 개선은 어떻게 되고있나요?",
+            body=(
+                "YURI secretary intake from Telegram.\n"
+                "Original user text:\n"
+                "여론조사 인식 개선은 어떻게 되고있나요?"
+            ),
+            assignee="planner",
+            initial_status="running",
+        )
+        assert kb.block_task(
+            conn,
+            root_id,
+            reason="review-required: wait for reviewer approval",
+        )
+        reviewer_id = kb.create_task(
+            conn,
+            title="Review Telegram intent for Yuri delivery",
+            body=(
+                f"Parent intake {root_id}. "
+                "Check Telegram/Telethon intent before final delivery."
+            ),
+            assignee="reviewer",
+        )
+        assert kb.complete_task(
+            conn,
+            reviewer_id,
+            summary="review_status=pass; intent_source=telethon",
+            metadata={
+                "review_status": "pass",
+                "intent_source": "telethon",
+                "approved_final_text": "검수 통과 문안입니다.",
+            },
+        )
+    finally:
+        conn.close()
+
+    runner = _make_runner(RecordingAdapter())
+    assert runner._yuri_finalize_review_blocked_tasks_for_board() == [root_id]
+
+    conn = kb.connect()
+    try:
+        root = kb.get_task(conn, root_id)
+        runs = kb.list_runs(conn, root_id)
+    finally:
+        conn.close()
+
+    assert root.status == "done"
+    assert root.result == "검수 통과 문안입니다."
+    completed = [run for run in runs if run.outcome == "completed"]
+    assert completed
+    assert completed[-1].metadata["review_status"] == "pass"
+    assert completed[-1].metadata["intent_source"] == "telethon"
+    assert completed[-1].metadata["auto_finalized_from_review"] is True
+
+
 def test_kanban_db_path_is_test_isolated_from_real_home():
     hermes_home = Path(kb.kanban_home())
     production_db = Path.home() / ".hermes" / "kanban.db"

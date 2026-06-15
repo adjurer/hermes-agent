@@ -4029,7 +4029,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(event_payload, dict):
             status = str(event_payload.get("review_status", "") or "").strip().lower()
             source = str(event_payload.get("intent_source", "") or "").strip().lower()
-            if status in {"pass", "passed", "ok"} and source in {"telethon", "telegram", "conversation"}:
+            if status in {"pass", "passed", "ok"} and source in {"telethon", "telegram-safe", "telegram", "conversation"}:
                 return True
         joined = "\n".join(str(t or "") for t in texts)
         return bool(re.search(r"검수\s*통과.*(?:텔레쏜|telethon|telegram|대화).*의도\s*일치", joined, re.IGNORECASE))

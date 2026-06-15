@@ -2758,6 +2758,102 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_default_spawn_auto_injects_ponytail_for_coding_tasks(
+    kanban_home,
+    monkeypatch,
+):
+    (kanban_home / "config.yaml").write_text(
+        "skills:\n"
+        "  auto_inject:\n"
+        "    coding:\n"
+        "      enabled: true\n"
+        "      skills:\n"
+        "        - ponytail\n",
+        encoding="utf-8",
+    )
+    skill_dir = kanban_home / "skills" / "autonomous-ai-agents" / "ponytail"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: ponytail\n---\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 100001
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="gateway config patch test",
+            body="코드 수정 후 pytest를 실행해주세요.",
+            assignee="worker",
+        )
+        task = kb.get_task(conn, tid)
+        kb._default_spawn(task, str(kb.resolve_workspace(task)))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_args = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--skills"]
+    assert "kanban-worker" in skill_args
+    assert "ponytail" in skill_args
+
+
+def test_default_spawn_does_not_auto_inject_ponytail_for_non_coding_tasks(
+    kanban_home,
+    monkeypatch,
+):
+    (kanban_home / "config.yaml").write_text(
+        "skills:\n"
+        "  auto_inject:\n"
+        "    coding:\n"
+        "      enabled: true\n"
+        "      skills:\n"
+        "        - ponytail\n",
+        encoding="utf-8",
+    )
+    skill_dir = kanban_home / "skills" / "autonomous-ai-agents" / "ponytail"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: ponytail\n---\n", encoding="utf-8")
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 100002
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="대화 의도 확인",
+            body="텔레쏜 대화를 보고 사용자의 의도를 정리해주세요.",
+            assignee="worker",
+        )
+        task = kb.get_task(conn, tid)
+        kb._default_spawn(task, str(kb.resolve_workspace(task)))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_args = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--skills"]
+    assert "kanban-worker" in skill_args
+    assert "ponytail" not in skill_args
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 

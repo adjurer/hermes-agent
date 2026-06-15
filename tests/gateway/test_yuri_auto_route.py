@@ -147,6 +147,9 @@ def test_yuri_review_gate_pass_requires_intent_source_evidence():
     assert runner._yuri_review_gate_passed(
         event_payload={"review_status": "pass", "intent_source": "telethon"}
     )
+    assert runner._yuri_review_gate_passed(
+        event_payload={"review_status": "pass", "intent_source": "telegram-safe"}
+    )
     assert runner._yuri_review_gate_passed("검수 통과: 텔레쏜 확인 후 의도 일치")
     assert not runner._yuri_review_gate_passed("검수 통과")
     assert not runner._yuri_review_gate_passed("완료했습니다")
