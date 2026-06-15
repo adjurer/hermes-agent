@@ -171,6 +171,9 @@ def test_yuri_actionable_telegram_work_routes_to_kanban_intake(text):
         "지금 살아있으면 OK라고만 답해줘",
         "kg서버 휴먼 폴더 루트만 알려줘",
         "내가 원하는 보고 방식 한 문장으로 말해줘",
+        "지금 진행중인건가요?",
+        "수집기가 돌고있나요?",
+        "칸반 상태가 어떤가요?",
         "네 좋아요",
         "응",
         "고마워",
@@ -309,6 +312,17 @@ async def test_yuri_fast_lookup_does_not_replace_kg_progress_questions_with_gene
     )
 
     assert response is None
+
+
+@pytest.mark.asyncio
+async def test_yuri_progress_status_question_returns_status_without_new_intake():
+    runner = _runner()
+    runner._yuri_current_work_status = lambda: "네, 현재 작업 상태는 진행 중 1건입니다."
+
+    response = await runner._yuri_fast_lookup_reply(_event("지금 진행중인건가요?"))
+
+    assert response == "네, 현재 작업 상태는 진행 중 1건입니다."
+    assert not runner._yuri_should_route_to_kanban_intake(_event("지금 진행중인건가요?"))
 
 
 @pytest.mark.asyncio

@@ -208,6 +208,11 @@ _YURI_PATH_RE = re.compile(r"(?:루트|경로|위치|절대경로|root|path|fold
 _YURI_HUMAN_RE = re.compile(r"(?:kg\s*human|human\s*(?:folder|폴더|root|루트|경로|위치)|휴먼|사람\s*폴더)", re.IGNORECASE)
 _YURI_HUMAN_CONTENT_RE = re.compile(r"(?:안에|내용|내용물|리스트|뭐뭐|어떤어떤|파악|보여)", re.IGNORECASE)
 _YURI_LIVENESS_QUERY_RE = re.compile(r"(?:살아있|작동|동작|응답|온라인|켜져|alive|ping)", re.IGNORECASE)
+_YURI_WORK_STATUS_QUERY_RE = re.compile(
+    r"(?:진행\s*중|하고\s*있|하고있|돌고\s*있|돌아가|상태|어디까지|칸반|kanban|큐)",
+    re.IGNORECASE,
+)
+_YURI_QUESTION_RE = re.compile(r"(?:\?|인가요|나요|니|습니까|어요|예요|야)$")
 _YURI_ARTIFACT_DELIVERY_CLAIM_RE = re.compile(
     r"(?:파일|문서|보고서|첨부|이미지|pdf|xlsx|docx|pptx).{0,24}(?:전송|첨부|업로드|보냈|전달|드렸)",
     re.IGNORECASE,
@@ -240,6 +245,19 @@ def _secretary_clean_kanban_text(platform: str, text: str, limit: int = 260) -> 
 def _kanban_text_claims_artifact_delivery(*texts: str) -> bool:
     joined = "\n".join(str(t or "") for t in texts)
     return bool(_YURI_ARTIFACT_DELIVERY_CLAIM_RE.search(joined))
+
+
+def _yuri_is_work_status_question(text: str) -> bool:
+    cleaned = _yuri_clean_shortcut_text(text)
+    if not cleaned:
+        return False
+    if any(p in cleaned for p in ("기준", "원칙", "뭘 봐야", "무엇을 봐야", "어떻게 봐야")):
+        return False
+    if not _YURI_WORK_STATUS_QUERY_RE.search(cleaned):
+        return False
+    if _YURI_QUESTION_RE.search(cleaned):
+        return True
+    return any(p in cleaned for p in ("하고 있니", "하고있니", "돌고있나요", "진행중인건가요"))
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -3799,6 +3817,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "네, 대기 중입니다."
         return None
 
+    def _yuri_current_work_status(self) -> str:
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect()
+            try:
+                counts: dict[str, int] = {}
+                samples = []
+                for status in ("running", "ready", "review", "blocked"):
+                    tasks = _kb.list_tasks(conn, status=status, limit=5, order_by="created-desc")
+                    counts[status] = len(tasks)
+                    for task in tasks[:2]:
+                        title = re.sub(r"^\[YURI intake\]\s*", "", str(getattr(task, "title", "") or "")).strip()
+                        if title:
+                            samples.append((status, title[:80]))
+                total = sum(counts.values())
+                if total <= 0:
+                    return "현재 확인되는 진행 중 작업은 없습니다."
+                parts = []
+                labels = {
+                    "running": "진행 중",
+                    "ready": "대기",
+                    "review": "검토",
+                    "blocked": "막힘",
+                }
+                for key in ("running", "ready", "review", "blocked"):
+                    if counts.get(key):
+                        parts.append(f"{labels[key]} {counts[key]}건")
+                msg = "네, 현재 작업 상태는 " + ", ".join(parts) + "입니다."
+                if samples:
+                    status, title = samples[0]
+                    msg += f" 최근 항목: {title}"
+                return msg
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("Yuri work status lookup failed: %s", exc)
+            return "현재 작업 상태 조회가 바로 되지 않습니다. 잠시 후 다시 확인하겠습니다."
+
+    async def _yuri_progress_status_reply(self, event: MessageEvent) -> Optional[str]:
+        if not self._yuri_platform_is_frontdesk(event=event):
+            return None
+        text = _yuri_clean_shortcut_text(getattr(event, "text", "") or "")
+        if not _yuri_is_work_status_question(text):
+            return None
+        return await asyncio.to_thread(self._yuri_current_work_status)
+
     async def _yuri_fast_lookup_reply(self, event: MessageEvent) -> Optional[str]:
         if not self._yuri_platform_is_frontdesk(event=event):
             return None
@@ -3806,6 +3871,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = intent.text
         lowered = intent.lowered
         tid = self._yuri_requested_tid(text)
+        progress_status = await self._yuri_progress_status_reply(event)
+        if progress_status is not None:
+            return f"{tid}{progress_status}"
         if re.search(r"22대\s*지선", text) and re.search(r"초선|당선", text):
             return (
                 f"{tid}질문 기준이 모호합니다. '22대'는 보통 국회/총선 기준이고, "
@@ -3857,6 +3925,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._yuri_platform_is_frontdesk(event=event) or not self._yuri_is_frontdesk_profile():
             return False
         intent = self._classify_yuri_telegram_intent(event)
+        if _yuri_is_work_status_question(intent.text):
+            return False
         if intent.kind in {"empty", "literal_reply", "path_lookup", "direct_fact", "liveness"}:
             return False
         if len(intent.text) <= 8 and intent.text in {"네", "응", "좋아요", "고마워", "감사", "네 좋아요"}:
@@ -3918,8 +3988,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             task_id = await asyncio.to_thread(_create)
         except Exception as exc:
             logger.exception("Yuri kanban intake failed")
-            return f"접수에 실패했습니다. 기획실 카드 생성 오류: {exc}"
-        return f"접수했습니다. 기획실에서 분배하고 검수 후 가져오겠습니다. ({task_id})"
+            return f"요청을 시작하지 못했습니다. 오류: {exc}"
+        logger.info("Yuri routed actionable Telegram intake to Kanban task %s", task_id)
+        return "확인하겠습니다. 결과는 검수 후 바로 보고드리겠습니다."
 
     def _yuri_secretary_protocol_prompt(self, event: MessageEvent, source: SessionSource) -> str:
         if not self._yuri_platform_is_frontdesk(event=event, source=source) or not self._yuri_is_frontdesk_profile():
