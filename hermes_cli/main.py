@@ -11353,6 +11353,21 @@ def cmd_memory(args):
         limit = max(1, int(getattr(args, "limit", 200) or 200))
         output = getattr(args, "output", None)
         print(build_okf_export_report(query, limit=limit, output_dir=output))
+    elif sub == "learn-report":
+        from gateway.yuri_knowledge_spine import build_learning_report
+
+        query = " ".join(getattr(args, "query", []) or []).strip()
+        limit = max(1, int(getattr(args, "limit", 8) or 8))
+        print(build_learning_report(query, limit=limit))
+    elif sub == "learn-rebuild":
+        from gateway.yuri_knowledge_spine import rebuild_learning_lessons
+
+        limit = max(1, int(getattr(args, "limit", 1000) or 1000))
+        result = rebuild_learning_lessons(limit=limit)
+        print("Yuri learning rebuild")
+        print(f"- lessons_path: {result['lessons_path']}")
+        print(f"- lessons_written: {result['lessons_written']}")
+        print(f"- unique_lessons: {result['unique_lessons']}")
     else:
         from hermes_cli.memory_setup import memory_command
 

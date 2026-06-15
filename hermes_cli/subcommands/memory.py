@@ -90,6 +90,31 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default=None,
         help="Output directory; defaults to the Yuri spine okf_bundle directory",
     )
+    _learn_parser = memory_sub.add_parser(
+        "learn-report",
+        help="Show Yuri review-pass lessons used for future context injection",
+    )
+    _learn_parser.add_argument(
+        "query",
+        nargs="*",
+        help="Optional free-text query; omitted means recent lessons",
+    )
+    _learn_parser.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        help="Maximum lessons to include",
+    )
+    _learn_rebuild_parser = memory_sub.add_parser(
+        "learn-rebuild",
+        help="Backfill Yuri review-pass lessons from existing spine events",
+    )
+    _learn_rebuild_parser.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Maximum spine events to scan",
+    )
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",

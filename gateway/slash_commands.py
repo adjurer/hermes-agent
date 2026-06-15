@@ -2094,6 +2094,21 @@ class GatewaySlashCommandsMixin:
 
             query = " ".join(args[1:]).strip()
             return build_okf_export_report(query, limit=50)
+        if args and args[0] in {"learn-report", "learn"}:
+            from gateway.yuri_knowledge_spine import build_learning_report
+
+            query = " ".join(args[1:]).strip()
+            return build_learning_report(query, limit=8)
+        if args and args[0] == "learn-rebuild":
+            from gateway.yuri_knowledge_spine import rebuild_learning_lessons
+
+            result = rebuild_learning_lessons(limit=1000)
+            return (
+                "Yuri learning rebuild\n"
+                f"- lessons_path: {result['lessons_path']}\n"
+                f"- lessons_written: {result['lessons_written']}\n"
+                f"- unique_lessons: {result['unique_lessons']}"
+            )
         session_key = self._session_key_for_source(event.source)
         config_path = _hermes_home / "config.yaml"
 

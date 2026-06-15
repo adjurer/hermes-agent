@@ -84,3 +84,32 @@ async def test_memory_okf_export_command_returns_yuri_okf_report(tmp_path, monke
     assert "Yuri OKF export" in out
     assert "okf_version: 0.1" in out
     assert "events_exported: 1" in out
+
+
+@pytest.mark.asyncio
+async def test_memory_learn_report_command_returns_lessons(tmp_path, monkeypatch):
+    from gateway import yuri_knowledge_spine as spine
+
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+
+    pack = spine.build_context_pack(
+        original_user_text="코드 오류 원인을 확인하고 수정해주세요.",
+        platform="telegram",
+    )
+    spine.record_intake(pack, task_id="t_learn")
+    spine.record_review_result(
+        root_task_id="t_learn",
+        reviewer_task_id="t_review_learn",
+        approved_final_text="코드 오류는 재현 테스트와 수정 검수를 통과했습니다.",
+        intent_source="telethon",
+        board="telegram-inbox",
+    )
+
+    runner = object.__new__(GatewayRunner)
+    out = await runner._handle_memory_command(
+        _event("/memory learn-report 코드 오류")
+    )
+
+    assert "Yuri learning report" in out
+    assert "t_learn" in out
+    assert "review_status=pass" in out

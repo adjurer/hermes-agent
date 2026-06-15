@@ -24,6 +24,7 @@ from typing import Any, Optional
 SCHEMA_VERSION = "yuri-knowledge-spine-v1"
 GRAPH_SCHEMA_VERSION = "yuri-knowledge-graph-v1"
 OKF_VERSION = "0.1"
+LEARNING_SCHEMA_VERSION = "yuri-learning-v1"
 
 OPERATING_RULES = [
     "Yuri is the front-desk chief of staff, not the sole worker.",
@@ -63,6 +64,10 @@ def _graph_edges_path() -> Path:
 
 def _okf_bundle_path() -> Path:
     return _spine_root() / "okf_bundle"
+
+
+def _lessons_path() -> Path:
+    return _spine_root() / "lessons.jsonl"
 
 
 def _utc_iso(ts: Optional[float] = None) -> str:
@@ -409,6 +414,10 @@ def append_event(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         _append_graph_edges(row)
     except Exception:
         pass
+    try:
+        _derive_learning_from_event(row)
+    except Exception:
+        pass
     return row
 
 
@@ -470,10 +479,32 @@ def recent_graph_edges(limit: int = 50) -> list[dict[str, Any]]:
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_가-힣]{2,}")
+_STOP_TOKENS = {
+    "그리고",
+    "그러면",
+    "그럼",
+    "다시",
+    "한번",
+    "확인",
+    "해주세요",
+    "진행",
+    "적용",
+    "유리",
+    "텔레쏜",
+    "코덱스",
+    "hermes",
+    "yuri",
+}
 
 
 def _tokens(text: str) -> set[str]:
     return {m.group(0).casefold() for m in _TOKEN_RE.finditer(text or "")}
+
+
+def _trigger_terms(text: str, *, limit: int = 12) -> list[str]:
+    terms = [tok for tok in _tokens(text) if tok not in _STOP_TOKENS]
+    terms.sort(key=lambda tok: (-len(tok), tok))
+    return terms[:limit]
 
 
 def _fts_query(text: str) -> str:
@@ -493,6 +524,149 @@ def _row_from_index(row: sqlite3.Row) -> dict[str, Any]:
         "kind": row["kind"],
         "payload": payload,
     }
+
+
+def _find_intake_event_for_task(task_id: str) -> Optional[dict[str, Any]]:
+    if not task_id:
+        return None
+    for row in reversed(_all_events_from_jsonl(limit=1000)):
+        if row.get("kind") != "yuri_intake":
+            continue
+        payload = _event_payload(row)
+        if str(payload.get("task_id") or "") == task_id:
+            return row
+    return None
+
+
+def _lesson_text(lesson: dict[str, Any]) -> str:
+    parts = [
+        lesson.get("user_intent"),
+        lesson.get("approved_final_text"),
+        lesson.get("learning_rule"),
+        " ".join(str(v) for v in lesson.get("trigger_terms") or []),
+    ]
+    return _safe_text("\n".join(str(part) for part in parts if part), limit=6000)
+
+
+def _lesson_from_review(row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    payload = _event_payload(row)
+    root_task_id = _safe_text(payload.get("root_task_id"), limit=120)
+    approved_text = _safe_text(payload.get("approved_final_text"), limit=2400)
+    if not root_task_id or not approved_text:
+        return None
+    intake = _find_intake_event_for_task(root_task_id)
+    intake_payload = _event_payload(intake or {})
+    user_intent = _safe_text(intake_payload.get("original_user_text"), limit=2000)
+    trigger_source = "\n".join([user_intent, approved_text])
+    return {
+        "schema_version": LEARNING_SCHEMA_VERSION,
+        "lesson_id": _stable_hash(
+            root_task_id,
+            payload.get("reviewer_task_id"),
+            approved_text,
+            length=20,
+        ),
+        "created_at": _utc_iso(),
+        "source_event_id": row.get("event_id"),
+        "root_task_id": root_task_id,
+        "reviewer_task_id": _safe_text(payload.get("reviewer_task_id"), limit=120),
+        "intent_source": _safe_text(payload.get("intent_source"), limit=120),
+        "board": _safe_text(payload.get("board"), limit=120),
+        "kind": "review_pass_lesson",
+        "trigger_terms": _trigger_terms(trigger_source),
+        "user_intent": user_intent,
+        "approved_final_text": approved_text,
+        "learning_rule": (
+            "Require review_status=pass before user-facing report. "
+            "For similar Yuri front-desk requests, preserve the Telegram intent, "
+            "route actionable work through planner/office flow, and report only "
+            "the reviewer-approved final result."
+        ),
+    }
+
+
+def _read_lessons(limit: int = 200) -> list[dict[str, Any]]:
+    path = _lessons_path()
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        lesson_id = str(row.get("lesson_id") or "")
+        if lesson_id and lesson_id in seen:
+            continue
+        if lesson_id:
+            seen.add(lesson_id)
+        out.append(row)
+        if len(out) >= max(0, int(limit)):
+            break
+    out.reverse()
+    return out
+
+
+def _append_lesson(lesson: dict[str, Any]) -> None:
+    path = _lessons_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_jsonable(lesson), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _derive_learning_from_event(row: dict[str, Any]) -> None:
+    if row.get("kind") != "review_finalized":
+        return
+    lesson = _lesson_from_review(row)
+    if lesson:
+        _append_lesson(lesson)
+
+
+def rebuild_learning_lessons(*, limit: int = 1000) -> dict[str, Any]:
+    rows = _all_events_from_jsonl(limit=limit)
+    written = 0
+    for row in rows:
+        lesson = _lesson_from_review(row) if row.get("kind") == "review_finalized" else None
+        if lesson:
+            _append_lesson(lesson)
+            written += 1
+    return {
+        "lessons_written": written,
+        "unique_lessons": len(_read_lessons(limit=limit)),
+        "lessons_path": str(_lessons_path()),
+    }
+
+
+def recall_lessons(query: str, *, limit: int = 4) -> list[dict[str, Any]]:
+    query = _safe_text(query, limit=1000)
+    if not query:
+        return _read_lessons(limit=limit)[-limit:]
+    q_tokens = _tokens(query)
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for lesson in _read_lessons(limit=500):
+        score = len(q_tokens & _tokens(_lesson_text(lesson)))
+        if score:
+            scored.append((score, str(lesson.get("created_at") or ""), lesson))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [lesson for _, _, lesson in scored[: int(limit)]]
+
+
+def _summarize_lesson(lesson: dict[str, Any]) -> str:
+    task_id = lesson.get("root_task_id") or "unknown"
+    terms = ", ".join(str(v) for v in (lesson.get("trigger_terms") or [])[:5])
+    text = _safe_text(lesson.get("approved_final_text"), limit=120)
+    rule = _safe_text(lesson.get("learning_rule"), limit=180)
+    return (
+        f"{lesson.get('created_at') or ''} lesson {task_id} terms=[{terms}]: "
+        f"{text} rule={rule}"
+    )
 
 
 def recall_relevant_events(query: str, *, limit: int = 4) -> list[dict[str, Any]]:
@@ -563,8 +737,10 @@ def build_context_pack(
     task_id: Optional[str] = None,
     recent_limit: int = 4,
     relevant_limit: int = 4,
+    lesson_limit: int = 4,
 ) -> dict[str, Any]:
     relevant = recall_relevant_events(original_user_text, limit=relevant_limit)
+    lessons = recall_lessons(original_user_text, limit=lesson_limit)
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_iso(),
@@ -578,6 +754,9 @@ def build_context_pack(
         "review_contract": dict(REVIEW_CONTRACT),
         "relevant_spine_events": [
             _summarize_event(row) for row in relevant
+        ],
+        "learned_patterns": [
+            _summarize_lesson(lesson) for lesson in lessons
         ],
         "recent_spine_events": [
             _summarize_event(row) for row in recent_events(limit=recent_limit)
@@ -610,10 +789,15 @@ def render_context_pack(pack: dict[str, Any]) -> str:
     )
     recent = pack.get("recent_spine_events") or []
     relevant = pack.get("relevant_spine_events") or []
+    learned = pack.get("learned_patterns") or []
     if relevant:
         lines.append("- relevant_spine_events:")
         for item in relevant:
             lines.append(f"  - {_safe_text(item, limit=260)}")
+    if learned:
+        lines.append("- learned_patterns:")
+        for item in learned:
+            lines.append(f"  - {_safe_text(item, limit=300)}")
     if recent:
         lines.append("- recent_spine_events:")
         for item in recent:
@@ -1029,6 +1213,28 @@ def build_okf_export_report(
     return "\n".join(lines)
 
 
+def build_learning_report(query: str = "", *, limit: int = 8) -> str:
+    query = _safe_text(query, limit=500)
+    lessons = recall_lessons(query, limit=limit) if query else _read_lessons(limit=limit)
+    lines = [
+        "Yuri learning report",
+        f"- query: {query or '(recent lessons)'}",
+        f"- lessons_path: {_lessons_path()}",
+        f"- matched_lessons: {len(lessons)}",
+        "- mechanism: review_pass lessons are generated from finalized reviewer-approved Yuri tasks and injected into future context packs.",
+    ]
+    if lessons:
+        lines.append("- lessons:")
+        for lesson in lessons:
+            lines.append(f"  - {_summarize_lesson(lesson)}")
+            rule = _safe_text(lesson.get("learning_rule"), limit=220)
+            if rule:
+                lines.append(f"    - rule: {rule}")
+    else:
+        lines.append("- lessons: none")
+    return "\n".join(lines)
+
+
 def build_audit_report(query: str, *, limit: int = 5) -> str:
     """Return a compact diagnostic report for a Yuri memory/task question."""
     query = _safe_text(query, limit=500)
@@ -1053,6 +1259,14 @@ def build_audit_report(query: str, *, limit: int = 5) -> str:
             lines.append(f"  - {_summarize_event(row)}")
     else:
         lines.append("- relevant_spine_events: none")
+
+    lessons = recall_lessons(query, limit=min(3, limit)) if query else _read_lessons(limit=min(3, limit))
+    if lessons:
+        lines.append("- learned_patterns:")
+        for lesson in lessons:
+            lines.append(f"  - {_summarize_lesson(lesson)}")
+    else:
+        lines.append("- learned_patterns: none")
 
     if not seen_task_ids:
         lines.append("- kanban: no task ids found from query/spine")

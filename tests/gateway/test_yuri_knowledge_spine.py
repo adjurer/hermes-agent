@@ -57,6 +57,23 @@ def test_yuri_knowledge_spine_renders_context_pack_and_records_events(
     assert "HAS_USER_INTENT" in report
     assert "task:t_root" in report
 
+    learned = spine.recall_lessons("코드 오류 원인", limit=3)
+    assert learned
+    assert learned[0]["root_task_id"] == "t_root"
+
+    followup = spine.build_context_pack(
+        original_user_text="코드 오류 원인 다시 확인해주세요.",
+        platform="telegram",
+    )
+    rendered_followup = spine.render_context_pack(followup)
+    assert followup["learned_patterns"]
+    assert "learned_patterns" in rendered_followup
+    assert "review_status=pass" in rendered_followup
+
+    learning_report = spine.build_learning_report("코드 오류", limit=3)
+    assert "Yuri learning report" in learning_report
+    assert "t_root" in learning_report
+
 
 def test_yuri_knowledge_spine_includes_recent_events(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))
