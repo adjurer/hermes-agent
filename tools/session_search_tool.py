@@ -87,21 +87,58 @@ def _resolve_to_parent(db, session_id: str) -> str:
     return cur
 
 
+def _truncate_message_content(
+    content: Any,
+    *,
+    anchor: bool = False,
+    tool_name: Optional[str] = None,
+) -> Any:
+    """Keep session_search useful without injecting whole historical turns.
+
+    Some Telegram follow-up turns were pulling hundreds of thousands of
+    characters from old tool/search results into the next model call.  The
+    caller can still scroll for nearby context, but discovery/browse should be
+    a map, not a transcript dump.
+    """
+    if not isinstance(content, str):
+        return content
+    max_chars = 3500 if anchor else 1800
+    if tool_name:
+        max_chars = min(max_chars, 1200)
+    if len(content) <= max_chars:
+        return content
+    head = max_chars // 2
+    tail = max_chars - head - 90
+    if tail < 0:
+        tail = 0
+    return (
+        content[:head].rstrip()
+        + f"\n… [session_search truncated {len(content) - head - tail:,} chars] …\n"
+        + (content[-tail:].lstrip() if tail else "")
+    )
+
+
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
+    is_anchor = anchor_id is not None and m.get("id") == anchor_id
+    tool_name = m.get("tool_name")
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": _truncate_message_content(
+            m.get("content"),
+            anchor=is_anchor,
+            tool_name=tool_name,
+        ),
         "timestamp": m.get("timestamp"),
     }
-    if m.get("tool_name"):
-        entry["tool_name"] = m.get("tool_name")
+    if tool_name:
+        entry["tool_name"] = tool_name
     if m.get("tool_calls"):
         entry["tool_calls"] = m.get("tool_calls")
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
-    if anchor_id is not None and m.get("id") == anchor_id:
+    if is_anchor:
         entry["anchor"] = True
     # Strip None values to keep payload tight, but always keep content
     # (absent content is meaningful — tool-call-only assistant turns).

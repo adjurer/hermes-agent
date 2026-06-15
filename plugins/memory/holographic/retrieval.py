@@ -520,11 +520,11 @@ class FactRetriever:
         try:
             rows = conn.execute(sql, params).fetchall()
         except Exception:
-            # FTS5 MATCH can fail on malformed queries — fall back to empty
-            return []
+            # FTS5 MATCH can fail on malformed queries — use Korean-friendly fallback.
+            return self._substring_candidates(query, category, min_trust, limit)
 
         if not rows:
-            return []
+            return self._substring_candidates(query, category, min_trust, limit)
 
         # Normalize FTS5 rank: rank is negative, lower = better
         # Convert to positive score in [0, 1] range
@@ -540,6 +540,86 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    def _substring_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Korean-friendly fallback when FTS5 cannot tokenize the query well.
+
+        SQLite FTS5's default tokenizer works well for ASCII whitespace tokens,
+        but Korean memory queries often arrive as short inflected phrases and
+        may also refer to mixed-script names such as "에르메스" vs "Hermes".
+        This fallback intentionally stays conservative: it only reads existing
+        facts, scores substring/alias/character overlap, and returns candidates
+        for the normal reranker to process. It does not write memory.
+        """
+        terms = self._expanded_terms(query)
+        where = ["trust_score >= ?"]
+        params: list = [min_trust]
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        rows = self.store._conn.execute(
+            f"""
+            SELECT fact_id, content, category, tags, trust_score,
+                   retrieval_count, helpful_count, created_at, updated_at,
+                   hrr_vector
+            FROM facts
+            WHERE {" AND ".join(where)}
+            """,
+            params,
+        ).fetchall()
+
+        query_hangul = {c for c in query if "\uac00" <= c <= "\ud7a3"}
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            fact = dict(row)
+            haystack = f"{fact.get('content', '')} {fact.get('tags', '')}".lower()
+            term_hits = sum(1 for term in terms if term and term.lower() in haystack)
+            fact_hangul = {c for c in haystack if "\uac00" <= c <= "\ud7a3"}
+            char_overlap = (
+                len(query_hangul & fact_hangul) / max(len(query_hangul), 1)
+                if query_hangul else 0.0
+            )
+            score = term_hits + char_overlap
+            if score <= 0:
+                continue
+            fact["fts_rank"] = min(1.0, 0.35 + score / max(len(terms), 1))
+            scored.append((score * fact["trust_score"], fact))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [fact for _, fact in scored[:limit]]
+
+    @staticmethod
+    def _expanded_terms(query: str) -> list[str]:
+        aliases = {
+            "에르메스": ["Hermes", "hermes"],
+            "헤르메스": ["Hermes", "hermes"],
+            "기억": ["memory", "MEMORY.md", "USER.md", "fact_store"],
+            "보호": ["보존", "수정하지", "덮어쓰지"],
+            "파일": ["전송", "산출물"],
+            "보낼": ["전송", "산출물"],
+            "그래프": ["대시보드", "레이어"],
+            "목표": ["핵심", "돕는"],
+            "칸반": ["kanban", "위임", "서브에이전트"],
+            "회수": ["회수", "완료", "검증"],
+            "비밀번호": ["계정", "토큰", "API", "secret"],
+            "토큰": ["비밀번호", "API", "secret"],
+            "보고": ["중간보고", "상태", "다음 조치"],
+            "톤": ["짧게", "선호"],
+        }
+        raw_terms = [t.strip(".,;:!?\"'()[]{}#@<>") for t in query.split()]
+        terms: list[str] = []
+        for term in raw_terms:
+            if len(term) < 2:
+                continue
+            terms.append(term)
+            terms.extend(aliases.get(term, []))
+        return list(dict.fromkeys(terms))
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:

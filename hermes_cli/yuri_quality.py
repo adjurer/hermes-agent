@@ -56,8 +56,9 @@ SIMPLE_CHECK_RE = re.compile(
 )
 
 ORCHESTRATION_CLAIM_RE = re.compile(
-    r"(이관하겠습니다|배정하겠습니다|넘기겠습니다|라우팅하겠습니다|"
-    r"(운영|기획|조사|문서|검증|작성)팀에\s*(?:이관|배정|넘기))"
+    r"(이관하겠습니다|배정하겠습니다|넘기겠습니다|라우팅하겠습니다|맡기겠습니다|"
+    r"일로\s*보겠습니다|업무로\s*보겠습니다|"
+    r"(운영|기획|조사|문서|검증|작성)팀에\s*(?:이관|배정|넘기|맡기))"
 )
 
 WORKER_COMPLETE_RE = re.compile(
@@ -191,7 +192,7 @@ def scan_messages(messages: Iterable[Mapping[str, Any]], *, context_window: int 
                     severity="medium",
                     message_id=mid,
                     summary="간단 진단/정확 응답 요청을 서브에이전트 업무처럼 라우팅했습니다.",
-                    recommendation="건강 확인, OK-only, 가능 여부 질문은 직접 짧게 답하고 실제 다단계 업무만 Kanban/subagent로 보냅니다.",
+                    recommendation="건강 확인, OK-only, 가능 여부 질문은 직접 짧게 답하고 확인/분석/수정/생성/검증 같은 업무성 요청은 Kanban/planner-first로 보냅니다.",
                 ))
             elif not SPECIFIC_INTERPRETATION_RE.search(text) and len(text.strip()) < 80:
                 issues.append(QualityIssue(

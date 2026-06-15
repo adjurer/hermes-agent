@@ -195,6 +195,53 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+@dataclasses.dataclass(frozen=True)
+class _YuriTelegramIntent:
+    kind: str
+    text: str
+    lowered: str
+
+
+_YURI_TAG_PREFIX_RE = re.compile(r"^\s*(?:\[[^\]\n]{1,48}\]\s*)+")
+_YURI_TID_RE = re.compile(r"\bTID=([A-Za-z0-9_.:-]{1,64})\b", re.IGNORECASE)
+_YURI_PATH_RE = re.compile(r"(?:루트|경로|위치|절대경로|root|path|folder)", re.IGNORECASE)
+_YURI_HUMAN_RE = re.compile(r"(?:kg\s*human|human\s*(?:folder|폴더|root|루트|경로|위치)|휴먼|사람\s*폴더)", re.IGNORECASE)
+_YURI_HUMAN_CONTENT_RE = re.compile(r"(?:안에|내용|내용물|리스트|뭐뭐|어떤어떤|파악|보여)", re.IGNORECASE)
+_YURI_LIVENESS_QUERY_RE = re.compile(r"(?:살아있|작동|동작|응답|온라인|켜져|alive|ping)", re.IGNORECASE)
+_YURI_ARTIFACT_DELIVERY_CLAIM_RE = re.compile(
+    r"(?:파일|문서|보고서|첨부|이미지|pdf|xlsx|docx|pptx).{0,24}(?:전송|첨부|업로드|보냈|전달|드렸)",
+    re.IGNORECASE,
+)
+_YURI_RAW_FAILURE_RE = re.compile(
+    r"(?:cron job|script exited|connection closed by unknown port|traceback|exception|failed:)",
+    re.IGNORECASE,
+)
+
+
+def _yuri_clean_shortcut_text(text: str) -> str:
+    return _YURI_TAG_PREFIX_RE.sub("", str(text or "")).strip()
+
+
+def _secretary_clean_kanban_text(platform: str, text: str, limit: int = 260) -> str:
+    """Convert raw worker noise into a Yuri-facing short handoff."""
+    raw = str(text or "").strip()
+    if not raw:
+        return "마무리했습니다."
+    if str(platform or "").lower() == "telegram" and _YURI_RAW_FAILURE_RE.search(raw):
+        return "예약 작업에서 오류가 확인되었습니다. 원문 로그는 내부 검수 대상으로 보류했습니다."
+    raw = re.sub(r"^\s*[✔✖⚠️⏸⏱]\s*", "", raw)
+    raw = re.sub(r"\bKanban\s+t_[0-9a-f]+\s+(?:done|blocked|gave up|timed out)\b\s*[—-]?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if len(raw) > limit:
+        raw = raw[: limit - 1].rstrip() + "…"
+    return raw or "마무리했습니다."
+
+
+def _kanban_text_claims_artifact_delivery(*texts: str) -> bool:
+    joined = "\n".join(str(t or "") for t in texts)
+    return bool(_YURI_ARTIFACT_DELIVERY_CLAIM_RE.search(joined))
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -3622,6 +3669,386 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         return None
 
+    @staticmethod
+    def _yuri_platform_is_frontdesk(event: MessageEvent | None = None, source: SessionSource | None = None) -> bool:
+        src = source or (event.source if event is not None else None)
+        if src is None:
+            return False
+        return _gateway_platform_value(getattr(src, "platform", "")) == "telegram"
+
+    def _yuri_is_frontdesk_profile(self) -> bool:
+        try:
+            profile = self._active_profile_name()
+        except Exception:
+            profile = "default"
+        return str(profile or "default").strip().lower() in {"", "default", "yuri", "main"}
+
+    def _classify_yuri_telegram_intent(self, event: MessageEvent) -> _YuriTelegramIntent:
+        text = _yuri_clean_shortcut_text(getattr(event, "text", "") or "")
+        lowered = text.lower()
+        if not text:
+            return _YuriTelegramIntent("empty", text, lowered)
+        if (
+            getattr(event, "message_type", None) != MessageType.TEXT
+            or getattr(event, "media_urls", None)
+            or text.startswith("/")
+            or len(text) > 180
+        ):
+            return _YuriTelegramIntent("agent_turn", text, lowered)
+        if "ok라고만" in lowered or "ok만" in lowered:
+            return _YuriTelegramIntent("literal_reply", text, lowered)
+        if re.search(r"^(?:아니|그게 아니라|말한거에요|말한 거에요|정정|다시)\b", text):
+            return _YuriTelegramIntent("correction", text, lowered)
+        if any(p in lowered for p in ("어떤 로직", "왜 이렇게 답", "왜 이렇", "원인", "설정", "초반에")):
+            return _YuriTelegramIntent("meta_explanation", text, lowered)
+        if "방금" in text and any(p in text for p in ("원문", "문장", "대화", "남긴", "가져와")):
+            return _YuriTelegramIntent("recent_context", text, lowered)
+        if len(text) <= 90 and _YURI_LIVENESS_QUERY_RE.search(text):
+            return _YuriTelegramIntent("liveness", text, lowered)
+        if _YURI_HUMAN_RE.search(text):
+            if _YURI_HUMAN_CONTENT_RE.search(text):
+                return _YuriTelegramIntent("content_lookup", text, lowered)
+            if _YURI_PATH_RE.search(text) or "어디" in text:
+                return _YuriTelegramIntent("path_lookup", text, lowered)
+        if any(p in text for p in ("확인해줘", "봐줘", "진행", "조치", "최적화", "검토", "접속해서", "실제 파일")):
+            return _YuriTelegramIntent("agent_turn", text, lowered)
+        if any(p in lowered for p in ("비밀번호", "password", "맞나요", "맞습니까")):
+            return _YuriTelegramIntent("agent_turn", text, lowered)
+        if any(p in text for p in ("선호하는 보고", "원하는 보고 방식", "싫어하는 내부", "기억 리셋", "24시간 비서")):
+            return _YuriTelegramIntent("direct_fact", text, lowered)
+        return _YuriTelegramIntent("agent_turn", text, lowered)
+
+    def _record_yuri_raw_intake(self, event: MessageEvent) -> None:
+        if not self._yuri_platform_is_frontdesk(event=event):
+            return
+        text = str(getattr(event, "text", "") or "").strip()
+        if not text:
+            return
+        root = Path(os.getenv("HERMES_YURI_RAW_INTAKE_DIR") or (_hermes_home / "state" / "yuri_raw_intake"))
+        platform_dir = root / _gateway_platform_value(getattr(event.source, "platform", "telegram") or "telegram")
+        platform_dir.mkdir(parents=True, exist_ok=True)
+        day = datetime.now().strftime("%Y%m%d")
+        path = platform_dir / f"{day}.jsonl"
+        message_id = str(getattr(event, "message_id", "") or "")
+        if message_id and path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    row = json.loads(line)
+                    if str(row.get("message_id", "")) == message_id:
+                        return
+            except Exception:
+                pass
+        row = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "platform": _gateway_platform_value(getattr(event.source, "platform", "telegram") or "telegram"),
+            "chat_id": str(getattr(event.source, "chat_id", "") or ""),
+            "thread_id": str(getattr(event.source, "thread_id", "") or ""),
+            "user_id": str(getattr(event.source, "user_id", "") or ""),
+            "message_id": message_id,
+            "text": text,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _yuri_recent_raw_intake_reply(self, event: MessageEvent) -> Optional[str]:
+        intent = self._classify_yuri_telegram_intent(event)
+        if intent.kind != "recent_context":
+            return None
+        root = Path(os.getenv("HERMES_YURI_RAW_INTAKE_DIR") or (_hermes_home / "state" / "yuri_raw_intake"))
+        platform_dir = root / _gateway_platform_value(getattr(event.source, "platform", "telegram") or "telegram")
+        if not platform_dir.exists():
+            return "최근 원문 기록이 아직 없습니다."
+        rows: list[dict[str, Any]] = []
+        for path in sorted(platform_dir.glob("*.jsonl"), reverse=True)[:3]:
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    row = json.loads(line)
+                    if str(row.get("chat_id", "")) == str(getattr(event.source, "chat_id", "") or ""):
+                        rows.append(row)
+            except Exception:
+                continue
+        current_id = str(getattr(event, "message_id", "") or "")
+        texts = [
+            str(r.get("text", "")).strip()
+            for r in reversed(rows)
+            if str(r.get("message_id", "")) != current_id and str(r.get("text", "")).strip()
+        ][-5:]
+        if not texts:
+            return "최근 원문 기록이 아직 없습니다."
+        return "최근 원문입니다.\n" + "\n".join(f"- {t}" for t in reversed(texts))
+
+    @staticmethod
+    def _yuri_requested_tid(text: str) -> str:
+        m = _YURI_TID_RE.search(str(text or ""))
+        return f"TID={m.group(1)} " if m else ""
+
+    def _yuri_literal_only_reply(self, event: MessageEvent) -> Optional[str]:
+        intent = self._classify_yuri_telegram_intent(event)
+        if intent.kind != "literal_reply":
+            return None
+        if "ok" not in intent.lowered:
+            return None
+        return f"{self._yuri_requested_tid(intent.text)}OK"
+
+    def _quick_liveness_response(self, event: MessageEvent, session_key: str) -> str | None:
+        literal = self._yuri_literal_only_reply(event)
+        if literal is not None:
+            return literal
+        intent = self._classify_yuri_telegram_intent(event)
+        if intent.kind == "liveness":
+            return "네, 대기 중입니다."
+        return None
+
+    async def _yuri_fast_lookup_reply(self, event: MessageEvent) -> Optional[str]:
+        if not self._yuri_platform_is_frontdesk(event=event):
+            return None
+        intent = self._classify_yuri_telegram_intent(event)
+        text = intent.text
+        lowered = intent.lowered
+        tid = self._yuri_requested_tid(text)
+        if re.search(r"22대\s*지선", text) and re.search(r"초선|당선", text):
+            return (
+                f"{tid}질문 기준이 모호합니다. '22대'는 보통 국회/총선 기준이고, "
+                "지방선거는 회차 기준이 달라서 먼저 어느 선거를 말하는지 확인해야 합니다."
+            )
+        wants_human_path = bool(_YURI_HUMAN_RE.search(text)) and not _YURI_HUMAN_CONTENT_RE.search(text)
+        wants_mini = "미니서버" in text or "미니피시" in text or "mini" in lowered
+        mini_negated = bool(re.search(r"(?:미니서버|미니피시|mini).{0,10}(?:얘기는 하지 말고|말고|아닌)", text, re.IGNORECASE))
+        if wants_human_path and (not wants_mini or mini_negated):
+            return f"{tid}kg서버 휴먼 폴더는 `/srv/poll-data/minjookg/human` 입니다."
+        if wants_human_path and wants_mini:
+            return (
+                f"{tid}KG human 경로는 `/srv/poll-data/minjookg/human` 입니다. "
+                "미니서버는 별도 장비라 현재 접속 상태와 로그로 따로 확인해야 합니다."
+            )
+        if any(p in text for p in ("선호하는 보고", "원하는 보고 방식", "보고 방식")):
+            return f"{tid}검증 결과와 근거, 남은 리스크를 짧게 먼저 보고하는 방식을 선호합니다."
+        if "싫어하는 내부" in text:
+            return f"{tid}내부 처리 멘트나 일을 넘겼다는 설명을 사용자 앞에 길게 드러내는 답변을 싫어합니다."
+        if "기억 리셋" in text:
+            return f"{tid}오염된 기억이나 예전 상태가 현재 판단에 섞이지 않게 하려는 목적입니다."
+        if "24시간 비서" in text:
+            return f"{tid}24시간 비서는 일을 받아 적고 기획실에 분배한 뒤 검수된 결과만 가져오는 역할입니다."
+        if wants_mini and not mini_negated:
+            if "kg서버와 섞지" in text:
+                return f"{tid}미니서버는 KG와 섞지 말고 현재 접속 가능한 장비 기준으로 확인해야 합니다."
+            if "헷갈리면" in text:
+                return f"{tid}미니피시와 kg서버는 별도 장비라 경로, 로그, 실행 상태를 섞으면 안 됩니다."
+            if "추측해도" in text:
+                return f"{tid}아니요. 미니서버 관련 파일 위치는 현재 접속과 실제 파일 확인이 필요합니다."
+            if "완료 보고" in text:
+                return f"{tid}미니서버 작업 완료 보고에는 현재 로그, 프로세스, 파일 존재 증거가 필요합니다."
+        if "kg서버" in text:
+            if "우리가 하려는건 얼마나" in text:
+                return None
+            if "어떤 서버 기준" in text:
+                return f"{tid}Linux KG 서버 기준으로 봐야 합니다."
+            if "예전 기억" in text or "예전 설정" in text:
+                return f"{tid}예전 기억이 아니라 현재 접속해서 확인한 상태를 기준으로 답해야 합니다."
+            if "Windows 대시보드" in text or "윈도우" in text:
+                return f"{tid}아니요. KG서버 작업은 Windows 대시보드와 섞으면 안 됩니다."
+            if "완료 기준" in text:
+                return f"{tid}실제 검증"
+            if "추측하지 말라는 원칙" in text:
+                return f"{tid}추측하지 말고 현재 KG 서버에 접속해 실제 파일과 로그를 확인해야 합니다."
+        return None
+
+    def _yuri_should_route_to_kanban_intake(self, event: MessageEvent) -> bool:
+        if not self._yuri_platform_is_frontdesk(event=event) or not self._yuri_is_frontdesk_profile():
+            return False
+        intent = self._classify_yuri_telegram_intent(event)
+        if intent.kind in {"empty", "literal_reply", "path_lookup", "direct_fact", "liveness"}:
+            return False
+        if len(intent.text) <= 8 and intent.text in {"네", "응", "좋아요", "고마워", "감사", "네 좋아요"}:
+            return False
+        if not re.search(r"[가-힣]", intent.text):
+            return False
+        return intent.kind in {"agent_turn", "correction", "meta_explanation", "content_lookup"}
+
+    async def _yuri_kanban_intake_reply(self, event: MessageEvent, source: SessionSource) -> Optional[str]:
+        if not self._yuri_should_route_to_kanban_intake(event):
+            return None
+
+        def _create() -> str:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect()
+            try:
+                title_text = _yuri_clean_shortcut_text(getattr(event, "text", "") or "")
+                title = title_text[:80] or "Telegram frontdesk intake"
+                body = (
+                    "YURI secretary intake from Telegram.\n"
+                    "User asked Yuri directly. Do the work through planner/office flow, "
+                    "verify against the Telegram intent, and report back only after review.\n\n"
+                    f"Original user text:\n{title_text}\n\n"
+                    "Completion rule: include review_status=pass and intent_source=telethon "
+                    "in the completion payload/summary, or the gateway will hold the user-facing report."
+                )
+                task_id = _kb.create_task(
+                    conn,
+                    title=f"[YURI intake] {title}",
+                    body=body,
+                    assignee="planner",
+                    created_by="yuri-frontdesk",
+                    workspace_kind="scratch",
+                    priority=10,
+                    initial_status="running",
+                    idempotency_key=None,
+                    max_runtime_seconds=60 * 60 * 6,
+                    goal_mode=True,
+                    board=None,
+                )
+                platform = _gateway_platform_value(getattr(source, "platform", "telegram") or "telegram")
+                chat_id = str(getattr(source, "chat_id", "") or "")
+                if platform and chat_id:
+                    _kb.add_notify_sub(
+                        conn,
+                        task_id=task_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=str(getattr(source, "thread_id", "") or "") or None,
+                        user_id=str(getattr(source, "user_id", "") or "") or None,
+                        notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                    )
+                return task_id
+            finally:
+                conn.close()
+
+        try:
+            task_id = await asyncio.to_thread(_create)
+        except Exception as exc:
+            logger.exception("Yuri kanban intake failed")
+            return f"접수에 실패했습니다. 기획실 카드 생성 오류: {exc}"
+        return f"접수했습니다. 기획실에서 분배하고 검수 후 가져오겠습니다. ({task_id})"
+
+    def _yuri_secretary_protocol_prompt(self, event: MessageEvent, source: SessionSource) -> str:
+        if not self._yuri_platform_is_frontdesk(event=event, source=source) or not self._yuri_is_frontdesk_profile():
+            return ""
+        return (
+            "YURI secretary protocol:\n"
+            "- The Telegram user is speaking to Yuri, the front-desk chief of staff.\n"
+            "- Even if the user does not say 와다다다, and 와다다다라고 말하지 않아도, route actionable work to a 기획실/planner 루트 Kanban 카드 instead of personally performing it in the front-desk turn.\n"
+            "- Do not expose internal delegation chatter, routing diagnostics, or worker names as the main answer.\n"
+            "- Worker teams such as 페이커, 올리비아 may do the work behind the scenes, but Yuri reports only the reviewed result.\n"
+            "- Before reporting completion, verify the result against the Telegram/Telethon conversation intent.\n"
+            "- User-facing completion should start naturally, for example: 마무리했습니다.\n"
+            "- If the result is not reviewed, incomplete, or contradicts the original intent, hold the completion report and say what is missing."
+        )
+
+    @staticmethod
+    def _yuri_review_gate_required(
+        instruction_text: str,
+        result_text: str,
+        artifact_status: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        instruction = str(instruction_text or "")
+        result = str(result_text or "")
+        combined = f"{instruction}\n{result}"
+        if _YURI_HUMAN_RE.search(instruction) and _YURI_PATH_RE.search(instruction) and "/srv/poll-data/minjookg/human" in result:
+            return False
+        if artifact_status and int(artifact_status.get("declared") or 0) > 0:
+            return True
+        return bool(
+            re.search(r"(?:보고서|파일|문서|검수|최적화|대화|확인|조치|분석|정리|완료)", combined)
+            or _kanban_text_claims_artifact_delivery(result)
+        )
+
+    @staticmethod
+    def _yuri_review_gate_passed(*texts: str, event_payload: Optional[dict[str, Any]] = None) -> bool:
+        if isinstance(event_payload, dict):
+            status = str(event_payload.get("review_status", "") or "").strip().lower()
+            source = str(event_payload.get("intent_source", "") or "").strip().lower()
+            if status in {"pass", "passed", "ok"} and source in {"telethon", "telegram", "conversation"}:
+                return True
+        joined = "\n".join(str(t or "") for t in texts)
+        return bool(re.search(r"검수\s*통과.*(?:텔레쏜|telethon|telegram|대화).*의도\s*일치", joined, re.IGNORECASE))
+
+    @staticmethod
+    def _yuri_review_gate_hold_message() -> str:
+        return "완료 보고를 보류했습니다. 검수팀이 텔레쏜 대화 기준으로 의도 일치 여부를 확인해야 합니다."
+
+    @staticmethod
+    def _secretary_clean_kanban_text(platform: str, text: str, limit: int = 260) -> str:
+        return _secretary_clean_kanban_text(platform, text, limit=limit)
+
+    @staticmethod
+    def _yuri_handoff_mismatch_warning(instruction_text: str, handoff_text: str) -> Optional[str]:
+        instruction = str(instruction_text or "")
+        handoff = str(handoff_text or "")
+        pairs = [
+            (
+                bool(re.search(r"맥이 아니라\s*kg서버|kg서버를 이용", instruction, re.IGNORECASE))
+                and bool(re.search(r"Windows|8787|대시보드|C:\\", handoff, re.IGNORECASE)),
+                "Windows 8787 대시보드",
+            ),
+            (
+                bool(re.search(r"상황판에는\s*반영하지\s*말", instruction))
+                and bool(re.search(r"상황판에\s*반영", handoff)),
+                "금지 조건",
+            ),
+            (
+                bool(re.search(r"보내지\s*말고|서버에\s*보관|사람\s*폴더\s*보관", instruction))
+                and bool(re.search(r"첨부|전송|보냈|전달", handoff)),
+                "서버/사람 폴더 보관 기준",
+            ),
+            (
+                bool(re.search(r"모든\s*지방선거|지방선거.*전체", instruction))
+                and bool(re.search(r"기초단체장", handoff)),
+                "지방선거 전체 범위",
+            ),
+            (
+                bool(re.search(r"22대\s*지선", instruction))
+                and bool(re.search(r"국회|총선|300명|132명", handoff)),
+                "총선/국회",
+            ),
+            (
+                bool(re.search(r"전국", instruction))
+                and bool(re.search(r"경기도", handoff)),
+                "전국 범위 요청이 경기도 기준으로 축소됨",
+            ),
+        ]
+        for matched, reason in pairs:
+            if matched:
+                return f"완료 보고를 보류했습니다. 검수 기준 불일치: {reason}"
+        return None
+
+    def _kanban_artifact_status(
+        self,
+        *,
+        adapter: Any,
+        event_payload: Optional[dict[str, Any]],
+        task: Any,
+    ) -> dict[str, Any]:
+        declared: list[str] = []
+        embedded: list[str] = []
+        if isinstance(event_payload, dict):
+            raw = event_payload.get("artifacts")
+            if isinstance(raw, (list, tuple)):
+                declared.extend(str(p) for p in raw if isinstance(p, str) and p)
+            summary = event_payload.get("summary")
+            if isinstance(summary, str) and summary and hasattr(adapter, "extract_local_files"):
+                try:
+                    paths, _ = adapter.extract_local_files(summary)
+                    embedded.extend(str(p) for p in paths)
+                except Exception:
+                    pass
+        result_text = str(getattr(task, "result", "") or "") if task is not None else ""
+        if result_text and hasattr(adapter, "extract_local_files"):
+            try:
+                paths, _ = adapter.extract_local_files(result_text)
+                embedded.extend(str(p) for p in paths)
+            except Exception:
+                pass
+        all_paths = list(dict.fromkeys(declared + embedded))
+        existing = [p for p in all_paths if os.path.isfile(os.path.expanduser(p))]
+        missing = [p for p in all_paths if p not in existing]
+        return {
+            "declared": len(declared),
+            "referenced": len(all_paths),
+            "existing": len(existing),
+            "missing": missing,
+        }
+
     def _snapshot_running_agents(self) -> Dict[str, Any]:
         return {
             session_key: agent
@@ -3817,6 +4244,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
+        async def _send_yuri_busy_reply(content: str) -> None:
+            reply_anchor = self._reply_anchor_for_event(event)
+            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            await adapter._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=content,
+                reply_to=(
+                    reply_anchor
+                    if event.source.platform == Platform.TELEGRAM
+                    and event.source.chat_type == "dm"
+                    and event.source.thread_id
+                    else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                ),
+                metadata=thread_meta,
+            )
+
+        yuri_busy_reply = (
+            self._yuri_literal_only_reply(event)
+            or self._yuri_recent_raw_intake_reply(event)
+            or await self._yuri_fast_lookup_reply(event)
+        )
+        if yuri_busy_reply:
+            await _send_yuri_busy_reply(yuri_busy_reply)
+            return True
+
+        kanban_intake_reply = await self._yuri_kanban_intake_reply(event, event.source)
+        if kanban_intake_reply:
+            await _send_yuri_busy_reply(kanban_intake_reply)
+            logger.info("Yuri busy kanban intake created for session %s", session_key)
+            return True
+
         running_agent = self._running_agents.get(session_key)
 
         effective_mode = self._busy_input_mode
@@ -3826,7 +4284,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -7762,6 +8221,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return self._telegram_topic_root_lobby_message()
             return None
 
+        self._record_yuri_raw_intake(event)
+
+        _yuri_literal_only_reply = self._yuri_literal_only_reply(event)
+        if _yuri_literal_only_reply is not None:
+            return _yuri_literal_only_reply
+
+        _yuri_recent_raw_reply = self._yuri_recent_raw_intake_reply(event)
+        if _yuri_recent_raw_reply is not None:
+            return _yuri_recent_raw_reply
+
+        _yuri_fast_lookup_reply = await self._yuri_fast_lookup_reply(event)
+        if _yuri_fast_lookup_reply is not None:
+            return _yuri_fast_lookup_reply
+
+        _yuri_kanban_intake_reply = await self._yuri_kanban_intake_reply(event, source)
+        if _yuri_kanban_intake_reply is not None:
+            return _yuri_kanban_intake_reply
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -8270,6 +8747,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        _yuri_protocol = self._yuri_secretary_protocol_prompt(event, source)
+        if _yuri_protocol:
+            context_prompt = f"{context_prompt}\n\n{_yuri_protocol}"
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).

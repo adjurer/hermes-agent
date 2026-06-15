@@ -405,7 +405,16 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _migrate_legacy_store(base)
 
     if (store / "HEAD").exists():
-        return None
+        ok, _, _ = _run_git(["rev-parse", "--git-dir"], store, str(base),
+                            allowed_returncodes={128})
+        if ok:
+            return None
+        corrupt = base / f"{_STORE_DIRNAME}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            shutil.move(str(store), str(corrupt))
+            logger.warning("Archived corrupt checkpoint store at %s", corrupt)
+        except OSError as exc:
+            return f"Could not archive corrupt checkpoint store: {exc}"
 
     store.mkdir(parents=True, exist_ok=True)
     (store / _INDEXES_DIRNAME).mkdir(exist_ok=True)

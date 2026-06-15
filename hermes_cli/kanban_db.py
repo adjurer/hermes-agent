@@ -2996,7 +2996,19 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "JOIN tasks c ON c.id = l.child_id "
+            "WHERE l.child_id = ? "
+            "  AND p.status NOT IN ('done', 'archived') "
+            "  AND NOT ("
+            "    c.assignee = 'reviewer' "
+            "    AND p.status = 'blocked' "
+            "    AND COALESCE(("
+            "      SELECT e.payload FROM task_events e "
+            "       WHERE e.task_id = p.id AND e.kind = 'blocked' "
+            "       ORDER BY e.id DESC LIMIT 1"
+            "    ), '') LIKE '%review-required:%'"
+            "  ) "
+            "LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -7004,6 +7016,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    lines.append("")
+
+    lines.append("## Work handoff contract")
+    lines.append(
+        "- Before acting, silently restate the task as: goal, constraints, "
+        "expected artifact, verification method, and first concrete step."
+    )
+    lines.append(
+        "- Do not mark the task done from intent alone. Verify the main result "
+        "with at least one concrete handle: file path exists, content readback, "
+        "test output, URL/HTTP status, dashboard/browser check, or command output."
+    )
+    lines.append(
+        "- Completion summary must be short and structured: what changed, where "
+        "it changed, verification performed, and remaining risk. If verification "
+        "is impossible, block with evidence instead of claiming completion."
+    )
     lines.append("")
 
     if task.body and task.body.strip():

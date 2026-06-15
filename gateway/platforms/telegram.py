@@ -5790,7 +5790,10 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        if self._should_batch_text_event(event):
+            self._enqueue_text_event(event)
+            return
+        await self.handle_message(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -5865,6 +5868,13 @@ class TelegramAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+
+    def _should_batch_text_event(self, event: MessageEvent) -> bool:
+        """Only debounce likely Telegram split chunks, not independent short tasks."""
+        key = self._text_batch_key(event)
+        if key in self._pending_text_batches:
+            return True
+        return len(event.text or "") >= self._SPLIT_THRESHOLD
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -6611,6 +6621,15 @@ class TelegramAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _reaction_from_env(name: str, default: Optional[str]) -> Optional[str]:
+        """Return a configured reaction emoji, treating blank as the default."""
+        value = os.getenv(name)
+        if value is None:
+            return default
+        value = value.strip()
+        return value if value else default
+
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
         if not self._bot:
@@ -6625,6 +6644,22 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, e)
             return False
+
+    async def _set_reaction_with_fallback(
+        self,
+        chat_id: str,
+        message_id: str,
+        emoji: Optional[str],
+        fallback: Optional[str],
+    ) -> bool:
+        """Set a configured reaction, retrying with a known-safe fallback."""
+        if emoji is None:
+            return await self._clear_reactions(chat_id, message_id)
+        if await self._set_reaction(chat_id, message_id, emoji):
+            return True
+        if fallback and fallback != emoji:
+            return await self._set_reaction(chat_id, message_id, fallback)
+        return False
 
     async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
         """Clear all reactions from a Telegram message.
@@ -6654,7 +6689,12 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            await self._set_reaction_with_fallback(
+                chat_id,
+                message_id,
+                self._reaction_from_env("TELEGRAM_REACTION_START", "\U0001f440"),
+                "\U0001f440",
+            )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
@@ -6677,9 +6717,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
-        else:
-            await self._set_reaction(
+        elif outcome == ProcessingOutcome.SUCCESS:
+            await self._set_reaction_with_fallback(
                 chat_id,
                 message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
+                self._reaction_from_env("TELEGRAM_REACTION_SUCCESS", "\U0001f525"),
+                "\U0001f44d",
             )
+        else:
+            failure_reaction = self._reaction_from_env("TELEGRAM_REACTION_FAILURE", None)
+            if failure_reaction is None:
+                await self._clear_reactions(chat_id, message_id)
+            else:
+                await self._set_reaction_with_fallback(
+                    chat_id,
+                    message_id,
+                    failure_reaction,
+                    "\U0001f44e",
+                )

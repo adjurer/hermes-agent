@@ -354,6 +354,27 @@ def test_config_bridges_telegram_reactions(monkeypatch, tmp_path):
     assert os.getenv("TELEGRAM_REACTION_FAILURE") == ""
 
 
+def test_config_false_disables_telegram_reactions(monkeypatch, tmp_path):
+    """telegram.reactions=false must disable start/success lifecycle alerts."""
+    import yaml
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.dump({
+        "telegram": {
+            "reactions": False,
+        },
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "")
+
+    from gateway.config import load_gateway_config
+    load_gateway_config()
+
+    import os
+    assert os.getenv("TELEGRAM_REACTIONS") == "false"
+    adapter = _make_adapter()
+    assert adapter._reactions_enabled() is False
+
+
 def test_config_reactions_env_takes_precedence(monkeypatch, tmp_path):
     """Env var should take precedence over config.yaml for reactions."""
     import yaml

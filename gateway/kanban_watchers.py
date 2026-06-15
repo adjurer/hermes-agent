@@ -242,6 +242,7 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        deliver_artifacts = True
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -260,10 +261,71 @@ class GatewayKanbanWatchersMixin:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                            handoff_text = handoff.strip()
+                            task_instruction_text = "\n".join(
+                                part
+                                for part in [
+                                    str(getattr(task, "title", "") or ""),
+                                    str(getattr(task, "body", "") or ""),
+                                ]
+                                if part
                             )
+                            result_text = "\n".join(
+                                part
+                                for part in [
+                                    payload_summary or "",
+                                    str(getattr(task, "result", "") or "") if task else "",
+                                ]
+                                if part
+                            )
+                            if platform_str == "telegram":
+                                mismatch_msg = self._yuri_handoff_mismatch_warning(
+                                    task_instruction_text,
+                                    result_text or handoff_text,
+                                )
+                                if mismatch_msg:
+                                    msg = mismatch_msg
+                                    deliver_artifacts = False
+                                    logger.warning(
+                                        "Yuri completion guard held %s: %s",
+                                        sub["task_id"], mismatch_msg,
+                                    )
+                                else:
+                                    try:
+                                        artifact_status = self._kanban_artifact_status(
+                                            adapter=adapter,
+                                            event_payload=getattr(ev, "payload", None),
+                                            task=task,
+                                        )
+                                    except Exception:
+                                        artifact_status = None
+                                    if (
+                                        self._yuri_review_gate_required(
+                                            task_instruction_text,
+                                            result_text or handoff_text,
+                                            artifact_status=artifact_status,
+                                        )
+                                        and not self._yuri_review_gate_passed(
+                                            payload_summary or "",
+                                            str(getattr(task, "result", "") or "") if task else "",
+                                            handoff_text,
+                                            event_payload=getattr(ev, "payload", None),
+                                        )
+                                    ):
+                                        msg = self._yuri_review_gate_hold_message()
+                                        deliver_artifacts = False
+                                        logger.warning(
+                                            "Yuri review gate held completion for %s",
+                                            sub["task_id"],
+                                        )
+                                    else:
+                                        clean = self._secretary_clean_kanban_text(platform_str, handoff_text or result_text or title)
+                                        msg = f"마무리했습니다.\n{clean}" if clean else "마무리했습니다."
+                            else:
+                                msg = (
+                                    f"✔ {tag}Kanban {sub['task_id']} done"
+                                    f" — {title}{handoff}"
+                                )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
@@ -316,7 +378,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and deliver_artifacts:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
