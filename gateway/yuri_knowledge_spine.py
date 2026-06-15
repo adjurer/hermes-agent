@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -48,6 +50,10 @@ def _events_path() -> Path:
     return _spine_root() / "events.jsonl"
 
 
+def _db_path() -> Path:
+    return _spine_root() / "spine.db"
+
+
 def _utc_iso(ts: Optional[float] = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts or time.time()))
 
@@ -71,6 +77,109 @@ def _jsonable(value: Any) -> Any:
         return str(value)
 
 
+def _payload_text(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "original_user_text",
+        "approved_final_text",
+        "intent_source",
+        "board",
+        "task_id",
+        "root_task_id",
+        "reviewer_task_id",
+    ):
+        val = payload.get(key)
+        if val:
+            parts.append(str(val))
+    for key in ("recent_spine_events", "operating_rules"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            parts.extend(str(item) for item in val if item)
+    return _safe_text("\n".join(parts), limit=6000)
+
+
+def _event_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _event_task_id(payload: dict[str, Any]) -> str:
+    return str(payload.get("task_id") or payload.get("root_task_id") or "")
+
+
+def _ensure_db(conn: sqlite3.Connection) -> bool:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            task_id TEXT,
+            root_task_id TEXT,
+            reviewer_task_id TEXT,
+            intent_source TEXT,
+            board TEXT,
+            text TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    fts_enabled = True
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS events_fts
+            USING fts5(event_id UNINDEXED, kind, task_id, text)
+            """
+        )
+    except sqlite3.Error:
+        fts_enabled = False
+    conn.commit()
+    return fts_enabled
+
+
+def _index_event(row: dict[str, Any]) -> None:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _event_payload(row)
+    text = _payload_text(payload)
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with sqlite3.connect(str(path), timeout=2) as conn:
+        fts_enabled = _ensure_db(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO events (
+                event_id, created_at, kind, task_id, root_task_id,
+                reviewer_task_id, intent_source, board, text, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row.get("event_id"),
+                row.get("created_at"),
+                row.get("kind"),
+                payload.get("task_id"),
+                payload.get("root_task_id"),
+                payload.get("reviewer_task_id"),
+                payload.get("intent_source"),
+                payload.get("board"),
+                text,
+                payload_json,
+            ),
+        )
+        if fts_enabled:
+            conn.execute("DELETE FROM events_fts WHERE event_id = ?", (row.get("event_id"),))
+            conn.execute(
+                "INSERT INTO events_fts(event_id, kind, task_id, text) VALUES (?, ?, ?, ?)",
+                (
+                    row.get("event_id"),
+                    row.get("kind"),
+                    _event_task_id(payload),
+                    text,
+                ),
+            )
+        conn.commit()
+
+
 def append_event(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     row = {
         "schema_version": SCHEMA_VERSION,
@@ -83,6 +192,10 @@ def append_event(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    try:
+        _index_event(row)
+    except Exception:
+        pass
     return row
 
 
@@ -103,6 +216,95 @@ def recent_events(limit: int = 6) -> list[dict[str, Any]]:
         if isinstance(row, dict):
             out.append(row)
     return out
+
+
+def _all_events_from_jsonl(limit: int = 200) -> list[dict[str, Any]]:
+    path = _events_path()
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines[-max(0, int(limit)) :]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_가-힣]{2,}")
+
+
+def _tokens(text: str) -> set[str]:
+    return {m.group(0).casefold() for m in _TOKEN_RE.finditer(text or "")}
+
+
+def _fts_query(text: str) -> str:
+    toks = sorted(_tokens(text))
+    return " OR ".join(toks[:12])
+
+
+def _row_from_index(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        payload = json.loads(row["payload_json"] or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": row["event_id"],
+        "created_at": row["created_at"],
+        "kind": row["kind"],
+        "payload": payload,
+    }
+
+
+def recall_relevant_events(query: str, *, limit: int = 4) -> list[dict[str, Any]]:
+    """Return events most relevant to ``query``.
+
+    FTS5 is used when available. If SQLite indexing is unavailable or stale,
+    fall back to bounded JSONL token-overlap scoring.
+    """
+    query = _safe_text(query, limit=1000)
+    if not query:
+        return []
+    db = _db_path()
+    fts = _fts_query(query)
+    if db.is_file() and fts:
+        try:
+            with sqlite3.connect(str(db), timeout=2) as conn:
+                conn.row_factory = sqlite3.Row
+                _ensure_db(conn)
+                rows = conn.execute(
+                    """
+                    SELECT e.*
+                      FROM events_fts f
+                      JOIN events e ON e.event_id = f.event_id
+                     WHERE events_fts MATCH ?
+                     ORDER BY bm25(events_fts), e.created_at DESC
+                     LIMIT ?
+                    """,
+                    (fts, int(limit)),
+                ).fetchall()
+                if rows:
+                    return [_row_from_index(row) for row in rows]
+        except sqlite3.Error:
+            pass
+
+    q_tokens = _tokens(query)
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for row in _all_events_from_jsonl(limit=240):
+        payload = _event_payload(row)
+        text = _payload_text(payload)
+        score = len(q_tokens & _tokens(text))
+        if score:
+            scored.append((score, str(row.get("created_at") or ""), row))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [row for _, _, row in scored[: int(limit)]]
 
 
 def _summarize_event(row: dict[str, Any]) -> str:
@@ -128,7 +330,9 @@ def build_context_pack(
     message_id: Optional[str] = None,
     task_id: Optional[str] = None,
     recent_limit: int = 4,
+    relevant_limit: int = 4,
 ) -> dict[str, Any]:
+    relevant = recall_relevant_events(original_user_text, limit=relevant_limit)
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_iso(),
@@ -140,6 +344,9 @@ def build_context_pack(
         "original_user_text": _safe_text(original_user_text),
         "operating_rules": list(OPERATING_RULES),
         "review_contract": dict(REVIEW_CONTRACT),
+        "relevant_spine_events": [
+            _summarize_event(row) for row in relevant
+        ],
         "recent_spine_events": [
             _summarize_event(row) for row in recent_events(limit=recent_limit)
         ],
@@ -170,6 +377,11 @@ def render_context_pack(pack: dict[str, Any]) -> str:
         ]
     )
     recent = pack.get("recent_spine_events") or []
+    relevant = pack.get("relevant_spine_events") or []
+    if relevant:
+        lines.append("- relevant_spine_events:")
+        for item in relevant:
+            lines.append(f"  - {_safe_text(item, limit=260)}")
     if recent:
         lines.append("- recent_spine_events:")
         for item in recent:

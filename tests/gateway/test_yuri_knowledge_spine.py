@@ -60,3 +60,39 @@ def test_yuri_knowledge_spine_includes_recent_events(tmp_path, monkeypatch):
 
     assert second["recent_spine_events"]
     assert "t_old" in second["recent_spine_events"][0]
+
+
+def test_yuri_knowledge_spine_recalls_relevant_events(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))
+
+    poll = spine.build_context_pack(
+        original_user_text="여론조사 PDF 인식 개선 상태를 확인해주세요.",
+        platform="telegram",
+    )
+    spine.record_intake(poll, task_id="t_poll")
+    spine.record_review_result(
+        root_task_id="t_poll",
+        reviewer_task_id="t_review_poll",
+        approved_final_text="여론조사 PDF 인식은 5개 샘플 테스트를 통과했습니다.",
+        intent_source="telethon",
+        board="telegram-inbox",
+    )
+
+    unrelated = spine.build_context_pack(
+        original_user_text="캘린더 회의 일정을 확인해주세요.",
+        platform="telegram",
+    )
+    spine.record_intake(unrelated, task_id="t_calendar")
+
+    recalled = spine.recall_relevant_events("여론조사 인식 개선은 어떻게 되고있나요?", limit=2)
+    rendered = spine.render_context_pack(
+        spine.build_context_pack(
+            original_user_text="여론조사 인식 개선은 어떻게 되고있나요?",
+            platform="telegram",
+        )
+    )
+
+    assert recalled
+    assert any("t_poll" in spine._summarize_event(row) for row in recalled)
+    assert "relevant_spine_events" in rendered
+    assert "t_poll" in rendered
