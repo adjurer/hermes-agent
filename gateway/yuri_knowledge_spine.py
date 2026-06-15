@@ -12,6 +12,7 @@ This is not model training. It is structured recall plus automatic injection.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 SCHEMA_VERSION = "yuri-knowledge-spine-v1"
+GRAPH_SCHEMA_VERSION = "yuri-knowledge-graph-v1"
 
 OPERATING_RULES = [
     "Yuri is the front-desk chief of staff, not the sole worker.",
@@ -52,6 +54,10 @@ def _events_path() -> Path:
 
 def _db_path() -> Path:
     return _spine_root() / "spine.db"
+
+
+def _graph_edges_path() -> Path:
+    return _spine_root() / "graph_edges.jsonl"
 
 
 def _utc_iso(ts: Optional[float] = None) -> str:
@@ -124,6 +130,19 @@ def _ensure_db(conn: sqlite3.Connection) -> bool:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS graph_edges (
+            edge_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            source TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            target TEXT NOT NULL,
+            properties_json TEXT NOT NULL
+        )
+        """
+    )
     fts_enabled = True
     try:
         conn.execute(
@@ -180,6 +199,191 @@ def _index_event(row: dict[str, Any]) -> None:
         conn.commit()
 
 
+_NODE_RE = re.compile(r"[^A-Za-z0-9_가-힣.-]+")
+
+
+def _stable_hash(*parts: Any, length: int = 16) -> str:
+    raw = json.dumps(_jsonable(parts), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:length]
+
+
+def _node(kind: str, value: Any) -> str:
+    text = _safe_text(value, limit=160)
+    if not text:
+        text = "unknown"
+    slug = _NODE_RE.sub("_", text).strip("_").casefold()
+    if len(slug) > 80:
+        slug = f"{slug[:48]}_{_stable_hash(text, length=12)}"
+    return f"{kind}:{slug or 'unknown'}"
+
+
+def _graph_edge(
+    *,
+    row: dict[str, Any],
+    source: str,
+    relation: str,
+    target: str,
+    properties: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": GRAPH_SCHEMA_VERSION,
+        "edge_id": _stable_hash(row.get("event_id"), source, relation, target),
+        "source": source,
+        "relation": relation,
+        "target": target,
+        "created_at": row.get("created_at"),
+        "event_id": row.get("event_id"),
+        "event_kind": row.get("kind"),
+        "properties": _jsonable(properties or {}),
+    }
+
+
+def _project_graph_edges(row: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = _event_payload(row)
+    kind = str(row.get("kind") or "")
+    edges: list[dict[str, Any]] = []
+
+    if kind == "yuri_intake":
+        task_id = payload.get("task_id") or row.get("event_id")
+        task = _node("task", task_id)
+        text = _safe_text(payload.get("original_user_text"), limit=1200)
+        if text:
+            intent = _node("intent", _stable_hash(text, length=20))
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="HAS_USER_INTENT",
+                    target=intent,
+                    properties={"task_id": task_id, "text": text},
+                )
+            )
+        review = payload.get("review_contract")
+        if not isinstance(review, dict):
+            review = REVIEW_CONTRACT
+        required_status = review.get("required_review_status") or "pass"
+        edges.append(
+            _graph_edge(
+                row=row,
+                source=task,
+                relation="REQUIRES_REVIEW_STATUS",
+                target=_node("review_status", required_status),
+                properties={"task_id": task_id},
+            )
+        )
+        for source_name in review.get("accepted_intent_sources") or []:
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="ACCEPTS_INTENT_SOURCE",
+                    target=_node("intent_source", source_name),
+                    properties={"task_id": task_id},
+                )
+            )
+        source_info = payload.get("source")
+        if isinstance(source_info, dict) and source_info.get("platform"):
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="ROUTED_FROM",
+                    target=_node("platform", source_info.get("platform")),
+                    properties={
+                        "task_id": task_id,
+                        "message_id": source_info.get("message_id"),
+                    },
+                )
+            )
+
+    elif kind == "review_finalized":
+        root_task_id = payload.get("root_task_id") or row.get("event_id")
+        reviewer_task_id = payload.get("reviewer_task_id")
+        task = _node("task", root_task_id)
+        if reviewer_task_id:
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="REVIEWED_BY",
+                    target=_node("task", reviewer_task_id),
+                    properties={
+                        "root_task_id": root_task_id,
+                        "reviewer_task_id": reviewer_task_id,
+                    },
+                )
+            )
+        approved_text = _safe_text(payload.get("approved_final_text"), limit=1200)
+        if approved_text:
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="APPROVED_WITH",
+                    target=_node("approval", _stable_hash(approved_text, length=20)),
+                    properties={
+                        "root_task_id": root_task_id,
+                        "approved_final_text": approved_text,
+                    },
+                )
+            )
+        if payload.get("intent_source"):
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="INTENT_SOURCE",
+                    target=_node("intent_source", payload.get("intent_source")),
+                    properties={"root_task_id": root_task_id},
+                )
+            )
+        if payload.get("board"):
+            edges.append(
+                _graph_edge(
+                    row=row,
+                    source=task,
+                    relation="ON_BOARD",
+                    target=_node("board", payload.get("board")),
+                    properties={"root_task_id": root_task_id},
+                )
+            )
+
+    return edges
+
+
+def _append_graph_edges(row: dict[str, Any]) -> None:
+    edges = _project_graph_edges(row)
+    if not edges:
+        return
+    path = _graph_edges_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for edge in edges:
+            f.write(json.dumps(edge, ensure_ascii=False, sort_keys=True) + "\n")
+
+    db = _db_path()
+    with sqlite3.connect(str(db), timeout=2) as conn:
+        _ensure_db(conn)
+        for edge in edges:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO graph_edges (
+                    edge_id, event_id, created_at, source, relation, target, properties_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    edge.get("edge_id"),
+                    edge.get("event_id"),
+                    edge.get("created_at"),
+                    edge.get("source"),
+                    edge.get("relation"),
+                    edge.get("target"),
+                    json.dumps(edge.get("properties") or {}, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+        conn.commit()
+
+
 def append_event(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     row = {
         "schema_version": SCHEMA_VERSION,
@@ -194,6 +398,10 @@ def append_event(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
     try:
         _index_event(row)
+    except Exception:
+        pass
+    try:
+        _append_graph_edges(row)
     except Exception:
         pass
     return row
@@ -234,6 +442,25 @@ def _all_events_from_jsonl(limit: int = 200) -> list[dict[str, Any]]:
             continue
         if isinstance(row, dict):
             out.append(row)
+    return out
+
+
+def recent_graph_edges(limit: int = 50) -> list[dict[str, Any]]:
+    path = _graph_edges_path()
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines[-max(0, int(limit)) :]:
+        try:
+            edge = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(edge, dict):
+            out.append(edge)
     return out
 
 
@@ -486,6 +713,82 @@ def _run_line(run: Any) -> str:
     if summary:
         bits.append(f"summary={summary}")
     return " ".join(bits)
+
+
+def export_graph_jsonl(
+    query: str = "",
+    *,
+    limit: int = 50,
+) -> str:
+    """Return Graphiti/Zep-ready edge documents as JSONL.
+
+    The export is intentionally a projection of the local spine, not a second
+    source of truth. Passing a query exports edges from matching spine events;
+    omitting it exports the most recent mirrored edges.
+    """
+    limit = max(1, int(limit))
+    query = _safe_text(query, limit=500)
+    if query:
+        edges: list[dict[str, Any]] = []
+        for row in recall_relevant_events(query, limit=limit):
+            edges.extend(_project_graph_edges(row))
+    else:
+        edges = recent_graph_edges(limit=limit)
+
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for edge in edges:
+        edge_id = str(edge.get("edge_id") or "")
+        if edge_id and edge_id in seen:
+            continue
+        if edge_id:
+            seen.add(edge_id)
+        unique.append(edge)
+        if len(unique) >= limit:
+            break
+    if not unique:
+        return ""
+    return "\n".join(
+        json.dumps(edge, ensure_ascii=False, sort_keys=True) for edge in unique
+    ) + "\n"
+
+
+def _edge_line(edge: dict[str, Any]) -> str:
+    return (
+        f"{edge.get('created_at') or '-'} "
+        f"{edge.get('source') or '-'} "
+        f"-[{edge.get('relation') or '-'}]-> "
+        f"{edge.get('target') or '-'}"
+    )
+
+
+def build_graph_export_report(query: str = "", *, limit: int = 20) -> str:
+    query = _safe_text(query, limit=500)
+    raw = export_graph_jsonl(query=query, limit=limit)
+    edges: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        try:
+            edge = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(edge, dict):
+            edges.append(edge)
+
+    lines = [
+        "Yuri graph export",
+        f"- query: {query or '(recent)'}",
+        f"- spine_root: {_spine_root()}",
+        f"- graph_edges_jsonl: {_graph_edges_path()}",
+        f"- exported_edges: {len(edges)}",
+        "- source_of_truth: events.jsonl remains primary; graph_edges are a projection for Graphiti/Zep experiments.",
+    ]
+    if edges:
+        lines.append("- edges:")
+        for edge in edges[:limit]:
+            lines.append(f"  - {_edge_line(edge)}")
+    else:
+        lines.append("- edges: none")
+    return "\n".join(lines)
 
 
 def build_audit_report(query: str, *, limit: int = 5) -> str:

@@ -43,6 +43,20 @@ def test_yuri_knowledge_spine_renders_context_pack_and_records_events(
     assert rows[0]["payload"]["task_id"] == "t_root"
     assert rows[1]["payload"]["approved_final_text"] == "검수 통과 문안입니다."
 
+    graph_raw = spine.export_graph_jsonl(limit=20)
+    graph_edges = [json.loads(line) for line in graph_raw.splitlines()]
+    relations = {edge["relation"] for edge in graph_edges}
+    assert "HAS_USER_INTENT" in relations
+    assert "REQUIRES_REVIEW_STATUS" in relations
+    assert "REVIEWED_BY" in relations
+    assert "APPROVED_WITH" in relations
+    assert "INTENT_SOURCE" in relations
+
+    report = spine.build_graph_export_report("코드 오류", limit=10)
+    assert "Yuri graph export" in report
+    assert "HAS_USER_INTENT" in report
+    assert "task:t_root" in report
+
 
 def test_yuri_knowledge_spine_includes_recent_events(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))

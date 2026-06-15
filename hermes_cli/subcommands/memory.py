@@ -49,6 +49,27 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default=5,
         help="Maximum spine/task matches to include",
     )
+    _graph_parser = memory_sub.add_parser(
+        "graph-export",
+        help="Export Yuri knowledge-spine graph edges for Graphiti/Zep experiments",
+    )
+    _graph_parser.add_argument(
+        "query",
+        nargs="*",
+        help="Optional free-text query; omitted means recent graph edges",
+    )
+    _graph_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum graph edges to export",
+    )
+    _graph_parser.add_argument(
+        "--format",
+        choices=["jsonl", "summary"],
+        default="jsonl",
+        help="Output JSONL for ingestion or a compact human summary",
+    )
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",

@@ -11333,6 +11333,19 @@ def cmd_memory(args):
         query = " ".join(getattr(args, "query", []) or []).strip()
         limit = max(1, int(getattr(args, "limit", 5) or 5))
         print(build_audit_report(query, limit=limit))
+    elif sub == "graph-export":
+        from gateway.yuri_knowledge_spine import (
+            build_graph_export_report,
+            export_graph_jsonl,
+        )
+
+        query = " ".join(getattr(args, "query", []) or []).strip()
+        limit = max(1, int(getattr(args, "limit", 50) or 50))
+        output_format = getattr(args, "format", "jsonl") or "jsonl"
+        if output_format == "summary":
+            print(build_graph_export_report(query, limit=limit))
+        else:
+            print(export_graph_jsonl(query=query, limit=limit), end="")
     else:
         from hermes_cli.memory_setup import memory_command
 
