@@ -413,3 +413,135 @@ def record_review_result(
             "board": _safe_text(board, limit=120) if board else None,
         },
     )
+
+
+def _format_payload_field(value: Any, *, limit: int = 220) -> str:
+    if value is None:
+        return ""
+    return _safe_text(value, limit=limit).replace("\n", " / ")
+
+
+def _find_kanban_task(task_id: str) -> Optional[dict[str, Any]]:
+    if not task_id:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        try:
+            boards = kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+        for meta in boards:
+            board = meta.get("slug") or kb.DEFAULT_BOARD
+            try:
+                conn = kb.connect(board=board)
+            except Exception:
+                continue
+            try:
+                task = kb.get_task(conn, task_id)
+                if not task:
+                    continue
+                runs = kb.list_runs(conn, task_id)
+                events = kb.list_events(conn, task_id)
+                comments = kb.list_comments(conn, task_id)
+                return {
+                    "board": board,
+                    "task": task,
+                    "runs": runs,
+                    "events": events,
+                    "comments": comments,
+                }
+            finally:
+                conn.close()
+    except Exception:
+        return None
+    return None
+
+
+def _task_line(task_info: dict[str, Any]) -> str:
+    task = task_info["task"]
+    return (
+        f"{task.id} board={task_info['board']} status={task.status} "
+        f"assignee={task.assignee or '-'} title={_format_payload_field(task.title, limit=120)}"
+    )
+
+
+def _run_line(run: Any) -> str:
+    meta = getattr(run, "metadata", None) or {}
+    bits = [
+        f"run#{getattr(run, 'id', '?')}",
+        f"outcome={getattr(run, 'outcome', None) or getattr(run, 'status', None) or '-'}",
+    ]
+    if isinstance(meta, dict):
+        status = meta.get("review_status")
+        source = meta.get("intent_source")
+        reviewer = meta.get("reviewer_task")
+        if status:
+            bits.append(f"review_status={status}")
+        if source:
+            bits.append(f"intent_source={source}")
+        if reviewer:
+            bits.append(f"reviewer={reviewer}")
+    summary = _format_payload_field(getattr(run, "summary", ""), limit=220)
+    if summary:
+        bits.append(f"summary={summary}")
+    return " ".join(bits)
+
+
+def build_audit_report(query: str, *, limit: int = 5) -> str:
+    """Return a compact diagnostic report for a Yuri memory/task question."""
+    query = _safe_text(query, limit=500)
+    lines = [
+        "Yuri memory audit",
+        f"- query: {query or '(empty)'}",
+        f"- spine_root: {_spine_root()}",
+    ]
+    direct_task = query if re.fullmatch(r"t_[0-9a-fA-F]+", query or "") else ""
+    events = recall_relevant_events(query, limit=limit) if query else recent_events(limit=limit)
+    seen_task_ids: list[str] = []
+    if direct_task:
+        seen_task_ids.append(direct_task)
+
+    if events:
+        lines.append("- relevant_spine_events:")
+        for row in events:
+            payload = _event_payload(row)
+            task_id = _event_task_id(payload)
+            if task_id and task_id not in seen_task_ids:
+                seen_task_ids.append(task_id)
+            lines.append(f"  - {_summarize_event(row)}")
+    else:
+        lines.append("- relevant_spine_events: none")
+
+    if not seen_task_ids:
+        lines.append("- kanban: no task ids found from query/spine")
+    else:
+        lines.append("- kanban_trace:")
+        for task_id in seen_task_ids[:limit]:
+            info = _find_kanban_task(task_id)
+            if not info:
+                lines.append(f"  - {task_id}: not found on active boards")
+                continue
+            lines.append(f"  - {_task_line(info)}")
+            runs = info.get("runs") or []
+            if runs:
+                for run in runs[-3:]:
+                    lines.append(f"    - {_run_line(run)}")
+            events_tail = info.get("events") or []
+            if events_tail:
+                event_bits = [
+                    f"{getattr(ev, 'kind', '-')}"
+                    for ev in events_tail[-5:]
+                ]
+                lines.append(f"    - events_tail: {', '.join(event_bits)}")
+            comments = info.get("comments") or []
+            if comments:
+                last = comments[-1]
+                lines.append(
+                    "    - last_comment: "
+                    f"{getattr(last, 'author', '-')}: "
+                    f"{_format_payload_field(getattr(last, 'body', ''), limit=180)}"
+                )
+
+    lines.append("- recommendation: use this audit to verify whether Yuri used the right Telegram intent, spine facts, kanban result, and reviewer pass before final reporting.")
+    return "\n".join(lines)

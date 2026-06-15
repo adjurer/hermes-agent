@@ -96,3 +96,51 @@ def test_yuri_knowledge_spine_recalls_relevant_events(tmp_path, monkeypatch):
     assert any("t_poll" in spine._summarize_event(row) for row in recalled)
     assert "relevant_spine_events" in rendered
     assert "t_poll" in rendered
+
+
+def test_yuri_memory_audit_report_includes_spine_and_kanban_trace(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="[YURI intake] 여론조사 인식 개선",
+            body="YURI secretary intake from Telegram.",
+            assignee="planner",
+            initial_status="running",
+        )
+        kb.complete_task(
+            conn,
+            task_id,
+            result="여론조사 PDF 인식은 샘플 테스트를 통과했습니다.",
+            summary="검수 통과",
+            metadata={
+                "review_status": "pass",
+                "intent_source": "telethon",
+            },
+        )
+    finally:
+        conn.close()
+
+    pack = spine.build_context_pack(
+        original_user_text="여론조사 인식 개선은 어떻게 되고있나요?",
+        platform="telegram",
+    )
+    spine.record_intake(pack, task_id=task_id)
+
+    report = spine.build_audit_report("여론조사 인식 개선", limit=3)
+
+    assert "Yuri memory audit" in report
+    assert "relevant_spine_events" in report
+    assert task_id in report
+    assert "kanban_trace" in report
+    assert "review_status=pass" in report
+    assert "intent_source=telethon" in report

@@ -11327,6 +11327,12 @@ def cmd_memory(args):
             f"\n  Memory reset complete. New sessions will start with a blank slate."
         )
         print(f"  Files were in: {display_hermes_home()}/memories/\n")
+    elif sub == "audit":
+        from gateway.yuri_knowledge_spine import build_audit_report
+
+        query = " ".join(getattr(args, "query", []) or []).strip()
+        limit = max(1, int(getattr(args, "limit", 5) or 5))
+        print(build_audit_report(query, limit=limit))
     else:
         from hermes_cli.memory_setup import memory_command
 

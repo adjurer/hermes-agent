@@ -34,6 +34,21 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+    _audit_parser = memory_sub.add_parser(
+        "audit",
+        help="Audit Yuri knowledge-spine recall and related Kanban evidence",
+    )
+    _audit_parser.add_argument(
+        "query",
+        nargs="*",
+        help="Task id or free-text query to audit",
+    )
+    _audit_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Maximum spine/task matches to include",
+    )
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",

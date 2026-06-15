@@ -2079,6 +2079,11 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
+        if args and args[0] == "audit":
+            from gateway.yuri_knowledge_spine import build_audit_report
+
+            query = " ".join(args[1:]).strip()
+            return build_audit_report(query, limit=5)
         session_key = self._session_key_for_source(event.source)
         config_path = _hermes_home / "config.yaml"
 
