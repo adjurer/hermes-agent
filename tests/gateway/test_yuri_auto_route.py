@@ -82,6 +82,45 @@ def test_yuri_raw_intake_records_exact_telegram_sentence(tmp_path, monkeypatch):
     assert rows[0]["message_id"] == "raw-1"
 
 
+@pytest.mark.asyncio
+async def test_yuri_kanban_intake_injects_knowledge_spine_context(
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+    kb.init_db()
+
+    runner = _runner()
+    event = _event("코드 오류 원인을 확인하고 수정해주세요.")
+    event.message_id = "spine-msg-1"
+
+    response = await runner._yuri_kanban_intake_reply(event, event.source)
+
+    assert response == "확인하겠습니다. 결과는 검수 후 바로 보고드리겠습니다."
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT id, body FROM tasks WHERE title LIKE '[YURI intake]%'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert "YURI KNOWLEDGE SPINE CONTEXT PACK" in row["body"]
+    assert "코드 오류 원인을 확인하고 수정해주세요." in row["body"]
+    assert "accepted_intent_sources: telethon" in row["body"]
+
+    events_path = tmp_path / "spine" / "events.jsonl"
+    rows = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["kind"] == "yuri_intake"
+    assert rows[-1]["payload"]["task_id"] == row["id"]
+
+
 def test_yuri_recent_raw_intake_reply_returns_exact_prior_sentences(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_YURI_RAW_INTAKE_DIR", str(tmp_path))
     runner = _runner()

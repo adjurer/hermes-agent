@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 
@@ -279,6 +280,7 @@ def test_yuri_review_loop_finalizes_blocked_root_from_unlinked_reviewer_pass(
 ):
     db_path = tmp_path / "yuri-review-loop-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
     kb.init_db()
 
     conn = kb.connect()
@@ -338,6 +340,15 @@ def test_yuri_review_loop_finalizes_blocked_root_from_unlinked_reviewer_pass(
     assert completed[-1].metadata["review_status"] == "pass"
     assert completed[-1].metadata["intent_source"] == "telethon"
     assert completed[-1].metadata["auto_finalized_from_review"] is True
+
+    events_path = tmp_path / "spine" / "events.jsonl"
+    rows = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[-1]["kind"] == "review_finalized"
+    assert rows[-1]["payload"]["root_task_id"] == root_id
+    assert rows[-1]["payload"]["reviewer_task_id"] == reviewer_id
 
 
 def test_kanban_db_path_is_test_isolated_from_real_home():

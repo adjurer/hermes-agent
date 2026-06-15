@@ -3941,18 +3941,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def _create() -> str:
             from hermes_cli import kanban_db as _kb
+            from gateway.yuri_knowledge_spine import (
+                build_context_pack,
+                record_intake,
+                render_context_pack,
+            )
 
             conn = _kb.connect()
             try:
                 title_text = _yuri_clean_shortcut_text(getattr(event, "text", "") or "")
                 title = title_text[:80] or "Telegram frontdesk intake"
+                platform = _gateway_platform_value(getattr(source, "platform", "telegram") or "telegram")
+                chat_id = str(getattr(source, "chat_id", "") or "")
+                context_pack = build_context_pack(
+                    original_user_text=title_text,
+                    platform=platform or "telegram",
+                    message_id=str(getattr(event, "message_id", "") or "") or None,
+                )
                 body = (
                     "YURI secretary intake from Telegram.\n"
                     "User asked Yuri directly. Do the work through planner/office flow, "
                     "verify against the Telegram intent, and report back only after review.\n\n"
                     f"Original user text:\n{title_text}\n\n"
                     "Completion rule: include review_status=pass and intent_source=telethon "
-                    "in the completion payload/summary, or the gateway will hold the user-facing report."
+                    "in the completion payload/summary, or the gateway will hold the user-facing report.\n\n"
+                    f"{render_context_pack(context_pack)}"
                 )
                 task_id = _kb.create_task(
                     conn,
@@ -3968,8 +3981,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     goal_mode=True,
                     board=None,
                 )
-                platform = _gateway_platform_value(getattr(source, "platform", "telegram") or "telegram")
-                chat_id = str(getattr(source, "chat_id", "") or "")
+                try:
+                    record_intake(context_pack, task_id=task_id)
+                except Exception as spine_exc:
+                    logger.debug("Yuri knowledge spine intake record failed: %s", spine_exc)
                 if platform and chat_id:
                     _kb.add_notify_sub(
                         conn,

@@ -690,6 +690,22 @@ class GatewayKanbanWatchersMixin:
                         )
                     except Exception:
                         pass
+                    try:
+                        from gateway.yuri_knowledge_spine import record_review_result
+
+                        record_review_result(
+                            root_task_id=root_id,
+                            reviewer_task_id=reviewer_task_id,
+                            approved_final_text=final_text,
+                            intent_source=str(metadata["intent_source"]),
+                            board=board,
+                        )
+                    except Exception as spine_exc:
+                        logger.debug(
+                            "Yuri knowledge spine review record failed for %s: %s",
+                            root_id,
+                            spine_exc,
+                        )
                     finalized.append(root_id)
         finally:
             conn.close()
