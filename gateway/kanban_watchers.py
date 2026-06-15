@@ -314,7 +314,7 @@ class GatewayKanbanWatchersMixin:
                                             event_payload=getattr(ev, "payload", None),
                                         )
                                     ):
-                                        msg = self._yuri_review_gate_hold_message()
+                                        msg = self._yuri_review_gate_hold_message(task_instruction_text)
                                         deliver_artifacts = False
                                         logger.warning(
                                             "Yuri review gate held completion for %s",

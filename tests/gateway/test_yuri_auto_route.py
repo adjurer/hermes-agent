@@ -225,6 +225,47 @@ def test_yuri_tiny_or_exact_answers_do_not_route_to_kanban_intake(text):
     assert not _runner()._yuri_should_route_to_kanban_intake(_event(text))
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "답변 첫머리에 TID=RND-01 붙이고, 아래 요청을 받으면 유리가 바로 해야 할 첫 행동만 말해줘. 발화: 중앙당 비공표 조사일 겁니다.",
+        "답변 첫머리에 TID=RND-02 붙이고, 아래 내용에서 대표님께 확인해야 할 핵심 포인트 1개만 뽑아줘. 내용: 구리,부천,파주 재심 없나요?",
+        "답변 첫머리에 TID=RND-03 붙이고, 아래 텔레쏜 내용을 보고 놓치면 안 되는 리스크가 있으면 한 줄로 말해줘. 내용: 예. 알고 있습니다",
+        "답변 첫머리에 TID=RND-04 붙이고, 아래 메시지에 대해 유리답게 짧고 자연스럽게 응답해줘. 메시지: 2번 같은경우 본선 후보자 기준입니다.",
+        "답변 첫머리에 TID=RND-05 붙이고, 아래 텔레쏜 발화가 업무 지시인지 단순 정보인지 한 줄로 판단해줘. 발화: 대통령 해외 순방 중 사상",
+    ],
+)
+@pytest.mark.asyncio
+async def test_yuri_tid_brief_direct_prompts_reply_without_kanban_intake(text):
+    runner = _runner()
+
+    response = await runner._yuri_fast_lookup_reply(_event(text))
+
+    assert response is not None
+    assert response.startswith("TID=RND-")
+    assert "넘겨" not in response
+    assert "배정" not in response
+    assert not runner._yuri_should_route_to_kanban_intake(_event(text))
+
+
+@pytest.mark.asyncio
+async def test_yuri_kanban_intake_ack_preserves_tid_when_work_must_route(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+    kb.init_db()
+
+    runner = _runner()
+    response = await runner._yuri_kanban_intake_reply(
+        _event("TID=WORK-A1 코드 오류 원인을 확인하고 수정해주세요."),
+        _event("x").source,
+    )
+
+    assert response.startswith("TID=WORK-A1 ")
+    assert "결과는 검수 후" in response
+
+
 @pytest.mark.asyncio
 async def test_yuri_fast_lookup_human_folder_root_accepts_root_word():
     response = await _runner()._yuri_fast_lookup_reply(

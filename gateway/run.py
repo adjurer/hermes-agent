@@ -212,6 +212,19 @@ _YURI_WORK_STATUS_QUERY_RE = re.compile(
     r"(?:진행\s*중|하고\s*있|하고있|돌고\s*있|돌아가|상태|어디까지|칸반|kanban|큐)",
     re.IGNORECASE,
 )
+_YURI_BRIEF_DIRECT_REQUEST_RE = re.compile(
+    r"(?:"
+    r"답변\s*첫머리.{0,40}TID=|"
+    r"TID=[A-Za-z0-9_.:-]{1,64}.{0,80}(?:붙이고|시작|첫머리)|"
+    r"한\s*줄(?:로|만)?\s*(?:판단|말|요약|답)|"
+    r"핵심\s*포인트\s*1\s*개|"
+    r"첫\s*행동만|"
+    r"놓치면\s*안\s*되는\s*리스크|"
+    r"짧고\s*자연스럽게\s*응답|"
+    r"한\s*문장(?:으로|만)?\s*(?:말|요약|답)"
+    r")",
+    re.IGNORECASE,
+)
 _YURI_QUESTION_RE = re.compile(r"(?:\?|인가요|나요|니|습니까|어요|예요|야)$")
 _YURI_ARTIFACT_DELIVERY_CLAIM_RE = re.compile(
     r"(?:파일|문서|보고서|첨부|이미지|pdf|xlsx|docx|pptx).{0,24}(?:전송|첨부|업로드|보냈|전달|드렸)",
@@ -3800,6 +3813,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         m = _YURI_TID_RE.search(str(text or ""))
         return f"TID={m.group(1)} " if m else ""
 
+    @staticmethod
+    def _yuri_labeled_payload(text: str) -> str:
+        raw = str(text or "").strip()
+        matches = list(re.finditer(r"(?:발화|내용|메시지)\s*:\s*", raw))
+        if matches:
+            return raw[matches[-1].end() :].strip()
+        return raw
+
+    def _yuri_brief_direct_reply(self, event: MessageEvent) -> Optional[str]:
+        if not self._yuri_platform_is_frontdesk(event=event):
+            return None
+        intent = self._classify_yuri_telegram_intent(event)
+        text = intent.text
+        if not text or not _YURI_BRIEF_DIRECT_REQUEST_RE.search(text):
+            return None
+        if any(p in text for p in ("선호하는 보고", "원하는 보고 방식", "싫어하는 내부", "기억 리셋", "24시간 비서")):
+            return None
+        tid = self._yuri_requested_tid(text)
+        payload = self._yuri_labeled_payload(text)
+        if not tid and "TID=" in text:
+            return None
+
+        if "업무 지시인지 단순 정보인지" in text or (
+            "단순 정보" in text and "업무" in text and "판단" in text
+        ):
+            action_markers = (
+                "해줘",
+                "해주세요",
+                "진행",
+                "조치",
+                "확인",
+                "검토",
+                "정리",
+                "수정",
+                "도입",
+                "적용",
+                "올립니다",
+                "하겠습니다",
+            )
+            label = "업무 지시" if any(marker in payload for marker in action_markers) else "단순 정보"
+            return f"{tid}{label}입니다. 바로 답하거나 필요한 범위만 확인하면 됩니다."
+        if "첫 행동만" in text:
+            return f"{tid}먼저 요청의 범위와 근거를 확인하고, 바로 답할 수 있는지부터 판단하면 됩니다."
+        if "핵심 포인트" in text:
+            return f"{tid}대표님께 확인할 핵심은 기준, 범위, 그리고 실제로 원하는 결과물입니다."
+        if "리스크" in text:
+            return f"{tid}리스크는 출처나 기준이 불명확하면 잘못된 판단으로 이어질 수 있다는 점입니다."
+        if "짧고 자연스럽게" in text:
+            return f"{tid}확인했습니다. 핵심만 짧게 정리해서 판단하겠습니다."
+        if "요약" in text:
+            compact = payload[:80].strip()
+            return f"{tid}{compact}" if compact else f"{tid}핵심만 짧게 요약하겠습니다."
+        if "한 줄" in text or "한 문장" in text:
+            return f"{tid}핵심은 기준을 먼저 확인하고 필요한 증거만 빠르게 보는 것입니다."
+        return None
+
     def _yuri_literal_only_reply(self, event: MessageEvent) -> Optional[str]:
         intent = self._classify_yuri_telegram_intent(event)
         if intent.kind != "literal_reply":
@@ -3871,6 +3940,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = intent.text
         lowered = intent.lowered
         tid = self._yuri_requested_tid(text)
+        brief_direct = self._yuri_brief_direct_reply(event)
+        if brief_direct is not None:
+            return brief_direct
         progress_status = await self._yuri_progress_status_reply(event)
         if progress_status is not None:
             return f"{tid}{progress_status}"
@@ -3926,6 +3998,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         intent = self._classify_yuri_telegram_intent(event)
         if _yuri_is_work_status_question(intent.text):
+            return False
+        if self._yuri_brief_direct_reply(event) is not None:
             return False
         if intent.kind in {"empty", "literal_reply", "path_lookup", "direct_fact", "liveness"}:
             return False
@@ -4005,7 +4079,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.exception("Yuri kanban intake failed")
             return f"요청을 시작하지 못했습니다. 오류: {exc}"
         logger.info("Yuri routed actionable Telegram intake to Kanban task %s", task_id)
-        return "확인하겠습니다. 결과는 검수 후 바로 보고드리겠습니다."
+        tid = self._yuri_requested_tid(getattr(event, "text", "") or "")
+        return f"{tid}확인하겠습니다. 결과는 검수 후 바로 보고드리겠습니다."
 
     def _yuri_secretary_protocol_prompt(self, event: MessageEvent, source: SessionSource) -> str:
         if not self._yuri_platform_is_frontdesk(event=event, source=source) or not self._yuri_is_frontdesk_profile():
@@ -4050,8 +4125,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return bool(re.search(r"검수\s*통과.*(?:텔레쏜|telethon|telegram|대화).*의도\s*일치", joined, re.IGNORECASE))
 
     @staticmethod
-    def _yuri_review_gate_hold_message() -> str:
-        return "완료 보고를 보류했습니다. 검수팀이 텔레쏜 대화 기준으로 의도 일치 여부를 확인해야 합니다."
+    def _yuri_review_gate_hold_message(instruction_text: str = "") -> str:
+        tid = GatewayRunner._yuri_requested_tid(instruction_text)
+        return f"{tid}완료 보고를 보류했습니다. 검수팀이 텔레쏜 대화 기준으로 의도 일치 여부를 확인해야 합니다."
 
     @staticmethod
     def _secretary_clean_kanban_text(platform: str, text: str, limit: int = 260) -> str:
