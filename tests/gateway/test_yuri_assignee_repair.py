@@ -81,3 +81,29 @@ def test_yuri_assignee_repair_skips_missing_target_profile(tmp_path, monkeypatch
         assert _task_assignee(conn, task_id) == "collection-lead"
     finally:
         conn.close()
+
+
+def test_yuri_article_quality_collection_lead_repairs_to_researcher(tmp_path, monkeypatch):
+    db_path = tmp_path / "yuri-article-quality-assignee-repair.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="[audit] 기사수집기 현재 퀄리티 근거 기반 평가",
+            body="상위 질문: “기사수집기 퀄리티는 어떤가요?”",
+            assignee="collection-lead",
+        )
+
+        repaired = repair_yuri_missing_profile_assignees(
+            conn,
+            profile_exists=lambda name: name in {"ops", "researcher"},
+            assign_task=kb.assign_task,
+        )
+
+        assert repaired == [(task_id, "collection-lead", "researcher")]
+        assert _task_assignee(conn, task_id) == "researcher"
+    finally:
+        conn.close()

@@ -40,7 +40,20 @@ def _looks_like_yuri_task(title: str, body: str, created_by: str) -> bool:
         or "Telegram 원문" in text
         or "대표님 원문" in text
         or "telethon source" in text
+        or "상위 질문" in text
+        or "상위 사용자 질문" in text
     )
+
+
+def _resolve_yuri_missing_profile_fallback(old: str, title: str, body: str) -> str | None:
+    if old == "factcheck-lead":
+        return "researcher"
+    if old == "collection-lead":
+        text = f"{title}\n{body}"
+        if re.search(r"기사|뉴스|품질|퀄리티|WARN|팩트|fact|source", text, re.I):
+            return "researcher"
+        return "ops"
+    return _YURI_MISSING_PROFILE_FALLBACKS.get(old)
 
 
 def repair_yuri_missing_profile_assignees(
@@ -84,14 +97,16 @@ def repair_yuri_missing_profile_assignees(
     repaired: list[tuple[str, str, str]] = []
     for row in rows:
         old = (row["assignee"] or "").strip()
-        new = _YURI_MISSING_PROFILE_FALLBACKS.get(old)
+        title = row["title"] or ""
+        body = row["body"] or ""
+        new = _resolve_yuri_missing_profile_fallback(old, title, body)
         if not new:
             continue
         if profile_exists is not None and not profile_exists(new):
             continue
         if not _looks_like_yuri_task(
-            row["title"] or "",
-            row["body"] or "",
+            title,
+            body,
             row["created_by"] or "",
         ):
             continue
