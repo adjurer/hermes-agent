@@ -488,6 +488,29 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     return attachments_root(board=board) / task_id
 
 
+def artifacts_root(board: Optional[str] = None) -> Path:
+    """Return the directory under which completion artifacts are stored.
+
+    Workers often create handoff files inside ephemeral scratch workspaces.
+    Completion preserves those files here before scratch cleanup so notifiers
+    can upload them after the task reaches ``done``.
+    """
+    override = os.environ.get("HERMES_KANBAN_ARTIFACTS_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban" / "artifacts"
+    return board_dir(slug) / "artifacts"
+
+
+def task_artifacts_dir(task_id: str, board: Optional[str] = None) -> Path:
+    """Return the per-task completion artifact directory."""
+    return artifacts_root(board=board) / task_id
+
+
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Return the directory under which per-task worker logs are written.
 
@@ -3576,6 +3599,134 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        return path.is_relative_to(root)
+    except ValueError:
+        return False
+
+
+def _infer_artifact_board_from_workspace(workspace_path: Optional[str]) -> Optional[str]:
+    if not workspace_path:
+        return None
+    try:
+        wp = Path(workspace_path).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    try:
+        default_root = workspaces_root(DEFAULT_BOARD).resolve(strict=False)
+        if _path_is_relative_to(wp, default_root):
+            return DEFAULT_BOARD
+    except OSError:
+        pass
+    try:
+        parent = boards_root()
+        entries = list(parent.iterdir()) if parent.exists() else []
+    except OSError:
+        entries = []
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            root = (entry / "workspaces").resolve(strict=False)
+        except OSError:
+            continue
+        if _path_is_relative_to(wp, root):
+            return entry.name
+    return None
+
+
+def _unique_artifact_destination(dest_dir: Path, filename: str) -> Path:
+    clean_name = Path(filename).name or "artifact"
+    candidate = dest_dir / clean_name
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    if not stem:
+        stem = clean_name
+        suffix = ""
+    for idx in range(2, 1000):
+        next_candidate = dest_dir / f"{stem}_{idx}{suffix}"
+        if not next_candidate.exists():
+            return next_candidate
+    return dest_dir / f"{stem}_{int(time.time())}{suffix}"
+
+
+def _preserve_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    artifacts: Any,
+) -> list[str]:
+    """Copy scratch-workspace artifacts to durable storage before cleanup.
+
+    Completion events are consumed after ``complete_task`` returns, but scratch
+    workspaces are removed at the end of the same function. Without this copy,
+    event payloads can point at files that no longer exist by the time the
+    notifier tries to upload them.
+    """
+    if not isinstance(artifacts, (list, tuple)):
+        return []
+    cleaned = [
+        str(p).strip()
+        for p in artifacts
+        if isinstance(p, str) and str(p).strip()
+    ]
+    if not cleaned:
+        return []
+
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    except Exception:
+        row = None
+
+    workspace_path = row["workspace_path"] if row else None
+    workspace_kind = row["workspace_kind"] if row else None
+    workspace: Path | None = None
+    if workspace_kind == "scratch" and workspace_path:
+        candidate_workspace = Path(workspace_path).expanduser()
+        if _is_managed_scratch_path(candidate_workspace):
+            workspace = candidate_workspace.resolve(strict=False)
+
+    board = _infer_artifact_board_from_workspace(workspace_path) or get_current_board()
+    dest_dir = task_artifacts_dir(task_id, board=board)
+    preserved: list[str] = []
+    for raw in cleaned:
+        if workspace is None:
+            preserved.append(raw)
+            continue
+        try:
+            src = Path(raw).expanduser()
+            src_resolved = src.resolve(strict=False)
+        except OSError:
+            preserved.append(raw)
+            continue
+        if (
+            not _path_is_relative_to(src_resolved, workspace)
+            or not src_resolved.is_file()
+        ):
+            preserved.append(raw)
+            continue
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = _unique_artifact_destination(dest_dir, src_resolved.name)
+            shutil.copy2(src_resolved, dest)
+            os.utime(dest, None)
+            preserved.append(str(dest))
+        except Exception as exc:
+            _log.warning(
+                "Failed to preserve completion artifact for task %s: %s (%s)",
+                task_id,
+                raw,
+                exc,
+            )
+            preserved.append(raw)
+    return preserved
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3642,6 +3793,14 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    if isinstance(metadata, dict):
+        metadata = dict(metadata)
+        preserved_artifacts = _preserve_completion_artifacts(
+            conn, task_id, metadata.get("artifacts")
+        )
+        if preserved_artifacts:
+            metadata["artifacts"] = preserved_artifacts
 
     with write_txn(conn):
         if expected_run_id is None:

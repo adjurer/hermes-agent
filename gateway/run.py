@@ -4236,7 +4236,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _YURI_HUMAN_RE.search(instruction) and _YURI_PATH_RE.search(instruction) and "/srv/poll-data/minjookg/human" in result:
             return False
         if artifact_status and int(artifact_status.get("declared") or 0) > 0:
-            return True
+            available = int(
+                artifact_status.get("existing")
+                or artifact_status.get("available")
+                or 0
+            )
+            if available <= 0:
+                return True
         return bool(
             re.search(r"(?:보고서|파일|문서|검수|최적화|대화|확인|조치|분석|정리|완료)", combined)
             or _kanban_text_claims_artifact_delivery(result)
@@ -4352,6 +4358,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "declared": len(declared),
             "referenced": len(all_paths),
             "existing": len(existing),
+            "available": len(existing),
             "missing": missing,
         }
 

@@ -584,7 +584,7 @@ class GatewayKanbanWatchersMixin:
                                         task=task,
                                     )
                                 except Exception as art_exc:
-                                    logger.debug(
+                                    logger.warning(
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
@@ -1288,24 +1288,44 @@ class GatewayKanbanWatchersMixin:
 
             # 2. Paths embedded in the payload summary.
             summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
+            if isinstance(summary, str) and summary and hasattr(adapter, "extract_local_files"):
                 paths, _ = adapter.extract_local_files(summary)
                 for p in paths:
                     _add(p)
 
         # 3. Legacy: paths embedded in task.result.
-        if task is not None and getattr(task, "result", None):
+        if (
+            task is not None
+            and getattr(task, "result", None)
+            and hasattr(adapter, "extract_local_files")
+        ):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
             for p in paths:
                 _add(p)
 
+        declared_count = 0
+        if isinstance(event_payload, dict):
+            raw_artifacts = event_payload.get("artifacts")
+            if isinstance(raw_artifacts, (list, tuple)):
+                declared_count = len(
+                    [p for p in raw_artifacts if isinstance(p, str) and p]
+                )
+
         if not candidates:
+            if declared_count:
+                logger.warning(
+                    "kanban notifier: %d declared artifact(s) but no existing local files to upload",
+                    declared_count,
+                )
             return
 
         from gateway.platforms.base import BasePlatformAdapter
         candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
         if not candidates:
+            logger.warning(
+                "kanban notifier: declared artifact candidates failed local delivery safety filter"
+            )
             return
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
