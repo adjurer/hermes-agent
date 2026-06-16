@@ -99,7 +99,11 @@ async def test_yuri_kanban_intake_injects_knowledge_spine_context(
 
     response = await runner._yuri_kanban_intake_reply(event, event.source)
 
-    assert response == "확인하겠습니다. 결과는 검수 후 바로 보고드리겠습니다."
+    assert response == (
+        "작업 큐에 접수했습니다. "
+        "진행 상태가 궁금하시면 '지금 진행중인건가요?'라고 물어보시면 바로 확인하겠습니다. "
+        "결과는 검수 후 보고드리겠습니다."
+    )
     conn = kb.connect()
     try:
         row = conn.execute(
@@ -301,6 +305,8 @@ async def test_yuri_kanban_intake_ack_preserves_tid_when_work_must_route(tmp_pat
     )
 
     assert response.startswith("TID=WORK-A1 ")
+    assert "작업 큐에 접수했습니다" in response
+    assert "지금 진행중인건가요?" in response
     assert "결과는 검수 후" in response
 
 

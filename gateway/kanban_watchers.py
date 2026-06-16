@@ -40,6 +40,8 @@ def _looks_like_yuri_task(title: str, body: str, created_by: str) -> bool:
         or "Telegram 원문" in text
         or "대표님 원문" in text
         or "telethon source" in text
+        or "User intent from Telegram" in text
+        or "Telegram message_id" in text
         or "상위 질문" in text
         or "상위 사용자 질문" in text
     )
@@ -541,15 +543,27 @@ class GatewayKanbanWatchersMixin:
                         try:
                             chunks = self._kanban_split_user_message(msg) if platform_str == "telegram" else [msg]
                             for index, chunk in enumerate(chunks):
-                                await adapter.send(
+                                send_result = await adapter.send(
                                     sub["chat_id"],
                                     chunk,
                                     reply_to=reply_to if index == 0 else None,
                                     metadata=metadata,
                                 )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                                if (
+                                    send_result is not None
+                                    and getattr(send_result, "success", True) is False
+                                ):
+                                    error = getattr(send_result, "error", None) or "send_result_unsuccessful"
+                                    raise RuntimeError(str(error))
+                            logger.info(
+                                "kanban notifier: delivered %s event for %s to %s/%s on board %s (%d chunk%s)",
+                                kind,
+                                sub["task_id"],
+                                platform_str,
+                                sub["chat_id"],
+                                board_slug,
+                                len(chunks),
+                                "" if len(chunks) == 1 else "s",
                             )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in

@@ -107,3 +107,32 @@ def test_yuri_article_quality_collection_lead_repairs_to_researcher(tmp_path, mo
         assert _task_assignee(conn, task_id) == "researcher"
     finally:
         conn.close()
+
+
+def test_yuri_telegram_message_id_collection_lead_repairs(tmp_path, monkeypatch):
+    db_path = tmp_path / "yuri-telegram-message-id-assignee-repair.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="implement patch: clean collector result outputs for data use",
+            body=(
+                "Parent will provide source map and defect evidence. "
+                "User intent from Telegram message_id=23079: make collected outputs cleaner."
+            ),
+            assignee="collection-lead",
+        )
+
+        repaired = repair_yuri_missing_profile_assignees(
+            conn,
+            profile_exists=lambda name: name in {"ops", "researcher"},
+            assign_task=kb.assign_task,
+        )
+
+        assert repaired == [(task_id, "collection-lead", "researcher")]
+        assert _task_assignee(conn, task_id) == "researcher"
+    finally:
+        conn.close()

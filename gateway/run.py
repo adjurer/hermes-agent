@@ -4149,7 +4149,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return f"요청을 시작하지 못했습니다. 오류: {exc}"
         logger.info("Yuri routed actionable Telegram intake to Kanban task %s", task_id)
         tid = self._yuri_requested_tid(getattr(event, "text", "") or "")
-        return f"{tid}확인하겠습니다. 결과는 검수 후 바로 보고드리겠습니다."
+        return (
+            f"{tid}작업 큐에 접수했습니다. "
+            "진행 상태가 궁금하시면 '지금 진행중인건가요?'라고 물어보시면 바로 확인하겠습니다. "
+            "결과는 검수 후 보고드리겠습니다."
+        )
 
     def _yuri_secretary_protocol_prompt(self, event: MessageEvent, source: SessionSource) -> str:
         if not self._yuri_platform_is_frontdesk(event=event, source=source) or not self._yuri_is_frontdesk_profile():

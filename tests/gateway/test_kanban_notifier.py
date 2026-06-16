@@ -21,6 +21,25 @@ class RecordingAdapter:
         })
 
 
+class FailedSendResult:
+    success = False
+    error = "synthetic send failure"
+
+
+class SendResultFailingAdapter:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, chat_id, text, reply_to=None, metadata=None):
+        self.sent.append({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_to": reply_to,
+            "metadata": metadata or {},
+        })
+        return FailedSendResult()
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -125,6 +144,27 @@ def test_kanban_notifier_replies_to_original_message(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     assert adapter.sent[0]["reply_to"] == "462"
     assert adapter.sent[0]["metadata"]["telegram_reply_to_message_id"] == "462"
+
+
+def test_kanban_notifier_rewinds_when_send_result_fails(tmp_path, monkeypatch):
+    db_path = tmp_path / "failed-send-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_completed_subscription()
+    adapter = SendResultFailingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["last_event_id"] == 0
 
 
 def test_yuri_notifier_uses_approved_final_text_from_run_metadata(tmp_path, monkeypatch):
