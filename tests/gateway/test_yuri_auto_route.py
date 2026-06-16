@@ -110,6 +110,8 @@ async def test_yuri_kanban_intake_injects_knowledge_spine_context(
     assert row is not None
     assert "YURI KNOWLEDGE SPINE CONTEXT PACK" in row["body"]
     assert "코드 오류 원인을 확인하고 수정해주세요." in row["body"]
+    assert "Planner triage rule" in row["body"]
+    assert "do not fan it out into serial child tasks" in row["body"]
     assert "accepted_intent_sources: telethon" in row["body"]
 
     events_path = tmp_path / "spine" / "events.jsonl"
@@ -500,6 +502,44 @@ async def test_yuri_progress_status_question_returns_status_without_new_intake()
 
     assert response == "네, 현재 작업 상태는 진행 중 1건입니다."
     assert not runner._yuri_should_route_to_kanban_intake(_event("지금 진행중인건가요?"))
+
+
+def test_yuri_work_status_does_not_describe_blocked_only_queue_as_active_work():
+    response = GatewayRunner._yuri_format_work_status(
+        {"running": 0, "review": 0, "ready": 0, "todo": 0, "blocked": 5},
+        [("blocked", "create verified openable link for target file")],
+    )
+
+    assert "지금 실제로 돌고 있는 작업은 없습니다" in response
+    assert "막힘 5건" in response
+    assert "막힘은 진행 중 worker가 아니라" in response
+    assert "막힌 항목 예시: create verified openable link" in response
+
+
+def test_yuri_work_status_prioritizes_active_work_over_blocked_samples():
+    response = GatewayRunner._yuri_format_work_status(
+        {"running": 1, "review": 0, "ready": 0, "todo": 2, "blocked": 5},
+        [("blocked", "old blocked task"), ("running", "current task")],
+    )
+
+    assert "진행 중 1건" in response
+    assert "준비 대기 2건" in response
+    assert "막힘 5건" in response
+    assert "지금 도는 항목: current task" in response
+    assert "old blocked task" not in response
+
+
+def test_yuri_work_status_separates_waiting_queue_from_running_work():
+    response = GatewayRunner._yuri_format_work_status(
+        {"running": 0, "review": 0, "ready": 0, "todo": 2, "blocked": 5},
+        [("blocked", "old blocked task"), ("todo", "queued review task")],
+    )
+
+    assert "지금 실제로 돌고 있는 작업은 없습니다" in response
+    assert "준비 대기 2건" in response
+    assert "막힘 5건" in response
+    assert "다음 대기 항목: queued review task" in response
+    assert "막힘은 진행 중 worker가 아니라" in response
 
 
 @pytest.mark.asyncio

@@ -3980,6 +3980,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "네, 대기 중입니다."
         return None
 
+    @staticmethod
+    def _yuri_format_work_status(counts: dict[str, int], samples: list[tuple[str, str]]) -> str:
+        live_keys = ("running", "review")
+        waiting_keys = ("ready", "todo")
+        live_total = sum(int(counts.get(key, 0) or 0) for key in live_keys)
+        waiting_total = sum(int(counts.get(key, 0) or 0) for key in waiting_keys)
+        blocked = int(counts.get("blocked", 0) or 0)
+        if live_total <= 0 and waiting_total <= 0 and blocked <= 0:
+            return "현재 확인되는 진행 중 작업은 없습니다."
+
+        labels = {
+            "running": "진행 중",
+            "review": "검수 중",
+            "ready": "실행 대기",
+            "todo": "준비 대기",
+            "blocked": "막힘",
+        }
+        parts = [f"{labels[key]} {counts[key]}건" for key in (*live_keys, *waiting_keys, "blocked") if counts.get(key)]
+        if live_total <= 0:
+            msg = f"지금 실제로 돌고 있는 작업은 없습니다. 다만 {', '.join(parts)}이 남아 있습니다."
+        else:
+            msg = "지금 작업 상태는 " + ", ".join(parts) + "입니다."
+
+        live_samples = [(status, title) for status, title in samples if status in live_keys]
+        waiting_samples = [(status, title) for status, title in samples if status in waiting_keys]
+        blocked_samples = [(status, title) for status, title in samples if status == "blocked"]
+        if live_samples:
+            _, title = live_samples[0]
+            msg += f" 지금 도는 항목: {title}"
+        elif waiting_samples:
+            _, title = waiting_samples[0]
+            msg += f" 다음 대기 항목: {title}"
+        elif blocked_samples:
+            _, title = blocked_samples[0]
+            msg += f" 막힌 항목 예시: {title}"
+        if blocked and live_total <= 0:
+            msg += " 막힘은 진행 중 worker가 아니라 보류/재작업이 필요한 상태입니다."
+        return msg
+
     def _yuri_current_work_status(self) -> str:
         try:
             from hermes_cli import kanban_db as _kb
@@ -3988,31 +4027,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 counts: dict[str, int] = {}
                 samples = []
-                for status in ("running", "ready", "review", "blocked"):
-                    tasks = _kb.list_tasks(conn, status=status, limit=5, order_by="created-desc")
+                for status in ("running", "review", "ready", "todo", "blocked"):
+                    tasks = _kb.list_tasks(conn, status=status, limit=50, order_by="created-desc")
                     counts[status] = len(tasks)
                     for task in tasks[:2]:
                         title = re.sub(r"^\[YURI intake\]\s*", "", str(getattr(task, "title", "") or "")).strip()
                         if title:
                             samples.append((status, title[:80]))
-                total = sum(counts.values())
-                if total <= 0:
-                    return "현재 확인되는 진행 중 작업은 없습니다."
-                parts = []
-                labels = {
-                    "running": "진행 중",
-                    "ready": "대기",
-                    "review": "검토",
-                    "blocked": "막힘",
-                }
-                for key in ("running", "ready", "review", "blocked"):
-                    if counts.get(key):
-                        parts.append(f"{labels[key]} {counts[key]}건")
-                msg = "네, 현재 작업 상태는 " + ", ".join(parts) + "입니다."
-                if samples:
-                    status, title = samples[0]
-                    msg += f" 최근 항목: {title}"
-                return msg
+                return self._yuri_format_work_status(counts, samples)
             finally:
                 conn.close()
         except Exception as exc:
@@ -4139,6 +4161,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "User asked Yuri directly. Do the work through planner/office flow, "
                     "verify against the Telegram intent, and report back only after review.\n\n"
                     f"Original user text:\n{title_text}\n\n"
+                    "Planner triage rule: if this is a narrow lookup, status check, yes/no existence check, "
+                    "or a single source-of-truth readback that one planner can answer, do not fan it out into "
+                    "serial child tasks. Resolve it directly and send it to review/approved_final_text quickly. "
+                    "Only split into parallel worker cards when independent subtasks can actually run in parallel.\n\n"
                     "Completion rule: include review_status=pass and intent_source=telethon "
                     "in the completion payload/summary, or the gateway will hold the user-facing report.\n\n"
                     f"{render_context_pack(context_pack)}"
