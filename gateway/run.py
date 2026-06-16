@@ -3935,6 +3935,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return f"{tid}괜찮습니다. 바로 이어서 보겠습니다."
         return f"{tid}네, 바로 듣고 있습니다."
 
+    def _yuri_domain_term_direct_reply(self, event: MessageEvent) -> Optional[str]:
+        if not self._yuri_platform_is_frontdesk(event=event):
+            return None
+        intent = self._classify_yuri_telegram_intent(event)
+        text = intent.text.strip()
+        if not text or len(text) > 120:
+            return None
+        normalized = re.sub(r"\s+", " ", text)
+        tid = self._yuri_requested_tid(text)
+        question_tail = r"(?:뭔가요|뭐야|뭐예요|무슨\s*뜻|어떤\s*뜻|설명|의미|뜻이야)"
+
+        if re.search(rf"정치\s*레이더\s*점수.{{0,24}}{question_tail}", normalized, re.IGNORECASE):
+            return (
+                f"{tid}정치레이더 점수는 기사별 중요도와 언급 신호를 내부 기준으로 합산한 정렬 점수입니다. "
+                "언급량 자체가 아니라 출처, 키워드, 본문 신호, 중복/신선도 등을 반영해 먼저 볼 기사를 고르는 보조 지표로 보면 됩니다."
+            )
+        if re.search(rf"(?:A\+\s*reportable|A\+\s*보고용|A플러스).{{0,24}}{question_tail}", normalized, re.IGNORECASE):
+            return (
+                f"{tid}A+ reportable은 URL, 본문, 날짜 같은 기본 검증을 통과해서 바로 보고 후보로 올릴 수 있는 최상위 품질 레인입니다."
+            )
+        if re.search(
+            rf"(?:gold\s*/\s*silver|gold\s+silver|골드\s*/?\s*실버).{{0,24}}{question_tail}",
+            normalized,
+            re.IGNORECASE,
+        ):
+            return f"{tid}gold/silver는 수집 결과의 신뢰도와 완성도를 나눠 보는 품질 등급입니다. gold가 더 바로 보고 가능한 레인입니다."
+        return None
+
     def _yuri_literal_only_reply(self, event: MessageEvent) -> Optional[str]:
         intent = self._classify_yuri_telegram_intent(event)
         if intent.kind != "literal_reply":
@@ -4012,6 +4040,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         brief_direct = self._yuri_brief_direct_reply(event)
         if brief_direct is not None:
             return brief_direct
+        domain_term_direct = self._yuri_domain_term_direct_reply(event)
+        if domain_term_direct is not None:
+            return domain_term_direct
         progress_status = await self._yuri_progress_status_reply(event)
         if progress_status is not None:
             return f"{tid}{progress_status}"
@@ -4069,6 +4100,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _yuri_is_work_status_question(intent.text):
             return False
         if self._yuri_brief_direct_reply(event) is not None:
+            return False
+        if self._yuri_domain_term_direct_reply(event) is not None:
             return False
         if intent.kind in {"empty", "literal_reply", "path_lookup", "direct_fact", "liveness", "social_reply"}:
             return False
@@ -4149,11 +4182,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return f"요청을 시작하지 못했습니다. 오류: {exc}"
         logger.info("Yuri routed actionable Telegram intake to Kanban task %s", task_id)
         tid = self._yuri_requested_tid(getattr(event, "text", "") or "")
-        return (
-            f"{tid}작업 큐에 접수했습니다. "
-            "진행 상태가 궁금하시면 '지금 진행중인건가요?'라고 물어보시면 바로 확인하겠습니다. "
-            "결과는 검수 후 보고드리겠습니다."
-        )
+        return f"{tid}접수했습니다. 확인 끝나면 검수 후 결과만 보고드리겠습니다."
 
     def _yuri_secretary_protocol_prompt(self, event: MessageEvent, source: SessionSource) -> str:
         if not self._yuri_platform_is_frontdesk(event=event, source=source) or not self._yuri_is_frontdesk_profile():

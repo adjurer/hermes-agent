@@ -99,11 +99,7 @@ async def test_yuri_kanban_intake_injects_knowledge_spine_context(
 
     response = await runner._yuri_kanban_intake_reply(event, event.source)
 
-    assert response == (
-        "작업 큐에 접수했습니다. "
-        "진행 상태가 궁금하시면 '지금 진행중인건가요?'라고 물어보시면 바로 확인하겠습니다. "
-        "결과는 검수 후 보고드리겠습니다."
-    )
+    assert response == "접수했습니다. 확인 끝나면 검수 후 결과만 보고드리겠습니다."
     conn = kb.connect()
     try:
         row = conn.execute(
@@ -238,6 +234,9 @@ def test_yuri_actionable_telegram_work_routes_to_kanban_intake(text):
         "이제 별걸다 넘기네",
         "그냥 인사한거야",
         "인사건 뭐건 모두 칸반으로 넘기고 있는것 같아요",
+        "정치레이더 점수는 뭔가요?",
+        "A+ reportable은 뭐예요?",
+        "gold/silver는 무슨 뜻이야?",
     ],
 )
 def test_yuri_tiny_or_exact_answers_do_not_route_to_kanban_intake(text):
@@ -264,6 +263,27 @@ async def test_yuri_social_turns_reply_directly_without_kanban_ack(text, expecte
     assert expected in response
     assert "결과는 검수 후" not in response
     assert "배정" not in response
+    assert not runner._yuri_should_route_to_kanban_intake(_event(text))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("정치레이더 점수는 뭔가요?", "정치레이더 점수는"),
+        ("A+ reportable은 뭐예요?", "A+ reportable은"),
+        ("gold/silver는 무슨 뜻이야?", "gold/silver는"),
+    ],
+)
+async def test_yuri_domain_term_questions_reply_directly_without_kanban_ack(text, expected):
+    runner = _runner()
+
+    response = await runner._yuri_fast_lookup_reply(_event(text))
+
+    assert response is not None
+    assert expected in response
+    assert "접수했습니다" not in response
+    assert "작업 큐" not in response
     assert not runner._yuri_should_route_to_kanban_intake(_event(text))
 
 
@@ -305,9 +325,8 @@ async def test_yuri_kanban_intake_ack_preserves_tid_when_work_must_route(tmp_pat
     )
 
     assert response.startswith("TID=WORK-A1 ")
-    assert "작업 큐에 접수했습니다" in response
-    assert "지금 진행중인건가요?" in response
-    assert "결과는 검수 후" in response
+    assert "접수했습니다" in response
+    assert "검수 후 결과" in response
 
 
 def test_yuri_work_type_prompt_with_payload_summary_word_routes_to_kanban():
