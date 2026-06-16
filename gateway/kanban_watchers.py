@@ -259,6 +259,19 @@ class GatewayKanbanWatchersMixin:
                         tag = f"@{who} " if who else ""
                         deliver_artifacts = True
                         if kind == "completed":
+                            if platform_str == "telegram" and await asyncio.to_thread(
+                                self._kanban_handoff_sub_to_open_child,
+                                sub,
+                                task,
+                                getattr(ev, "payload", None),
+                                board_slug,
+                            ):
+                                logger.info(
+                                    "kanban notifier: handed off subscription from %s to open child on board %s",
+                                    sub["task_id"],
+                                    board_slug,
+                                )
+                                continue
                             approved = self._yuri_review_pass_from_metadata(d.get("latest_run_metadata"))
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -395,13 +408,16 @@ class GatewayKanbanWatchersMixin:
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        reply_to = sub.get("reply_to_message_id") or None
+                        if reply_to:
+                            metadata["telegram_reply_to_message_id"] = reply_to
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
                             await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                sub["chat_id"], msg, reply_to=reply_to, metadata=metadata,
                             )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -521,6 +537,95 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
             )
+        finally:
+            conn.close()
+
+    def _kanban_handoff_sub_to_open_child(
+        self,
+        sub: dict,
+        task: Any,
+        event_payload: Optional[dict[str, Any]],
+        board: Optional[str] = None,
+    ) -> bool:
+        """Move a parent handoff subscription to the child that will report.
+
+        Planner/root cards often complete with "배정 완료" while real work
+        continues in child cards. Sending that parent completion as a Yuri
+        review hold makes the chat feel broken. Instead, subscribe the same
+        Telegram chat to the best open child, preferring reviewer/final-report
+        cards, and remove the parent subscription.
+        """
+        if not task or str(getattr(task, "status", "") or "") != "done":
+            return False
+        summary = ""
+        if isinstance(event_payload, dict):
+            summary = str(event_payload.get("summary") or "")
+        task_text = "\n".join(
+            str(part or "")
+            for part in (
+                getattr(task, "title", ""),
+                getattr(task, "body", ""),
+                summary,
+            )
+        )
+        if not re.search(r"(?:배정\s*완료|라우팅|분해|연결|handoff)", task_text, re.IGNORECASE):
+            return False
+
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            candidate_ids: list[str] = []
+            if isinstance(event_payload, dict):
+                for raw in event_payload.get("verified_cards") or []:
+                    cid = str(raw or "").strip()
+                    if cid and cid not in candidate_ids:
+                        candidate_ids.append(cid)
+            for cid in _kb.child_ids(conn, str(sub["task_id"])):
+                if cid not in candidate_ids:
+                    candidate_ids.append(cid)
+            if not candidate_ids:
+                return False
+
+            placeholders = ",".join("?" for _ in candidate_ids)
+            rows = conn.execute(
+                f"""
+                SELECT id, title, assignee, status
+                  FROM tasks
+                 WHERE id IN ({placeholders})
+                   AND status NOT IN ('done', 'archived')
+                """,
+                tuple(candidate_ids),
+            ).fetchall()
+            if not rows:
+                return False
+            by_id = {str(row["id"]): row for row in rows}
+            ordered = [by_id[cid] for cid in candidate_ids if cid in by_id]
+
+            def _score(row: Any) -> tuple[int, int]:
+                text = f"{row['title'] or ''} {row['assignee'] or ''}"
+                finalish = bool(re.search(r"(?:review|reviewer|검수|리뷰|최종|보고문|승인)", text, re.IGNORECASE))
+                return (1 if finalish else 0, 1 if str(row["status"]) == "ready" else 0)
+
+            target = max(ordered, key=_score)
+            _kb.add_notify_sub(
+                conn,
+                task_id=str(target["id"]),
+                platform=str(sub["platform"]),
+                chat_id=str(sub["chat_id"]),
+                thread_id=sub.get("thread_id") or None,
+                user_id=sub.get("user_id") or None,
+                notifier_profile=sub.get("notifier_profile") or None,
+                reply_to_message_id=sub.get("reply_to_message_id") or None,
+            )
+            _kb.remove_notify_sub(
+                conn,
+                task_id=str(sub["task_id"]),
+                platform=str(sub["platform"]),
+                chat_id=str(sub["chat_id"]),
+                thread_id=sub.get("thread_id") or "",
+            )
+            return True
         finally:
             conn.close()
 
