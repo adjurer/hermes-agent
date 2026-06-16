@@ -168,6 +168,47 @@ def test_yuri_notifier_uses_approved_final_text_from_run_metadata(tmp_path, monk
     assert adapter.sent[0]["text"] == "TID=WRK-T01 승인된 최종 문안입니다."
 
 
+def test_yuri_notifier_does_not_truncate_approved_final_text(tmp_path, monkeypatch):
+    db_path = tmp_path / "yuri-long-approved-final.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    long_final = "승인된 최종 보고입니다. " + ("상세 검수 내용입니다. " * 650) + "끝표식-LONG-FINAL"
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="[YURI intake] 긴 최종 보고",
+            body="YURI secretary intake from Telegram.\nOriginal user text:\n긴 보고를 해주세요.",
+            assignee="reviewer",
+            initial_status="running",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="review_status=pass, intent_source=telethon",
+            metadata={
+                "review_status": "pass",
+                "intent_source": "telethon",
+                "approved_final_text": long_final,
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) > 1
+    combined = "\n".join(item["text"] for item in adapter.sent)
+    assert "끝표식-LONG-FINAL" in combined
+    assert len(combined) > 3900
+    assert adapter.sent[0]["reply_to"] is None
+
+
 def test_kanban_notifier_persists_completion_for_followup_context(tmp_path, monkeypatch):
     db_path = tmp_path / "context-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -280,6 +321,130 @@ def test_kanban_notifier_hands_off_verified_cards_without_links(tmp_path, monkey
     assert parent_subs == []
     assert len(child_subs) == 1
     assert child_subs[0]["reply_to_message_id"] == "777"
+
+
+def test_yuri_unreviewed_completion_creates_review_cycle_without_user_report(tmp_path, monkeypatch):
+    db_path = tmp_path / "yuri-unreviewed-cycle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="[YURI intake] 보고서 작성",
+            body="YURI secretary intake from Telegram.\nOriginal user text:\n보고서 작성해주세요.",
+            assignee="writer",
+            initial_status="running",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            reply_to_message_id="901",
+        )
+        assert kb.complete_task(conn, tid, summary="보고서 초안을 작성했습니다.")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, title, assignee, status FROM tasks WHERE created_by = 'yuri-review-loop'"
+        ).fetchall()
+        parent_subs = kb.list_notify_subs(conn, tid)
+        review_subs = [
+            sub
+            for row in rows
+            for sub in kb.list_notify_subs(conn, row["id"])
+        ]
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0]["assignee"] == "reviewer"
+    assert rows[0]["status"] == "ready"
+    assert parent_subs == []
+    assert len(review_subs) == 1
+    assert review_subs[0]["reply_to_message_id"] == "901"
+
+
+def test_yuri_failed_review_creates_rework_then_followup_review_without_user_report(tmp_path, monkeypatch):
+    db_path = tmp_path / "yuri-failed-review-cycle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        work_id = kb.create_task(
+            conn,
+            title="[YURI intake] 기사 품질 감사",
+            body="YURI secretary intake from Telegram.\nOriginal user text:\n기사 품질 검증해주세요.",
+            assignee="researcher",
+            initial_status="running",
+        )
+        assert kb.complete_task(conn, work_id, summary="품질 감사 결과 초안")
+        review_id = kb.create_task(
+            conn,
+            title="[review] 기사 품질 감사 검수",
+            body="review_status metadata required. Check Telegram/Telethon intent.",
+            assignee="reviewer",
+            parents=[work_id],
+            initial_status="running",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=review_id,
+            platform="telegram",
+            chat_id="chat-1",
+            reply_to_message_id="902",
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="review_status=fail, intent_source=telethon: 근거가 부족합니다.",
+            metadata={
+                "review_status": "fail",
+                "intent_source": "telethon",
+                "blocking_issues": ["근거 부족"],
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, title, assignee, status FROM tasks WHERE created_by = 'yuri-review-loop' ORDER BY created_at, id"
+        ).fetchall()
+        old_subs = kb.list_notify_subs(conn, review_id)
+        followup_review = [row for row in rows if row["assignee"] == "reviewer"]
+        followup_subs = [
+            sub
+            for row in followup_review
+            for sub in kb.list_notify_subs(conn, row["id"])
+        ]
+    finally:
+        conn.close()
+    assert len(rows) == 2
+    assert any(row["assignee"] == "researcher" and row["status"] == "ready" for row in rows)
+    assert len(followup_review) == 1
+    assert followup_review[0]["status"] == "todo"
+    assert old_subs == []
+    assert len(followup_subs) == 1
+    assert followup_subs[0]["reply_to_message_id"] == "902"
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

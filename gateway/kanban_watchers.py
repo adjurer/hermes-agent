@@ -315,6 +315,20 @@ class GatewayKanbanWatchersMixin:
                                     result_text or handoff_text,
                                 )
                                 if mismatch_msg:
+                                    if await asyncio.to_thread(
+                                        self._yuri_continue_review_cycle_on_hold,
+                                        sub,
+                                        task,
+                                        getattr(ev, "payload", None),
+                                        result_text or handoff_text,
+                                        mismatch_msg,
+                                        board_slug,
+                                    ):
+                                        logger.warning(
+                                            "Yuri completion guard held %s and started review cycle: %s",
+                                            sub["task_id"], mismatch_msg,
+                                        )
+                                        continue
                                     msg = mismatch_msg
                                     deliver_artifacts = False
                                     logger.warning(
@@ -345,7 +359,22 @@ class GatewayKanbanWatchersMixin:
                                             event_payload=d.get("latest_run_metadata") if isinstance(d.get("latest_run_metadata"), dict) else getattr(ev, "payload", None),
                                         )
                                     ):
-                                        msg = self._yuri_review_gate_hold_message(task_instruction_text)
+                                        hold_msg = self._yuri_review_gate_hold_message(task_instruction_text)
+                                        if await asyncio.to_thread(
+                                            self._yuri_continue_review_cycle_on_hold,
+                                            sub,
+                                            task,
+                                            getattr(ev, "payload", None),
+                                            result_text or handoff_text,
+                                            hold_msg,
+                                            board_slug,
+                                        ):
+                                            logger.warning(
+                                                "Yuri review gate held %s and started review cycle",
+                                                sub["task_id"],
+                                            )
+                                            continue
+                                        msg = hold_msg
                                         deliver_artifacts = False
                                         logger.warning(
                                             "Yuri review gate held completion for %s",
@@ -353,7 +382,11 @@ class GatewayKanbanWatchersMixin:
                                         )
                                     else:
                                         final_text = approved.get("approved_final_text", "") if approved else ""
-                                        clean = self._secretary_clean_kanban_text(platform_str, final_text or handoff_text or result_text or title)
+                                        clean = self._secretary_clean_kanban_text(
+                                            platform_str,
+                                            final_text or handoff_text or result_text or title,
+                                            limit=max(len(final_text) + 32, 260) if final_text else 260,
+                                        )
                                         if clean.startswith("TID="):
                                             msg = clean
                                         else:
@@ -416,9 +449,14 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, reply_to=reply_to, metadata=metadata,
-                            )
+                            chunks = self._kanban_split_user_message(msg) if platform_str == "telegram" else [msg]
+                            for index, chunk in enumerate(chunks):
+                                await adapter.send(
+                                    sub["chat_id"],
+                                    chunk,
+                                    reply_to=reply_to if index == 0 else None,
+                                    metadata=metadata,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -503,6 +541,26 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    @staticmethod
+    def _kanban_split_user_message(text: str, limit: int = 3900) -> list[str]:
+        raw = str(text or "")
+        if len(raw) <= limit:
+            return [raw]
+        chunks: list[str] = []
+        remaining = raw
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            cut = remaining.rfind("\n", 0, limit)
+            if cut < int(limit * 0.6):
+                cut = remaining.rfind(" ", 0, limit)
+            if cut < int(limit * 0.6):
+                cut = limit
+            chunks.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip()
+        return [chunk for chunk in chunks if chunk]
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
@@ -628,6 +686,243 @@ class GatewayKanbanWatchersMixin:
             return True
         finally:
             conn.close()
+
+    @staticmethod
+    def _yuri_review_fail_from_metadata(raw: Any) -> Optional[dict[str, Any]]:
+        if not raw:
+            return None
+        if isinstance(raw, dict):
+            meta = raw
+        else:
+            try:
+                meta = json.loads(str(raw))
+            except Exception:
+                return None
+        status = str(meta.get("review_status", "") or "").strip().lower()
+        if status not in {"fail", "failed", "hold", "blocked", "reject", "rejected"}:
+            return None
+        return dict(meta)
+
+    @staticmethod
+    def _yuri_review_cycle_task_text(task: Any, extra: str = "") -> str:
+        return "\n".join(
+            str(part or "")
+            for part in (
+                getattr(task, "title", ""),
+                getattr(task, "body", ""),
+                getattr(task, "result", ""),
+                extra,
+            )
+            if part
+        )
+
+    def _yuri_continue_review_cycle_on_hold(
+        self,
+        sub: dict,
+        task: Any,
+        event_payload: Optional[dict[str, Any]],
+        result_text: str,
+        hold_reason: str,
+        board: Optional[str] = None,
+    ) -> bool:
+        """Keep Yuri work internal until a reviewer pass exists.
+
+        If a task tries to report without a passing review, move the chat
+        subscription to an existing open child. If there is no child, create
+        the next review or rework->review pair and subscribe to the final
+        reviewer card. Nothing is sent to Telegram until that reviewer passes.
+        """
+        if task is None:
+            return False
+
+        from hermes_cli import kanban_db as _kb
+
+        task_id = str(getattr(task, "id", "") or sub.get("task_id") or "")
+        if not task_id:
+            return False
+        task_text = self._yuri_review_cycle_task_text(task, result_text)
+        yuriish = bool(
+            re.search(
+                r"(?:YURI|Yuri|\[YURI intake\]|review_status|intent_source|텔레쏜|검수)",
+                task_text,
+                re.IGNORECASE,
+            )
+        )
+        if not yuriish:
+            return False
+
+        conn = _kb.connect(board=board)
+        try:
+            if self._kanban_move_sub_to_best_open_child(conn, sub, task_id):
+                return True
+
+            meta = event_payload if isinstance(event_payload, dict) else {}
+            summary = str(meta.get("summary") or result_text or "").strip()
+            failed_review = self._yuri_review_fail_from_metadata(meta)
+            is_reviewer = bool(
+                str(getattr(task, "assignee", "") or "") == "reviewer"
+                or re.search(r"(?:review|reviewer|검수|리뷰|승인)", task_text, re.IGNORECASE)
+                or failed_review
+            )
+
+            if is_reviewer:
+                parent_rows = []
+                parent_ids = _kb.parent_ids(conn, task_id)
+                if parent_ids:
+                    placeholders = ",".join("?" for _ in parent_ids)
+                    parent_rows = conn.execute(
+                        f"SELECT id, title, body, assignee FROM tasks WHERE id IN ({placeholders})",
+                        tuple(parent_ids),
+                    ).fetchall()
+                base = next(
+                    (row for row in parent_rows if str(row["assignee"] or "") != "reviewer"),
+                    parent_rows[0] if parent_rows else None,
+                )
+                rework_assignee = str((base["assignee"] if base else "") or "planner")
+                base_title = str((base["title"] if base else getattr(task, "title", "")) or task_id)
+                rework_id = _kb.create_task(
+                    conn,
+                    title=f"[rework] {base_title[:80]}",
+                    body=(
+                        "Yuri review cycle rework.\n"
+                        "Do not report to the user directly. Fix the issues below, then the follow-up reviewer card must approve.\n\n"
+                        f"Original reviewed task: {base['id'] if base else task_id}\n"
+                        f"Failed/held reviewer task: {task_id}\n"
+                        f"Hold reason:\n{hold_reason}\n\n"
+                        f"Reviewer/hold evidence:\n{summary or result_text}\n\n"
+                        "Completion requirements:\n"
+                        "- Address every blocking issue.\n"
+                        "- Include concise evidence and changed artifact paths if any.\n"
+                        "- Do not include user-facing final wording as approved unless the reviewer passes it."
+                    ),
+                    assignee=rework_assignee,
+                    created_by="yuri-review-loop",
+                    parents=[task_id],
+                    priority=20,
+                    idempotency_key=f"yuri-review-loop:{task_id}:rework",
+                    goal_mode=True,
+                )
+                review_id = _kb.create_task(
+                    conn,
+                    title=f"[review] 재검수 {base_title[:72]}",
+                    body=(
+                        "Yuri review cycle follow-up review.\n"
+                        "Review the rework result against the original Telegram/Telethon intent.\n\n"
+                        f"Failed/held reviewer task: {task_id}\n"
+                        f"Rework task: {rework_id}\n"
+                        f"Hold reason:\n{hold_reason}\n\n"
+                        "If and only if the result is now acceptable, complete with metadata:\n"
+                        'review_status=\"pass\", intent_source=\"telethon\" or \"telegram-safe\", '
+                        "and approved_final_text/final_text.\n"
+                        "If it still fails, complete with review_status=fail plus blocking_issues; "
+                        "the loop will create another rework pass."
+                    ),
+                    assignee="reviewer",
+                    created_by="yuri-review-loop",
+                    parents=[rework_id],
+                    priority=20,
+                    idempotency_key=f"yuri-review-loop:{task_id}:review",
+                    goal_mode=True,
+                )
+                target_id = review_id
+            else:
+                review_id = _kb.create_task(
+                    conn,
+                    title=f"[review] {str(getattr(task, 'title', '') or task_id)[:80]}",
+                    body=(
+                        "Yuri completion review.\n"
+                        "The worker produced a result, but user-facing reporting is held until review passes.\n\n"
+                        f"Task to review: {task_id}\n"
+                        f"Hold reason:\n{hold_reason}\n\n"
+                        f"Worker result/handoff:\n{summary or result_text}\n\n"
+                        "Check Telegram/Telethon intent, evidence, and final wording. "
+                        "If acceptable, complete with review_status=pass, intent_source=telethon "
+                        "or telegram-safe, and approved_final_text/final_text. "
+                        "If not acceptable, complete with review_status=fail and blocking_issues; "
+                        "the loop will create rework."
+                    ),
+                    assignee="reviewer",
+                    created_by="yuri-review-loop",
+                    parents=[task_id],
+                    priority=20,
+                    idempotency_key=f"yuri-review-loop:{task_id}:initial-review",
+                    goal_mode=True,
+                )
+                target_id = review_id
+
+            _kb.add_notify_sub(
+                conn,
+                task_id=target_id,
+                platform=str(sub["platform"]),
+                chat_id=str(sub["chat_id"]),
+                thread_id=sub.get("thread_id") or None,
+                user_id=sub.get("user_id") or None,
+                notifier_profile=sub.get("notifier_profile") or None,
+                reply_to_message_id=sub.get("reply_to_message_id") or None,
+            )
+            _kb.remove_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=str(sub["platform"]),
+                chat_id=str(sub["chat_id"]),
+                thread_id=sub.get("thread_id") or "",
+            )
+            try:
+                _kb.add_comment(
+                    conn,
+                    task_id,
+                    "yuri-review-loop",
+                    f"Report held and routed to {target_id}. Reason: {hold_reason}",
+                )
+            except Exception:
+                pass
+            return True
+        finally:
+            conn.close()
+
+    def _kanban_move_sub_to_best_open_child(self, conn: Any, sub: dict, task_id: str) -> bool:
+        from hermes_cli import kanban_db as _kb
+
+        candidate_ids = _kb.child_ids(conn, task_id)
+        if not candidate_ids:
+            return False
+        placeholders = ",".join("?" for _ in candidate_ids)
+        rows = conn.execute(
+            f"""
+            SELECT id, title, assignee, status
+              FROM tasks
+             WHERE id IN ({placeholders})
+               AND status NOT IN ('done', 'archived')
+            """,
+            tuple(candidate_ids),
+        ).fetchall()
+        if not rows:
+            return False
+
+        def _score(row: Any) -> tuple[int, int]:
+            text = f"{row['title'] or ''} {row['assignee'] or ''}"
+            finalish = bool(re.search(r"(?:review|reviewer|검수|리뷰|최종|보고문|승인)", text, re.IGNORECASE))
+            return (1 if finalish else 0, 1 if str(row["status"]) in {"ready", "review"} else 0)
+
+        target = max(rows, key=_score)
+        _kb.add_notify_sub(
+            conn,
+            task_id=str(target["id"]),
+            platform=str(sub["platform"]),
+            chat_id=str(sub["chat_id"]),
+            thread_id=sub.get("thread_id") or None,
+            user_id=sub.get("user_id") or None,
+            notifier_profile=sub.get("notifier_profile") or None,
+            reply_to_message_id=sub.get("reply_to_message_id") or None,
+        )
+        _kb.remove_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=str(sub["platform"]),
+            chat_id=str(sub["chat_id"]),
+            thread_id=sub.get("thread_id") or "",
+        )
+        return True
 
     def _kanban_rewind(
         self,
