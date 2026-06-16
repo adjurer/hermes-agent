@@ -24,6 +24,81 @@ from typing import Any, Optional
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+_YURI_MISSING_PROFILE_FALLBACKS = {
+    "collection-lead": "ops",
+    "factcheck-lead": "researcher",
+}
+
+
+def _looks_like_yuri_task(title: str, body: str, created_by: str) -> bool:
+    if created_by in {"yuri", "yuri-review-loop"}:
+        return True
+    text = f"{title}\n{body}"
+    return (
+        title.startswith("[YURI intake]")
+        or "YURI secretary intake" in text
+        or "Telegram 원문" in text
+        or "대표님 원문" in text
+        or "telethon source" in text
+    )
+
+
+def repair_yuri_missing_profile_assignees(
+    conn: sqlite3.Connection,
+    *,
+    profile_exists=None,
+    assign_task=None,
+) -> list[tuple[str, str, str]]:
+    """Map Yuri planner pseudo-roles to real worker profiles before dispatch.
+
+    Yuri can ask the planner to fan out work using natural team labels such as
+    ``collection-lead``. Those are not Hermes profiles, so the dispatcher
+    correctly refuses to spawn them. For Telegram/Yuri work only, repair the
+    known pseudo-roles to the closest real profiles so the queue keeps moving.
+    """
+    if profile_exists is None:
+        try:
+            from hermes_cli.profiles import profile_exists as _profile_exists
+        except Exception:
+            _profile_exists = None
+        profile_exists = _profile_exists
+    if assign_task is None:
+        try:
+            from hermes_cli import kanban_db as _kb
+            assign_task = _kb.assign_task
+        except Exception:
+            assign_task = None
+    if assign_task is None:
+        return []
+
+    aliases = tuple(_YURI_MISSING_PROFILE_FALLBACKS.keys())
+    placeholders = ",".join("?" for _ in aliases)
+    rows = conn.execute(
+        "SELECT id, title, body, assignee, created_by FROM tasks "
+        "WHERE status IN ('todo', 'ready') "
+        "AND claim_lock IS NULL "
+        f"AND assignee IN ({placeholders})",
+        aliases,
+    ).fetchall()
+
+    repaired: list[tuple[str, str, str]] = []
+    for row in rows:
+        old = (row["assignee"] or "").strip()
+        new = _YURI_MISSING_PROFILE_FALLBACKS.get(old)
+        if not new:
+            continue
+        if profile_exists is not None and not profile_exists(new):
+            continue
+        if not _looks_like_yuri_task(
+            row["title"] or "",
+            row["body"] or "",
+            row["created_by"] or "",
+        ):
+            continue
+        if assign_task(conn, row["id"], new):
+            repaired.append((row["id"], old, new))
+    return repaired
+
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
@@ -1484,6 +1559,16 @@ class GatewayKanbanWatchersMixin:
             try:
                 self._yuri_finalize_review_blocked_tasks_for_board(slug)
                 conn = _kb.connect(board=slug)
+                repaired_assignees = repair_yuri_missing_profile_assignees(conn)
+                if repaired_assignees:
+                    logger.info(
+                        "kanban dispatcher [%s]: repaired Yuri pseudo-assignees: %s",
+                        slug,
+                        ", ".join(
+                            f"{tid}:{old}->{new}"
+                            for tid, old, new in repaired_assignees
+                        ),
+                    )
                 # `connect()` runs the schema + idempotent migration on
                 # first open per process; the previous explicit
                 # `init_db()` call here busted the per-process cache and
