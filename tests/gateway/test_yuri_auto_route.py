@@ -151,10 +151,16 @@ def test_yuri_recent_raw_intake_reply_returns_exact_prior_sentences(tmp_path, mo
         ("아니 휴먼 폴더 안에 어떤어떤 폴더들이 있는지 말한거에요", "correction"),
         ("kg서버 휴먼 폴더 루트만 알려줘", "path_lookup"),
         ("다시한번 휴먼 폴더 리스트 보여주세요", "content_lookup"),
+        ("안녕?", "social_reply"),
+        ("좋은 아침입니다", "social_reply"),
+        ("고생 많았지?", "social_reply"),
+        ("이제 별걸다 넘기네", "social_reply"),
+        ("인사건 뭐건 모두 칸반으로 넘기고 있는것 같아요", "social_reply"),
         ("kg서버에 실제 파일이 있는지 확인해줘. 추측하지 말고 지금 접속해서 봐줘", "agent_turn"),
         ("kg서버의 비밀번호는 6501 입니다.", "agent_turn"),
         ("당선자 대수는 15·16·18·19·20·22대입니다 맞나요?", "agent_turn"),
         ("이 폴더 이름 바꾸고 옮겨주세요", "agent_turn"),
+        ("인사말 문구 정리해주세요", "agent_turn"),
     ],
 )
 def test_yuri_telegram_intent_classifier_keeps_shortcuts_narrow(text, kind):
@@ -222,10 +228,39 @@ def test_yuri_actionable_telegram_work_routes_to_kanban_intake(text):
         "네 좋아요",
         "응",
         "고마워",
+        "안녕?",
+        "좋은 아침입니다",
+        "고생 많았지?",
+        "이제 별걸다 넘기네",
+        "그냥 인사한거야",
+        "인사건 뭐건 모두 칸반으로 넘기고 있는것 같아요",
     ],
 )
 def test_yuri_tiny_or_exact_answers_do_not_route_to_kanban_intake(text):
     assert not _runner()._yuri_should_route_to_kanban_intake(_event(text))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("안녕?", "안녕하세요"),
+        ("좋은 아침입니다", "안녕하세요"),
+        ("고생 많았지?", "오늘도 바로 보겠습니다"),
+        ("이제 별걸다 넘기네", "바로 답해야 합니다"),
+        ("인사건 뭐건 모두 칸반으로 넘기고 있는것 같아요", "바로 답해야 합니다"),
+    ],
+)
+async def test_yuri_social_turns_reply_directly_without_kanban_ack(text, expected):
+    runner = _runner()
+
+    response = await runner._yuri_fast_lookup_reply(_event(text))
+
+    assert response is not None
+    assert expected in response
+    assert "결과는 검수 후" not in response
+    assert "배정" not in response
+    assert not runner._yuri_should_route_to_kanban_intake(_event(text))
 
 
 @pytest.mark.parametrize(

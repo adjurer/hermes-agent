@@ -212,6 +212,25 @@ _YURI_WORK_STATUS_QUERY_RE = re.compile(
     r"(?:진행\s*중|하고\s*있|하고있|돌고\s*있|돌아가|상태|어디까지|칸반|kanban|큐)",
     re.IGNORECASE,
 )
+_YURI_SOCIAL_ACTION_RE = re.compile(
+    r"(?:"
+    r"확인|봐줘|봐주세요|보세요|진행|조치|최적화|검토|접속|수정|도입|적용|"
+    r"정리|작성|만들|찾아|찾고|찾아줘|수집|전수|분석|삭제|커밋|업데이트|"
+    r"패치|테스트|실행|보고|가져와|알려줘|말해줘|답해줘|해주세요|해줘|해\s*봐|해\s*보"
+    r")",
+    re.IGNORECASE,
+)
+_YURI_SOCIAL_TURN_RE = re.compile(
+    r"(?:"
+    r"^(?:안녕|안녕하세요|하이|hello|hi|굿모닝|좋은\s*(?:아침|점심|저녁)|잘\s*자|잘자|"
+    r"수고|고생|고마워|감사|반가워|괜찮|미안|죄송)|"
+    r"(?:별걸\s*다|별걸다).{0,24}(?:넘기|보내|칸반)|"
+    r"(?:왜|또|자꾸|이제|이걸|이런걸).{0,28}(?:넘기|보내|칸반)|"
+    r"그냥\s*인사|인사(?:한|했|였|인데|건)|"
+    r"멍청|말귀|답답|뭐하(?:냐|니|고)|왜\s*그래|아니야"
+    r")",
+    re.IGNORECASE,
+)
 _YURI_BRIEF_DIRECT_REQUEST_RE = re.compile(
     r"(?:"
     r"답변\s*첫머리.{0,40}TID=|"
@@ -238,6 +257,15 @@ _YURI_RAW_FAILURE_RE = re.compile(
 
 def _yuri_clean_shortcut_text(text: str) -> str:
     return _YURI_TAG_PREFIX_RE.sub("", str(text or "")).strip()
+
+
+def _yuri_is_social_turn(text: str) -> bool:
+    cleaned = _yuri_clean_shortcut_text(text)
+    if not cleaned or len(cleaned) > 100:
+        return False
+    if _YURI_SOCIAL_ACTION_RE.search(cleaned):
+        return False
+    return bool(_YURI_SOCIAL_TURN_RE.search(cleaned))
 
 
 def _secretary_clean_kanban_text(platform: str, text: str, limit: int = 260) -> str:
@@ -3736,6 +3764,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return _YuriTelegramIntent("recent_context", text, lowered)
         if len(text) <= 90 and _YURI_LIVENESS_QUERY_RE.search(text):
             return _YuriTelegramIntent("liveness", text, lowered)
+        if _yuri_is_social_turn(text):
+            return _YuriTelegramIntent("social_reply", text, lowered)
         if _YURI_HUMAN_RE.search(text):
             if _YURI_HUMAN_CONTENT_RE.search(text):
                 return _YuriTelegramIntent("content_lookup", text, lowered)
@@ -3880,6 +3910,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return f"{tid}핵심은 기준을 먼저 확인하고 필요한 증거만 빠르게 보는 것입니다."
         return None
 
+    def _yuri_social_direct_reply(self, event: MessageEvent) -> Optional[str]:
+        if not self._yuri_platform_is_frontdesk(event=event):
+            return None
+        intent = self._classify_yuri_telegram_intent(event)
+        if intent.kind != "social_reply":
+            return None
+        text = intent.text
+        tid = self._yuri_requested_tid(text)
+        if re.search(
+            r"(?:별걸\s*다|별걸다|왜|또|자꾸|이제|이걸|이런걸|인사(?:한|했|였|인데|건)|"
+            r"그냥\s*인사).{0,40}(?:넘기|보내|칸반)|멍청|말귀|답답",
+            text,
+            re.IGNORECASE,
+        ):
+            return f"{tid}맞습니다. 이런 말은 제가 바로 답해야 합니다. 인사나 가벼운 반응은 바로 응답하겠습니다."
+        if re.search(r"(?:안녕|안녕하세요|하이|hello|hi|굿모닝|좋은\s*(?:아침|점심|저녁))", text, re.IGNORECASE):
+            return f"{tid}안녕하세요. 대기 중입니다."
+        if re.search(r"(?:고마워|감사)", text):
+            return f"{tid}네, 바로 이어서 보겠습니다."
+        if re.search(r"(?:고생|수고)", text):
+            return f"{tid}괜찮습니다. 오늘도 바로 보겠습니다."
+        if re.search(r"(?:미안|죄송|괜찮)", text):
+            return f"{tid}괜찮습니다. 바로 이어서 보겠습니다."
+        return f"{tid}네, 바로 듣고 있습니다."
+
     def _yuri_literal_only_reply(self, event: MessageEvent) -> Optional[str]:
         intent = self._classify_yuri_telegram_intent(event)
         if intent.kind != "literal_reply":
@@ -3951,6 +4006,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text = intent.text
         lowered = intent.lowered
         tid = self._yuri_requested_tid(text)
+        social_direct = self._yuri_social_direct_reply(event)
+        if social_direct is not None:
+            return social_direct
         brief_direct = self._yuri_brief_direct_reply(event)
         if brief_direct is not None:
             return brief_direct
@@ -4012,7 +4070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         if self._yuri_brief_direct_reply(event) is not None:
             return False
-        if intent.kind in {"empty", "literal_reply", "path_lookup", "direct_fact", "liveness"}:
+        if intent.kind in {"empty", "literal_reply", "path_lookup", "direct_fact", "liveness", "social_reply"}:
             return False
         if len(intent.text) <= 8 and intent.text in {"네", "응", "좋아요", "고마워", "감사", "네 좋아요"}:
             return False
