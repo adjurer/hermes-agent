@@ -2813,6 +2813,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "important"
         return mode
 
+    @staticmethod
+    def _natural_model_switch_command(text: str) -> str:
+        """Translate narrow Korean model-switch phrases into the slash command."""
+        normalized = re.sub(r"\s+", "", (text or "").strip().lower())
+        if not normalized:
+            return ""
+        if "슈퍼젬마" in normalized:
+            return ""
+
+        has_switch_intent = any(
+            marker in normalized
+            for marker in ("모델변경", "모델을", "모델다시", "변경", "복귀", "돌아와")
+        )
+        if not has_switch_intent:
+            return ""
+
+        wants_main = (
+            "gpt" in normalized
+            or "gpt5.5" in normalized
+            or "gpt-5.5" in normalized
+            or "코덱스" in normalized
+            or "기본모델" in normalized
+        )
+        if not wants_main:
+            return ""
+        return "/model gpt-5.5 --provider openai-codex"
+
     def _adapter_disconnect_timeout_secs(self) -> float:
         """Return the per-adapter disconnect timeout used during shutdown."""
         raw = os.getenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "").strip()
@@ -5407,21 +5434,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=thread_meta,
             )
 
-        yuri_busy_reply = (
-            self._yuri_literal_only_reply(event)
-            or self._yuri_recent_raw_intake_reply(event)
-            or await self._yuri_fast_lookup_reply(event)
-        )
+        yuri_busy_reply = self._yuri_literal_only_reply(event)
+        if yuri_busy_reply is None:
+            text = _yuri_clean_shortcut_text(getattr(event, "text", "") or "")
+            tid = self._yuri_requested_tid(text)
+            if _YURI_HUMAN_RE.search(text) and not _YURI_HUMAN_CONTENT_RE.search(text):
+                lowered = text.lower()
+                wants_mini = "미니서버" in text or "미니피시" in text or "mini" in lowered
+                mini_negated = bool(
+                    re.search(
+                        r"(?:미니서버|미니피시|mini).{0,10}(?:얘기는 하지 말고|말고|아닌)",
+                        text,
+                        re.IGNORECASE,
+                    )
+                )
+                if wants_mini and not mini_negated:
+                    yuri_busy_reply = (
+                        f"{tid}KG human 경로는 `/srv/poll-data/minjookg/human` 입니다. "
+                        "미니서버는 별도 장비라 현재 접속 상태와 로그로 따로 확인해야 합니다."
+                    )
+                else:
+                    yuri_busy_reply = f"{tid}kg서버 휴먼 폴더는 `/srv/poll-data/minjookg/human` 입니다."
         if yuri_busy_reply:
             await _send_yuri_busy_reply(yuri_busy_reply)
             return True
 
-        kanban_intake_reply = await self._yuri_kanban_intake_reply(event, event.source)
-        if kanban_intake_reply is not None:
-            if kanban_intake_reply:
-                await _send_yuri_busy_reply(kanban_intake_reply)
-            logger.info("Yuri busy kanban intake created for session %s", session_key)
-            return True
+        yuri_live_intercept = self._yuri_should_intercept_live_message(event)
+        yuri_kanban_intake = yuri_live_intercept or self._yuri_should_route_to_kanban_intake(event)
+        if yuri_live_intercept:
+            yuri_live_reply = (
+                self._yuri_recent_raw_intake_reply(event)
+                or await self._yuri_fast_lookup_reply(event)
+            )
+            if yuri_live_reply:
+                await _send_yuri_busy_reply(yuri_live_reply)
+                return True
+
+        if yuri_kanban_intake:
+            kanban_intake_reply = await self._yuri_kanban_intake_reply(event, event.source)
+            if kanban_intake_reply is not None:
+                if kanban_intake_reply:
+                    await _send_yuri_busy_reply(kanban_intake_reply)
+                logger.info("Yuri busy kanban intake created for session %s", session_key)
+                return True
 
         running_agent = self._running_agents.get(session_key)
 
@@ -8067,9 +8122,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # KeepAlive.SuccessfulExit=false needs a non-zero exit to
                 # relaunch, so keep the old code on macOS.
                 self._exit_code = (
-                    GATEWAY_SERVICE_RESTART_EXIT_CODE
-                    if sys.platform == "darwin" or not os.environ.get("INVOCATION_ID")
-                    else 0
+                    0 if os.environ.get("INVOCATION_ID") else GATEWAY_SERVICE_RESTART_EXIT_CODE
                 )
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 

@@ -152,12 +152,12 @@ async def test_text_handler_uses_effective_message_for_channel_post(telegram_ada
     adapter = _make_adapter(telegram_adapter_cls)
     msg = _make_channel_message()
     update = _make_channel_update(msg)
-    adapter._enqueue_text_event = MagicMock()
+    adapter.handle_message = AsyncMock()
 
     await adapter._handle_text_message(update, MagicMock())
 
-    adapter._enqueue_text_event.assert_called_once()
-    event = adapter._enqueue_text_event.call_args.args[0]
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
     assert event.text == "channel id test @hermes_bot"
     assert event.message_type == MessageType.TEXT
     assert event.source.chat_type == "channel"

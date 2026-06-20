@@ -728,7 +728,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # A concurrent connect(board=normed) after the rename/delete recreates
     # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
     # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    _forget_initialized_path(d / "kanban.db")
 
     if archive:
         archive_root = boards_root() / "_archived"
@@ -1167,6 +1167,7 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+_INITIALIZED_SIGNATURES: dict[str, tuple[int, int, int, int]] = {}
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
@@ -1203,6 +1204,33 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
+
+
+def _db_signature(path: Path) -> Optional[tuple[int, int, int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _forget_initialized_path(path: Path | str) -> None:
+    resolved = str(Path(path).resolve())
+    _INITIALIZED_PATHS.discard(resolved)
+    _INITIALIZED_SIGNATURES.pop(resolved, None)
+
+
+def _sqlite_error_indicates_corruption(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "database disk image is malformed",
+            "file is not a database",
+            "malformed database schema",
+            "database schema is corrupt",
+        )
+    )
 
 
 @contextlib.contextmanager
@@ -1410,11 +1438,17 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     except OSError:
         return
     try:
-        if not resolved.exists() or resolved.stat().st_size == 0:
+        stat = resolved.stat()
+        if not resolved.exists() or stat.st_size == 0:
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    resolved_str = str(resolved)
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if (
+        resolved_str in _INITIALIZED_PATHS
+        and _INITIALIZED_SIGNATURES.get(resolved_str) == signature
+    ):
         return
     reason: Optional[str] = None
     try:
@@ -1425,13 +1459,19 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             probe.close()
         if not row or (row[0] or "").lower() != "ok":
             reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
-    except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
-        raise
+    except sqlite3.OperationalError as exc:
+        if _sqlite_error_indicates_corruption(exc):
+            reason = str(exc)
+        else:
+            # Lock contention, busy, transient IO — not corruption. Let it propagate.
+            raise
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
+        if resolved_str in _INITIALIZED_PATHS:
+            _INITIALIZED_SIGNATURES[resolved_str] = signature
         return
+    _forget_initialized_path(resolved)
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
@@ -1485,7 +1525,15 @@ def connect(
                 # falls back to DELETE with one WARNING so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                try:
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                except sqlite3.DatabaseError as exc:
+                    if _sqlite_error_indicates_corruption(exc):
+                        conn.close()
+                        _forget_initialized_path(path)
+                        backup = _backup_corrupt_db(path.resolve())
+                        raise KanbanDbCorruptError(path.resolve(), backup, str(exc)) from exc
+                    raise
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
@@ -1507,6 +1555,9 @@ def connect(
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
                     _INITIALIZED_PATHS.add(resolved)
+                    signature = _db_signature(path)
+                    if signature is not None:
+                        _INITIALIZED_SIGNATURES[resolved] = signature
         except Exception:
             conn.close()
             raise

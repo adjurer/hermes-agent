@@ -647,6 +647,10 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> Optional[int]:
         if reply_to:
             return int(reply_to)
+        if metadata and metadata.get("telegram_reply_to_message_id") is not None:
+            if reply_to_mode == "off":
+                return None
+            return cls._metadata_reply_to_message_id(metadata)
         if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
             if reply_to_mode == "off":
                 return None
@@ -2295,7 +2299,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
                 )
                 reply_to_source = reply_to or (
-                    str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
+                    str(metadata_reply_to) if metadata_reply_to is not None else None
                 )
                 if private_dm_topic_send:
                     should_thread = (
@@ -5788,7 +5792,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
-        await self._ensure_forum_commands(update.message)
+        await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)

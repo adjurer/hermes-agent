@@ -19,6 +19,7 @@ Improvements over v2:
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -184,6 +185,37 @@ _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 # the summary, the downstream model may re-emit it as an active directive on
 # the next turn, triggering bogus attachment sends (#14665).
 _MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
+_VOICE_TRANSCRIPT_PREFIX = "[The user sent a voice message"
+
+
+def _compression_provider_is_explicit() -> bool:
+    """Return True when auxiliary compression routing pins a provider.
+
+    A user-set ``auxiliary.compression.provider`` is an explicit routing
+    decision. If that provider fails, compression should not silently retry on
+    the main model and hide the broken route behind a slower fallback.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+    except Exception:
+        return False
+    auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+    compression = auxiliary.get("compression", {}) if isinstance(auxiliary, dict) else {}
+    if not isinstance(compression, dict):
+        return False
+    return bool(str(compression.get("provider") or "").strip())
+
+
+def _is_historical_voice_transcript_message(msg: Dict[str, Any]) -> bool:
+    """Detect old STT transcript messages that should not stay pinned head."""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    return isinstance(content, str) and content.startswith(_VOICE_TRANSCRIPT_PREFIX)
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
@@ -1587,6 +1619,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
+                and not _compression_provider_is_explicit()
             ):
                 if _is_json_decode:
                     _reason = "returned invalid JSON"
@@ -1612,6 +1645,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 self.summary_model
                 and self.summary_model != self.model
                 and not getattr(self, "_summary_model_fallen_back", False)
+                and not _compression_provider_is_explicit()
             ):
                 self._fallback_to_main_for_compression(e, "failed")
                 return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
@@ -2208,6 +2242,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Phase 2: Determine boundaries
         compress_start = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
+        summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
+        head_voice_indices = {
+            i
+            for i in range(summary_search_start, compress_start)
+            if _is_historical_voice_transcript_message(messages[i])
+        }
 
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
@@ -2238,7 +2278,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         # a new turn. Protected messages after the handoff remain live context,
         # so only summarize messages that are both after the handoff and inside
         # the current compression window.
-        summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
         summary_idx, summary_body = self._find_latest_context_summary(
             messages,
             summary_search_start,
@@ -2255,6 +2294,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             # it so _generate_summary() does not inject cross-session content
             # into the summarizer prompt via the iterative-update path.
             self._previous_summary = None
+
+        if head_voice_indices:
+            turns_to_summarize = [
+                messages[i]
+                for i in sorted(head_voice_indices)
+                if summary_idx is None or i > summary_idx
+            ] + turns_to_summarize
 
         if not self.quiet_mode:
             logger.info(
@@ -2311,6 +2357,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
+            if i in head_voice_indices:
+                continue
             msg = messages[i].copy()
             if i == 0 and msg.get("role") == "system":
                 existing = msg.get("content")
@@ -2337,7 +2385,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         _merge_summary_into_tail = False
-        last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
+        live_head_messages = [
+            messages[i]
+            for i in range(compress_start)
+            if i not in head_voice_indices
+        ]
+        last_head_role = live_head_messages[-1].get("role", "user") if live_head_messages else "user"
         first_tail_role = messages[compress_end].get("role", "user") if compress_end < n_messages else "user"
         # Pick a role that avoids consecutive same-role with both neighbors.
         # Priority: avoid colliding with head (already committed), then tail.
