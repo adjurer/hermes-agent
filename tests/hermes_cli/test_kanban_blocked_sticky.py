@@ -99,6 +99,63 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         assert kb.get_task(conn, child).status == "blocked"
 
 
+def test_review_required_block_promotes_reviewer_child(kanban_home: Path) -> None:
+    """A worker's review-required block must stay sticky, while its
+    reviewer child is allowed to start.
+
+    This pins the Yuri flow: implementation blocks with
+    ``review-required`` after producing artifacts, then the existing reviewer
+    card should become ready instead of leaving the user with only the intake
+    acknowledgement.
+    """
+    with kb.connect() as conn:
+        impl = kb.create_task(conn, title="implemented artifact")
+        reviewer = kb.create_task(
+            conn,
+            title="review implemented artifact",
+            assignee="reviewer",
+            parents=[impl],
+        )
+
+        kb.claim_task(conn, impl)
+        kb.block_task(
+            conn,
+            impl,
+            reason="review-required: verify generated MVP before reporting",
+            expected_run_id=kb.get_task(conn, impl).current_run_id,
+        )
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 1
+        assert kb.get_task(conn, impl).status == "blocked"
+        assert kb.get_task(conn, reviewer).status == "ready"
+
+
+def test_admin_required_block_promotes_reviewer_child_for_final_report(kanban_home: Path) -> None:
+    """A blocked parent can be a final-report input, not only a blocker."""
+    with kb.connect() as conn:
+        ops = kb.create_task(conn, title="update tailscale", assignee="ops")
+        reviewer = kb.create_task(
+            conn,
+            title="review all requested lanes",
+            assignee="reviewer",
+            parents=[ops],
+        )
+
+        kb.claim_task(conn, ops)
+        kb.block_task(
+            conn,
+            ops,
+            reason="admin-required: sudo approval is required",
+            expected_run_id=kb.get_task(conn, ops).current_run_id,
+        )
+
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 1
+        assert kb.get_task(conn, ops).status == "blocked"
+        assert kb.get_task(conn, reviewer).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------

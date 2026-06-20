@@ -18,6 +18,8 @@ KANBAN_METHODS = [
     "_kanban_unsub",
     "_kanban_rewind",
     "_deliver_kanban_artifacts",
+    "_kanban_artifact_candidates",
+    "_kanban_artifact_status",
 ]
 
 

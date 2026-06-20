@@ -755,29 +755,55 @@ class TestSendDocument:
         assert len(call_kwargs["caption"]) == 1024
 
     @pytest.mark.asyncio
-    async def test_send_document_api_error_falls_back(self, connected_adapter, tmp_path):
-        """If Telegram API raises, falls back to base class text message."""
+    async def test_send_document_api_error_returns_failure_without_text_fallback(self, connected_adapter, tmp_path):
+        """If Telegram document upload fails, do not fake delivery with a file-path text."""
         test_file = tmp_path / "file.pdf"
         test_file.write_bytes(b"data")
 
         connected_adapter._bot.send_document = AsyncMock(
             side_effect=RuntimeError("Telegram API error")
         )
-
-        # The base fallback calls self.send() which is also on _bot, so mock it
-        # to avoid cascading errors.
-        connected_adapter.send = AsyncMock(
-            return_value=SendResult(success=True, message_id="fallback")
-        )
+        connected_adapter.send = AsyncMock()
 
         result = await connected_adapter.send_document(
             chat_id="12345",
             file_path=str(test_file),
         )
 
-        # Should have fallen back to base class
+        assert result.success is False
+        assert "Telegram API error" in result.error
+        connected_adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_document_stale_reply_retries_without_reply_anchor(self, connected_adapter, tmp_path):
+        """A stale reply anchor should retry as a real document upload, not text fallback."""
+        class BadRequest(Exception):
+            pass
+
+        test_file = tmp_path / "evidence.json"
+        test_file.write_bytes(b'{"ok": true}')
+
+        mock_msg = MagicMock()
+        mock_msg.message_id = 105
+        connected_adapter._bot.send_document = AsyncMock(
+            side_effect=[BadRequest("Message to be replied not found"), mock_msg]
+        )
+        connected_adapter.send = AsyncMock()
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+            reply_to="50",
+        )
+
         assert result.success is True
-        assert result.message_id == "fallback"
+        assert result.message_id == "105"
+        assert connected_adapter._bot.send_document.call_count == 2
+        first = connected_adapter._bot.send_document.call_args_list[0][1]
+        second = connected_adapter._bot.send_document.call_args_list[1][1]
+        assert first["reply_to_message_id"] == 50
+        assert second["reply_to_message_id"] is None
+        connected_adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_document_reply_to(self, connected_adapter, tmp_path):

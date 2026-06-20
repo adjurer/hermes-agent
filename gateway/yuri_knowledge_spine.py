@@ -25,6 +25,9 @@ SCHEMA_VERSION = "yuri-knowledge-spine-v1"
 GRAPH_SCHEMA_VERSION = "yuri-knowledge-graph-v1"
 OKF_VERSION = "0.1"
 LEARNING_SCHEMA_VERSION = "yuri-learning-v1"
+GRAPHITI_EPISODE_SCHEMA_VERSION = "yuri-graphiti-episodes-v1"
+FAILURE_SCHEMA_VERSION = "yuri-failure-case-v1"
+REGRESSION_SCHEMA_VERSION = "yuri-regression-candidate-v1"
 
 OPERATING_RULES = [
     "Yuri is the front-desk chief of staff, not the sole worker.",
@@ -32,6 +35,8 @@ OPERATING_RULES = [
     "Workers must use current evidence and source-of-truth checks instead of stale memory or guesses.",
     "User-facing completion must be a reviewed result, not internal routing chatter.",
     "If intent, evidence, or deliverables are incomplete, hold the final report and state the missing proof.",
+    "If a final report mentions a file, attachment, document, or filename, the native attachment must be available and delivered; otherwise hold for rework.",
+    "For codebase reading, bug investigation, tests, refactoring, repository structure, or PR review, workers may use /Users/tbd/.hermes/bin/hermes-gajae-run; do not use Gajae-Code for non-development research, Yuri replies, or final reports.",
 ]
 
 REVIEW_CONTRACT = {
@@ -66,8 +71,20 @@ def _okf_bundle_path() -> Path:
     return _spine_root() / "okf_bundle"
 
 
+def _graphiti_episodes_path() -> Path:
+    return _spine_root() / "graphiti_episodes.jsonl"
+
+
 def _lessons_path() -> Path:
     return _spine_root() / "lessons.jsonl"
+
+
+def _failures_path() -> Path:
+    return _spine_root() / "failures.jsonl"
+
+
+def _regression_candidates_path() -> Path:
+    return _spine_root() / "regression_candidates.jsonl"
 
 
 def _utc_iso(ts: Optional[float] = None) -> str:
@@ -580,7 +597,9 @@ def _lesson_from_review(row: dict[str, Any]) -> Optional[dict[str, Any]]:
             "Require review_status=pass before user-facing report. "
             "For similar Yuri front-desk requests, preserve the Telegram intent, "
             "route actionable work through planner/office flow, and report only "
-            "the reviewer-approved final result."
+            "the reviewer-approved final result. If the final result claims a "
+            "file or attachment, verify that the native attachment is available "
+            "and delivered before sending the completion report."
         ),
     }
 
@@ -619,6 +638,233 @@ def _append_lesson(lesson: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(_jsonable(lesson), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_jsonable(row), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _read_jsonl_unique(path: Path, *, id_key: str, limit: int = 200) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        row_id = str(row.get(id_key) or "")
+        if row_id and row_id in seen:
+            continue
+        if row_id:
+            seen.add(row_id)
+        out.append(row)
+        if len(out) >= max(0, int(limit)):
+            break
+    out.reverse()
+    return out
+
+
+_FAILURE_HINTS = {
+    "file_claim_without_media": {
+        "root_cause": "파일 전송 완료 표현이 실제 첨부 evidence보다 먼저 나갔습니다.",
+        "expected_behavior": "전송 API 결과나 media/document evidence가 없으면 전송 완료라고 말하지 않습니다.",
+        "forbidden_behavior": "파일을 보냈다고 말하고 실제 첨부를 누락하는 것.",
+        "test_prompt": "파일 보냈다고 보고하기 전에 실제 첨부 확인이 필요한가요?",
+    },
+    "linebreak_or_readability": {
+        "root_cause": "긴 Telegram 보고가 문단/목록으로 나뉘지 않아 읽기 어렵습니다.",
+        "expected_behavior": "최종 보고는 짧은 문단과 목록으로 줄바꿈해서 보냅니다.",
+        "forbidden_behavior": "긴 한 문단으로 보고하거나 줄바꿈 적용을 확인 없이 주장하는 것.",
+        "test_prompt": "보고 문장 줄바꿈 규칙이 적용됐나요?",
+    },
+    "misunderstood_intent": {
+        "root_cause": "최근 Telegram/Telethon 의도 확인 없이 오래된 기억이나 일반 라우팅으로 답했습니다.",
+        "expected_behavior": "유리 오해/말귀/답답함 지적은 최신 대화와 live config/code evidence를 먼저 봅니다.",
+        "forbidden_behavior": "설정했다거나 확인했다고 말하면서 실제 변경/readback 증거를 남기지 않는 것.",
+        "test_prompt": "유리가 말귀를 못 알아듣는다는 지적은 어떤 순서로 확인해야 하나요?",
+    },
+    "completion_without_review": {
+        "root_cause": "검수 통과와 승인된 최종문안 없이 완료 보고가 나가려 했습니다.",
+        "expected_behavior": "review_status=pass, intent_source, approved_final_text가 있어야 최종 보고합니다.",
+        "forbidden_behavior": "검수/승인 문안 없이 마무리 또는 완료라고 보고하는 것.",
+        "test_prompt": "완료 보고 전에 필요한 검수 metadata는 무엇인가요?",
+    },
+    "data_trust_insufficient": {
+        "root_cause": "데이터/파일 결과의 원천, 행수, readback, 검증 명령, 잔여 리스크가 부족했습니다.",
+        "expected_behavior": "데이터 산출물은 원천·count·sample/readback·검증·리스크 증거를 갖춘 뒤 보고합니다.",
+        "forbidden_behavior": "증거 없이 완료/확보/전수 확인을 말하는 것.",
+        "test_prompt": "데이터 결과를 완료 보고하려면 어떤 증거가 필요한가요?",
+    },
+    "overrouting_simple_question": {
+        "root_cause": "간단한 상태/설정/기억 질문을 작업 라우팅으로 넘겼습니다.",
+        "expected_behavior": "짧은 사실·상태·진단 질문은 유리가 직접 답하고 실제 변경 지시만 작업으로 보냅니다.",
+        "forbidden_behavior": "바로 답할 수 있는 질문을 기획실/칸반으로 넘기는 것.",
+        "test_prompt": "기억 설정은 뭐가 있냐는 질문은 바로 답해야 하나요?",
+    },
+    "ai_processing_source_misrouted": {
+        "root_cause": "AI 처리 출처 질문을 '진행중' 단어 때문에 현재 작업 상태 질문으로 오분류했습니다.",
+        "expected_behavior": "로컬/GPT/모델/AI 처리 출처 질문은 직전 파이프라인 맥락을 유지하고, 현재 증거를 확인하거나 작업으로 라우팅합니다.",
+        "forbidden_behavior": "AI 처리 출처 질문에 '지금 실제로 진행 중인 작업은 없습니다' 같은 칸반 상태로 답하는 것.",
+        "test_prompt": "ai 처리가 로컬로 돌고있니? 아님 내 gpt로 진행중이니?",
+    },
+    "context_drift_followup": {
+        "root_cause": "후속 질문을 직전 주제 안에서 해석하지 않고 전체 운영 개선처럼 범위를 넓혔습니다.",
+        "expected_behavior": "사용자가 '또', '그럼', '이제', '더'처럼 이어 말하면 직전 주제를 기본 범위로 삼고, 범위를 넓힐 때만 명시합니다.",
+        "forbidden_behavior": "직전 주제가 줄바꿈/문체인데 갑자기 전체 시스템 개선 목록으로 확장하는 것.",
+        "test_prompt": "줄바꿈 조정 직후 '또 개선할 게 뭐가 있을까?'라고 하면 어느 범위로 답해야 하나요?",
+    },
+}
+
+
+def _classify_failure_case(
+    user_text: str,
+    observed_behavior: str = "",
+    issue_code: str = "",
+) -> str:
+    text = f"{user_text}\n{observed_behavior}\n{issue_code}"
+    if issue_code in _FAILURE_HINTS:
+        return issue_code
+    if re.search(r"(?:파일|첨부|전송|보냈).{0,30}(?:못|누락|안\s*보|없)", text):
+        return "file_claim_without_media"
+    if re.search(
+        r"(?:ai|gpt|모델|로컬|local).{0,50}(?:처리|분류|돌|진행|쓰고|사용)|"
+        r"(?:처리|분류).{0,50}(?:로컬|local|gpt|모델|내\s*gpt)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "ai_processing_source_misrouted"
+    if re.search(r"(?:맥락|문맥|직전|방금|후속|follow.?up|벗어나|이탈|넓혔|확장)", text, re.IGNORECASE):
+        return "context_drift_followup"
+    if re.search(r"(?:줄바꿈|가독성|읽기|문단)", text):
+        return "linebreak_or_readability"
+    if re.search(r"(?:말귀|못알아|못\s*알아|답답|멍청|이상한|헛소리|왜\s*그래)", text):
+        return "misunderstood_intent"
+    if re.search(r"(?:완료|마무리|보고).{0,30}(?:보류|검수|재검수|승인)", text):
+        return "completion_without_review"
+    if re.search(r"(?:데이터|자료|파일|행수|row|count|누락|전수|검증|신뢰도)", text):
+        return "data_trust_insufficient"
+    if re.search(r"(?:넘기|라우팅|칸반|기획실).{0,30}(?:인사|간단|기억|설정|상태)", text):
+        return "overrouting_simple_question"
+    return "misunderstood_intent"
+
+
+def _failure_text(row: dict[str, Any]) -> str:
+    parts = [
+        row.get("user_text"),
+        row.get("observed_behavior"),
+        row.get("root_cause"),
+        row.get("expected_behavior"),
+        row.get("forbidden_behavior"),
+        row.get("category"),
+        " ".join(str(v) for v in row.get("trigger_terms") or []),
+    ]
+    return _safe_text("\n".join(str(part) for part in parts if part), limit=6000)
+
+
+def _summarize_failure_case(row: dict[str, Any]) -> str:
+    category = row.get("category") or "failure"
+    text = _safe_text(row.get("user_text"), limit=100)
+    expected = _safe_text(row.get("expected_behavior"), limit=140)
+    return f"{row.get('created_at') or ''} failure {category}: {text} expected={expected}"
+
+
+def _regression_candidate_from_failure(row: dict[str, Any]) -> dict[str, Any]:
+    category = str(row.get("category") or "misunderstood_intent")
+    prompt = str(row.get("test_prompt") or _FAILURE_HINTS.get(category, {}).get("test_prompt") or row.get("user_text") or "")
+    return {
+        "schema_version": REGRESSION_SCHEMA_VERSION,
+        "candidate_id": _stable_hash(row.get("failure_id"), prompt, length=20),
+        "created_at": _utc_iso(),
+        "source_failure_id": row.get("failure_id"),
+        "category": category,
+        "prompt": _safe_text(prompt, limit=300),
+        "expected_behavior": _safe_text(row.get("expected_behavior"), limit=600),
+        "forbidden_behavior": _safe_text(row.get("forbidden_behavior"), limit=600),
+        "suggested_test_name": f"test_yuri_{re.sub(r'[^a-z0-9_]+', '_', category.lower()).strip('_')}",
+        "status": "candidate",
+    }
+
+
+def record_failure_case(
+    *,
+    user_text: str,
+    observed_behavior: str = "",
+    source: str = "manual",
+    issue_code: str = "",
+    task_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    root_cause: str = "",
+    expected_behavior: str = "",
+    forbidden_behavior: str = "",
+    test_prompt: str = "",
+) -> dict[str, Any]:
+    """Record a Yuri failure as a durable lesson source and regression seed."""
+    category = _classify_failure_case(user_text, observed_behavior, issue_code)
+    defaults = _FAILURE_HINTS.get(category, {})
+    root = _safe_text(root_cause or defaults.get("root_cause") or observed_behavior, limit=800)
+    expected = _safe_text(expected_behavior or defaults.get("expected_behavior") or "", limit=800)
+    forbidden = _safe_text(forbidden_behavior or defaults.get("forbidden_behavior") or "", limit=800)
+    prompt = _safe_text(test_prompt or defaults.get("test_prompt") or user_text, limit=300)
+    row = {
+        "schema_version": FAILURE_SCHEMA_VERSION,
+        "failure_id": _stable_hash(
+            category,
+            source,
+            user_text,
+            observed_behavior,
+            task_id,
+            message_id,
+            length=20,
+        ),
+        "created_at": _utc_iso(),
+        "source": _safe_text(source, limit=120),
+        "category": category,
+        "issue_code": _safe_text(issue_code or category, limit=120),
+        "task_id": _safe_text(task_id, limit=120) if task_id else "",
+        "message_id": _safe_text(message_id, limit=120) if message_id else "",
+        "trigger_terms": _trigger_terms("\n".join([user_text, observed_behavior, category])),
+        "user_text": _safe_text(user_text, limit=2000),
+        "observed_behavior": _safe_text(observed_behavior, limit=2000),
+        "root_cause": root,
+        "expected_behavior": expected,
+        "forbidden_behavior": forbidden,
+        "test_prompt": prompt,
+    }
+    _append_jsonl(_failures_path(), row)
+    _append_jsonl(_regression_candidates_path(), _regression_candidate_from_failure(row))
+    return row
+
+
+def _read_failure_cases(limit: int = 200) -> list[dict[str, Any]]:
+    return _read_jsonl_unique(_failures_path(), id_key="failure_id", limit=limit)
+
+
+def _read_regression_candidates(limit: int = 200) -> list[dict[str, Any]]:
+    return _read_jsonl_unique(_regression_candidates_path(), id_key="candidate_id", limit=limit)
+
+
+def recall_failure_cases(query: str, *, limit: int = 4) -> list[dict[str, Any]]:
+    query = _safe_text(query, limit=1000)
+    if not query:
+        return _read_failure_cases(limit=limit)[-limit:]
+    q_tokens = _tokens(query)
+    scored: list[tuple[int, str, dict[str, Any]]] = []
+    for row in _read_failure_cases(limit=500):
+        score = len(q_tokens & _tokens(_failure_text(row)))
+        if score:
+            scored.append((score, str(row.get("created_at") or ""), row))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [row for _, _, row in scored[: int(limit)]]
 
 
 def _derive_learning_from_event(row: dict[str, Any]) -> None:
@@ -741,6 +987,7 @@ def build_context_pack(
 ) -> dict[str, Any]:
     relevant = recall_relevant_events(original_user_text, limit=relevant_limit)
     lessons = recall_lessons(original_user_text, limit=lesson_limit)
+    failures = recall_failure_cases(original_user_text, limit=min(3, lesson_limit))
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_iso(),
@@ -757,6 +1004,9 @@ def build_context_pack(
         ],
         "learned_patterns": [
             _summarize_lesson(lesson) for lesson in lessons
+        ],
+        "failure_patterns": [
+            _summarize_failure_case(row) for row in failures
         ],
         "recent_spine_events": [
             _summarize_event(row) for row in recent_events(limit=recent_limit)
@@ -790,6 +1040,7 @@ def render_context_pack(pack: dict[str, Any]) -> str:
     recent = pack.get("recent_spine_events") or []
     relevant = pack.get("relevant_spine_events") or []
     learned = pack.get("learned_patterns") or []
+    failures = pack.get("failure_patterns") or []
     if relevant:
         lines.append("- relevant_spine_events:")
         for item in relevant:
@@ -797,6 +1048,10 @@ def render_context_pack(pack: dict[str, Any]) -> str:
     if learned:
         lines.append("- learned_patterns:")
         for item in learned:
+            lines.append(f"  - {_safe_text(item, limit=300)}")
+    if failures:
+        lines.append("- failure_patterns_to_avoid:")
+        for item in failures:
             lines.append(f"  - {_safe_text(item, limit=300)}")
     if recent:
         lines.append("- recent_spine_events:")
@@ -978,6 +1233,111 @@ def build_graph_export_report(query: str = "", *, limit: int = 20) -> str:
     else:
         lines.append("- edges: none")
     return "\n".join(lines)
+
+
+def _graphiti_episode_from_row(
+    row: dict[str, Any],
+    *,
+    group_id: str = "yuri",
+    previous_episode_uuid: str = "",
+) -> dict[str, Any]:
+    payload = _event_payload(row)
+    event_id = str(row.get("event_id") or uuid.uuid4().hex)
+    kind = str(row.get("kind") or "event")
+    task_id = _event_task_id(payload)
+    episode_body = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": event_id,
+        "event_kind": kind,
+        "task_id": task_id,
+        "created_at": row.get("created_at"),
+        "payload": _jsonable(payload),
+        "projected_edges": _project_graph_edges(row),
+    }
+    arguments: dict[str, Any] = {
+        "name": f"Yuri {kind} {event_id[:8]}",
+        "episode_body": json.dumps(episode_body, ensure_ascii=False, sort_keys=True),
+        "source": "json",
+        "source_description": "Hermes Yuri knowledge spine",
+        "reference_time": row.get("created_at") or _utc_iso(),
+        "group_id": group_id or "yuri",
+    }
+    if previous_episode_uuid:
+        arguments["previous_episode_uuids"] = [previous_episode_uuid]
+    return {
+        "schema_version": GRAPHITI_EPISODE_SCHEMA_VERSION,
+        "event_id": event_id,
+        "event_kind": kind,
+        "task_id": task_id,
+        "created_at": row.get("created_at"),
+        "graphiti_tool": "add_memory",
+        "graphiti_legacy_tool": "add_episode",
+        "arguments": arguments,
+    }
+
+
+def export_graphiti_episodes(
+    query: str = "",
+    *,
+    limit: int = 200,
+    output_path: Optional[str | Path] = None,
+    group_id: str = "yuri",
+) -> dict[str, Any]:
+    """Write Graphiti MCP add_memory-ready episode JSONL from Yuri spine events."""
+    limit = max(1, int(limit))
+    query = _safe_text(query, limit=500)
+    rows = recall_relevant_events(query, limit=limit) if query else _all_events_from_jsonl(limit=limit)
+    out = Path(output_path).expanduser() if output_path else _graphiti_episodes_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    previous_episode_uuid = ""
+    with out.open("w", encoding="utf-8") as f:
+        for row in rows:
+            episode = _graphiti_episode_from_row(
+                row,
+                group_id=group_id,
+                previous_episode_uuid=previous_episode_uuid,
+            )
+            f.write(json.dumps(episode, ensure_ascii=False, sort_keys=True) + "\n")
+            previous_episode_uuid = str(episode.get("event_id") or "")
+            written += 1
+    return {
+        "schema_version": GRAPHITI_EPISODE_SCHEMA_VERSION,
+        "query": query,
+        "group_id": group_id or "yuri",
+        "output_path": str(out),
+        "episodes_exported": written,
+        "source_of_truth": str(_events_path()),
+        "graph_edges_jsonl": str(_graph_edges_path()),
+    }
+
+
+def build_graphiti_export_report(
+    query: str = "",
+    *,
+    limit: int = 200,
+    output_path: Optional[str | Path] = None,
+    group_id: str = "yuri",
+) -> str:
+    result = export_graphiti_episodes(
+        query=query,
+        limit=limit,
+        output_path=output_path,
+        group_id=group_id,
+    )
+    return "\n".join(
+        [
+            "Yuri Graphiti export",
+            f"- query: {result['query'] or '(recent/all)'}",
+            f"- schema_version: {result['schema_version']}",
+            f"- group_id: {result['group_id']}",
+            f"- output_path: {result['output_path']}",
+            f"- episodes_exported: {result['episodes_exported']}",
+            f"- source_of_truth: {result['source_of_truth']}",
+            "- ingest_note: each JSONL line contains Graphiti MCP add_memory arguments; load only after Graphiti/FalkorDB or Neo4j is running.",
+        ]
+    )
 
 
 _OKF_FILE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -1216,12 +1576,18 @@ def build_okf_export_report(
 def build_learning_report(query: str = "", *, limit: int = 8) -> str:
     query = _safe_text(query, limit=500)
     lessons = recall_lessons(query, limit=limit) if query else _read_lessons(limit=limit)
+    failures = recall_failure_cases(query, limit=min(limit, 8)) if query else _read_failure_cases(limit=min(limit, 8))
+    candidates = _read_regression_candidates(limit=min(limit, 8))
     lines = [
         "Yuri learning report",
         f"- query: {query or '(recent lessons)'}",
         f"- lessons_path: {_lessons_path()}",
+        f"- failures_path: {_failures_path()}",
+        f"- regression_candidates_path: {_regression_candidates_path()}",
         f"- matched_lessons: {len(lessons)}",
-        "- mechanism: review_pass lessons are generated from finalized reviewer-approved Yuri tasks and injected into future context packs.",
+        f"- matched_failure_patterns: {len(failures)}",
+        f"- regression_candidates: {len(candidates)}",
+        "- mechanism: review_pass lessons and failure patterns are injected into future context packs; failure patterns also create regression-test candidates.",
     ]
     if lessons:
         lines.append("- lessons:")
@@ -1232,6 +1598,25 @@ def build_learning_report(query: str = "", *, limit: int = 8) -> str:
                 lines.append(f"    - rule: {rule}")
     else:
         lines.append("- lessons: none")
+    if failures:
+        lines.append("- failure_patterns:")
+        for row in failures:
+            lines.append(f"  - {_summarize_failure_case(row)}")
+            forbidden = _safe_text(row.get("forbidden_behavior"), limit=180)
+            if forbidden:
+                lines.append(f"    - forbidden: {forbidden}")
+    else:
+        lines.append("- failure_patterns: none")
+    if candidates:
+        lines.append("- regression_candidates:")
+        for row in candidates[-min(len(candidates), 5) :]:
+            lines.append(
+                "  - "
+                f"{row.get('suggested_test_name')}: "
+                f"{_safe_text(row.get('prompt'), limit=120)}"
+            )
+    else:
+        lines.append("- regression_candidates: none")
     return "\n".join(lines)
 
 

@@ -11346,6 +11346,21 @@ def cmd_memory(args):
             print(build_graph_export_report(query, limit=limit))
         else:
             print(export_graph_jsonl(query=query, limit=limit), end="")
+    elif sub == "graphiti-export":
+        from gateway.yuri_knowledge_spine import build_graphiti_export_report
+
+        query = " ".join(getattr(args, "query", []) or []).strip()
+        limit = max(1, int(getattr(args, "limit", 200) or 200))
+        output = getattr(args, "output", None)
+        group_id = getattr(args, "group_id", "yuri") or "yuri"
+        print(
+            build_graphiti_export_report(
+                query,
+                limit=limit,
+                output_path=output,
+                group_id=group_id,
+            )
+        )
     elif sub == "okf-export":
         from gateway.yuri_knowledge_spine import build_okf_export_report
 

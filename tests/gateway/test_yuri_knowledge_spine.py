@@ -93,6 +93,78 @@ def test_yuri_knowledge_spine_includes_recent_events(tmp_path, monkeypatch):
     assert "t_old" in second["recent_spine_events"][0]
 
 
+def test_yuri_failure_cases_seed_context_and_regression_candidates(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))
+
+    failure = spine.record_failure_case(
+        user_text="유리가 줄바꿈도 못하고 파일 보냈다고 하는데 첨부가 없습니다.",
+        observed_behavior="User reported unreadable Telegram output and missing attachment evidence.",
+        source="test",
+        message_id="m-fail",
+    )
+
+    assert failure["category"] in {"file_claim_without_media", "linebreak_or_readability"}
+    failures_path = tmp_path / "failures.jsonl"
+    regression_path = tmp_path / "regression_candidates.jsonl"
+    assert failures_path.is_file()
+    assert regression_path.is_file()
+
+    pack = spine.build_context_pack(
+        original_user_text="파일 보냈다는 보고가 맞는지 다시 확인해주세요.",
+        platform="telegram",
+    )
+    rendered = spine.render_context_pack(pack)
+    assert pack["failure_patterns"]
+    assert "failure_patterns_to_avoid" in rendered
+
+    report = spine.build_learning_report("파일 첨부", limit=5)
+    assert "matched_failure_patterns" in report
+    assert "regression_candidates" in report
+    assert "forbidden" in report
+
+
+def test_yuri_failure_case_tracks_followup_context_drift(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))
+
+    failure = spine.record_failure_case(
+        user_text="방금 맥락을 이해못하고 줄바꿈 얘기에서 전체 운영 개선으로 벗어났습니다.",
+        observed_behavior="Follow-up question after linebreak tuning was answered as broad system optimization.",
+        source="test",
+    )
+
+    assert failure["category"] == "context_drift_followup"
+    assert "직전 주제" in failure["expected_behavior"]
+
+    pack = spine.build_context_pack(
+        original_user_text="줄바꿈 말고 또 개선할 게 뭐가 있을까?",
+        platform="telegram",
+    )
+    rendered = spine.render_context_pack(pack)
+    assert "context_drift_followup" in rendered
+    assert "직전 주제" in rendered
+
+
+def test_yuri_failure_case_tracks_ai_processing_source_misroute(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))
+
+    failure = spine.record_failure_case(
+        user_text="ai 처리가 로컬로 돌고있니? 아님 내 gpt로 진행중이니?",
+        observed_behavior="Yuri answered generic Kanban status instead of preserving the poll collector AI-processing context.",
+        source="test",
+    )
+
+    assert failure["category"] == "ai_processing_source_misrouted"
+    assert "로컬/GPT/모델" in failure["expected_behavior"]
+
+    pack = spine.build_context_pack(
+        original_user_text="내 gpt로 진행중이니?",
+        platform="telegram",
+    )
+    rendered = spine.render_context_pack(pack)
+    assert "ai_processing_source_misrouted" in rendered
+    assert "파이프라인 맥락" in rendered
+
+
 def test_yuri_knowledge_spine_recalls_relevant_events(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path))
 
@@ -209,3 +281,33 @@ def test_yuri_knowledge_spine_exports_okf_bundle(tmp_path, monkeypatch):
     assert "type: \"Yuri Task\"" in (out_dir / "tasks" / "t_okf.md").read_text(encoding="utf-8")
     assert "Yuri OKF export" in report
     assert "conformance" in report
+
+
+def test_yuri_knowledge_spine_exports_graphiti_episodes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+
+    pack = spine.build_context_pack(
+        original_user_text="파일 첨부 누락을 반복하지 않게 해주세요.",
+        platform="telegram",
+        message_id="m-graphiti",
+    )
+    spine.record_intake(pack, task_id="t_graphiti")
+    spine.record_review_result(
+        root_task_id="t_graphiti",
+        reviewer_task_id="t_review_graphiti",
+        approved_final_text="첨부 누락 방지 회귀 테스트를 추가했습니다.",
+        intent_source="telethon",
+        board="telegram-inbox",
+    )
+
+    out = tmp_path / "graphiti.jsonl"
+    result = spine.export_graphiti_episodes(output_path=out, group_id="yuri-test")
+    lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+
+    assert result["schema_version"] == "yuri-graphiti-episodes-v1"
+    assert result["episodes_exported"] == 2
+    assert len(lines) == 2
+    assert lines[0]["graphiti_tool"] == "add_memory"
+    assert lines[0]["arguments"]["source"] == "json"
+    assert lines[0]["arguments"]["group_id"] == "yuri-test"
+    assert "episode_body" in lines[0]["arguments"]

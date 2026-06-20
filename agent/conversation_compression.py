@@ -271,6 +271,14 @@ def replay_compression_warning(agent: Any) -> None:
     warning.
     """
     msg = getattr(agent, "_compression_warning", None)
+    platform = str(getattr(agent, "platform", "") or "").lower()
+    if (
+        msg
+        and "Codex gpt-5.5 caps context" in str(msg)
+        and platform
+        and platform not in {"cli", "terminal", "console"}
+    ):
+        return
     if msg and agent.status_callback:
         try:
             agent.status_callback("lifecycle", msg)

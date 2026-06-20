@@ -65,6 +65,28 @@ async def test_memory_graph_export_command_returns_yuri_graph_report(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_memory_graphiti_export_command_returns_yuri_graphiti_report(tmp_path, monkeypatch):
+    from gateway import yuri_knowledge_spine as spine
+
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+
+    pack = spine.build_context_pack(
+        original_user_text="같은 실수를 반복하지 않게 기억 레일을 개선해주세요.",
+        platform="telegram",
+    )
+    spine.record_intake(pack, task_id="t_graphiti_cmd")
+
+    runner = object.__new__(GatewayRunner)
+    out = await runner._handle_memory_command(
+        _event("/memory graphiti-export 같은 실수")
+    )
+
+    assert "Yuri Graphiti export" in out
+    assert "schema_version: yuri-graphiti-episodes-v1" in out
+    assert "episodes_exported: 1" in out
+
+
+@pytest.mark.asyncio
 async def test_memory_okf_export_command_returns_yuri_okf_report(tmp_path, monkeypatch):
     from gateway import yuri_knowledge_spine as spine
 

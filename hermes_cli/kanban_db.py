@@ -2899,11 +2899,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "gave_up"}
 
 
 def recompute_ready(
@@ -2942,7 +2942,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, assignee, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -2955,12 +2955,23 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status, "
+                "COALESCE(("
+                "  SELECT e.payload FROM task_events e "
+                "   WHERE e.task_id = t.id AND e.kind = 'blocked' "
+                "   ORDER BY e.id DESC LIMIT 1"
+                "), '') AS latest_block_payload "
+                "FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            def _parent_satisfied(parent: sqlite3.Row) -> bool:
+                if parent["status"] in ("done", "archived"):
+                    return True
+                return bool(row["assignee"] == "reviewer" and parent["status"] == "blocked")
+
+            if all(_parent_satisfied(p) for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3027,15 +3038,7 @@ def claim_task(
             "JOIN tasks c ON c.id = l.child_id "
             "WHERE l.child_id = ? "
             "  AND p.status NOT IN ('done', 'archived') "
-            "  AND NOT ("
-            "    c.assignee = 'reviewer' "
-            "    AND p.status = 'blocked' "
-            "    AND COALESCE(("
-            "      SELECT e.payload FROM task_events e "
-            "       WHERE e.task_id = p.id AND e.kind = 'blocked' "
-            "       ORDER BY e.id DESC LIMIT 1"
-            "    ), '') LIKE '%review-required:%'"
-            "  ) "
+            "  AND NOT (c.assignee = 'reviewer' AND p.status = 'blocked') "
             "LIMIT 1",
             (task_id,),
         ).fetchone()

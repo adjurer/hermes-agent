@@ -70,6 +70,31 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default="jsonl",
         help="Output JSONL for ingestion or a compact human summary",
     )
+    _graphiti_parser = memory_sub.add_parser(
+        "graphiti-export",
+        help="Write Graphiti MCP add_memory-ready episode JSONL from Yuri knowledge-spine events",
+    )
+    _graphiti_parser.add_argument(
+        "query",
+        nargs="*",
+        help="Optional free-text query; omitted means recent/all spine events",
+    )
+    _graphiti_parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum spine events to export",
+    )
+    _graphiti_parser.add_argument(
+        "--output",
+        default=None,
+        help="Output JSONL path; defaults to the Yuri spine graphiti_episodes.jsonl",
+    )
+    _graphiti_parser.add_argument(
+        "--group-id",
+        default="yuri",
+        help="Graphiti group_id namespace",
+    )
     _okf_parser = memory_sub.add_parser(
         "okf-export",
         help="Export Yuri knowledge-spine memory as an OKF v0.1 markdown bundle",

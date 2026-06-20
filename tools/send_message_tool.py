@@ -1088,9 +1088,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 send_path = media_path
                 display_name = None
                 if not (ext in _IMAGE_EXTS and not force_document) and ext not in _VIDEO_EXTS and not (ext in _VOICE_EXTS and is_voice) and ext not in _TELEGRAM_SEND_AUDIO_EXTS:
-                    from gateway.platforms.base import prepare_outbound_document_for_send
-
-                    send_path, display_name = prepare_outbound_document_for_send(media_path)
+                    # Keep the original filename for Telegram documents. Older
+                    # builds imported a helper that no longer exists here,
+                    # which made standalone `hermes send "MEDIA:/file.xlsx"`
+                    # report success while silently skipping the attachment.
+                    display_name = os.path.basename(media_path)
 
                 with open(send_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)

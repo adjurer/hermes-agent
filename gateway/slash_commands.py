@@ -45,6 +45,84 @@ from utils import (
 logger = logging.getLogger("gateway.run")
 
 
+def _is_gemma4_emergency_switch_result(result: Any) -> bool:
+    """Return True for the local Gemma 4 emergency endpoint switch."""
+    alias = str(getattr(result, "resolved_via_alias", "") or "").strip().lower()
+    provider = str(getattr(result, "target_provider", "") or "").strip().lower()
+    model = str(getattr(result, "new_model", "") or "").strip().lower()
+    base_url = str(getattr(result, "base_url", "") or "").strip().rstrip("/").lower()
+    return (
+        alias == "gemma4-emergency"
+        or provider == "custom:local-gemma4-emergency"
+        or (
+            base_url == "http://127.0.0.1:18080/v1"
+            and ("gemma" in model or "local-gemma4" in provider)
+        )
+    )
+
+
+def _gemma4_emergency_api_ready(timeout: float = 2.0) -> bool:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        "http://127.0.0.1:18080/v1/models",
+        headers={"Authorization": "Bearer local-gemma4-emergency"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= int(getattr(response, "status", 0)) < 300
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def _ensure_gemma4_emergency_server_sync() -> tuple[bool, str]:
+    """Ensure the local Gemma 4 server is available before switching to it."""
+    if _gemma4_emergency_api_ready():
+        return True, ""
+
+    start_script = Path("/Users/tbd/.hermes/bin/hermes-gemma4-emergency-start")
+    if not start_script.exists():
+        return False, f"Local Gemma 4 start script not found: {start_script}"
+    if not os.access(start_script, os.X_OK):
+        return False, f"Local Gemma 4 start script is not executable: {start_script}"
+
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            [str(start_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=210,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Timed out while starting the local Gemma 4 server."
+    except Exception as exc:
+        return False, f"Failed to start the local Gemma 4 server: {exc}"
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if len(detail) > 800:
+            detail = detail[-800:]
+        return False, (
+            "Local Gemma 4 server start command failed"
+            + (f": {detail}" if detail else ".")
+        )
+
+    if _gemma4_emergency_api_ready(timeout=5.0):
+        return True, "Local Gemma 4 server started."
+    return False, "Local Gemma 4 server started but /v1/models is still not ready."
+
+
+async def _ensure_local_model_server_for_switch(result: Any) -> tuple[bool, str]:
+    """Start prerequisite local model servers for known local switch targets."""
+    if not _is_gemma4_emergency_switch_result(result):
+        return True, ""
+    return await asyncio.to_thread(_ensure_gemma4_emergency_server_sync)
+
+
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
@@ -1054,6 +1132,9 @@ class GatewaySlashCommandsMixin:
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
+                        local_ready, local_notice = await _ensure_local_model_server_for_switch(result)
+                        if not local_ready:
+                            return t("gateway.model.error_prefix", error=local_notice)
 
                         # Update cached agent in-place
                         cached_entry = None
@@ -1115,6 +1196,8 @@ class GatewaySlashCommandsMixin:
                         plabel = result.provider_label or result.target_provider
                         lines = [t("gateway.model.switched", model=result.new_model)]
                         lines.append(t("gateway.model.provider_label", provider=plabel))
+                        if local_notice:
+                            lines.append(local_notice)
                         mi = result.model_info
                         from hermes_cli.model_switch import resolve_display_context_length
                         _sw_config_ctx = None
@@ -1209,6 +1292,10 @@ class GatewaySlashCommandsMixin:
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
+            local_ready, local_notice = await _ensure_local_model_server_for_switch(result)
+            if not local_ready:
+                return t("gateway.model.error_prefix", error=local_notice)
+
             # If there's a cached agent, update it in-place
             cached_entry = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -1302,6 +1389,8 @@ class GatewaySlashCommandsMixin:
             provider_label = result.provider_label or result.target_provider
             lines = [t("gateway.model.switched", model=result.new_model)]
             lines.append(t("gateway.model.provider_label", provider=provider_label))
+            if local_notice:
+                lines.append(local_notice)
 
             # Context: always resolve via the provider-aware chain so Codex OAuth,
             # Copilot, and Nous-enforced caps win over the raw models.dev entry.
@@ -2089,6 +2178,11 @@ class GatewaySlashCommandsMixin:
 
             query = " ".join(args[1:]).strip()
             return build_graph_export_report(query, limit=8)
+        if args and args[0] in {"graphiti-export", "graphiti"}:
+            from gateway.yuri_knowledge_spine import build_graphiti_export_report
+
+            query = " ".join(args[1:]).strip()
+            return build_graphiti_export_report(query, limit=50)
         if args and args[0] in {"okf-export", "okf"}:
             from gateway.yuri_knowledge_spine import build_okf_export_report
 

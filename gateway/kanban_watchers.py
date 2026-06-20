@@ -25,9 +25,22 @@ from typing import Any, Optional
 logger = logging.getLogger("gateway.run")
 
 _YURI_MISSING_PROFILE_FALLBACKS = {
+    "backend-eng": "ops",
     "collection-lead": "ops",
+    "docs-lead": "docslead",
     "factcheck-lead": "researcher",
+    "pm": "planner",
 }
+
+_YURI_ARTIFACT_DELIVERY_CLAIM_RE = re.compile(
+    r"(?:"
+    r"(?:파일|문서|보고서|엑셀|수정본|작성본|산출물|pdf|xlsx|docx|pptx)"
+    r".{0,24}(?:전송|첨부|업로드|보냈|보냅니다|전달|드렸)"
+    r"|(?:전송|첨부|업로드|보냈|보냅니다|전달|드렸)"
+    r".{0,24}(?:파일|문서|보고서|엑셀|수정본|작성본|산출물|pdf|xlsx|docx|pptx)"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_yuri_task(title: str, body: str, created_by: str) -> bool:
@@ -38,9 +51,14 @@ def _looks_like_yuri_task(title: str, body: str, created_by: str) -> bool:
         title.startswith("[YURI intake]")
         or "YURI secretary intake" in text
         or "Telegram 원문" in text
+        or "Telegram 의도" in text
         or "대표님 원문" in text
+        or "대표님 Telegram 의도" in text
+        or "대표님’s" in text
+        or "대표님의" in text
         or "telethon source" in text
         or "User intent from Telegram" in text
+        or "message_id=" in text
         or "Telegram message_id" in text
         or "상위 질문" in text
         or "상위 사용자 질문" in text
@@ -55,7 +73,81 @@ def _resolve_yuri_missing_profile_fallback(old: str, title: str, body: str) -> s
         if re.search(r"기사|뉴스|품질|퀄리티|WARN|팩트|fact|source", text, re.I):
             return "researcher"
         return "ops"
+    if old == "pm":
+        return "planner"
+    if old == "backend-eng":
+        return "ops"
     return _YURI_MISSING_PROFILE_FALLBACKS.get(old)
+
+
+def format_yuri_telegram_report_text(text: str) -> str:
+    """Make Yuri's Telegram reports readable even when workers return prose.
+
+    Writer cards sometimes produce a single Korean paragraph with inline
+    ``-`` bullets. Telegram then renders the report as a wall of text. This
+    formatter is intentionally conservative: short replies stay as natural
+    prose, existing line breaks are preserved, inline bullets are expanded only
+    when they are real list markers, and long prose is split into a few
+    paragraphs instead of one bullet per sentence.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+
+    inline_bullet_count = len(re.findall(r"(?<!^)(?<!\n)[ \t]+-[ \t]+", raw))
+    has_existing_structure = bool(re.search(r"(?:^|\n)\s*(?:[-*]|\d+[.)])\s+", raw))
+    if inline_bullet_count >= 2 or has_existing_structure:
+        raw = re.sub(r"(?<!^)(?<!\n)[ \t]+-[ \t]+", "\n- ", raw)
+
+    compact_sentence_count = len(re.findall(r"[.!?](?:\s|$)", raw))
+    if "\n" not in raw and inline_bullet_count == 0 and len(raw) <= 320 and compact_sentence_count <= 3:
+        return raw
+
+    raw = re.sub(
+        r"(?<=[.!?])\s+(?=(?:따라서|결론|다만|현재|이번|플랫폼|MVP|검증|저장|의사결정|접근|원문|커뮤니티|Reddit|LinkedIn|FM코리아)\b)",
+        "\n\n",
+        raw,
+    )
+
+    out: list[str] = []
+    for block in re.split(r"\n\s*\n", raw):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        for line in lines:
+            if line.startswith("- "):
+                out.append(line)
+                continue
+            if len(line) <= 150:
+                out.append(line)
+                continue
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", line) if s.strip()]
+            if len(sentences) <= 1:
+                out.append(line)
+                continue
+            paragraph: list[str] = []
+            paragraph_len = 0
+            for sentence in sentences:
+                projected_len = paragraph_len + len(sentence) + (1 if paragraph else 0)
+                if paragraph and projected_len > 190:
+                    out.append(" ".join(paragraph))
+                    out.append("")
+                    paragraph = [sentence]
+                    paragraph_len = len(sentence)
+                else:
+                    paragraph.append(sentence)
+                    paragraph_len = projected_len
+            if paragraph:
+                out.append(" ".join(paragraph))
+        out.append("")
+
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
 
 
 def repair_yuri_missing_profile_assignees(
@@ -119,6 +211,324 @@ def repair_yuri_missing_profile_assignees(
 
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+
+    @staticmethod
+    def _yuri_work_review_human_age(seconds: int) -> str:
+        seconds = max(0, int(seconds or 0))
+        if seconds < 60:
+            return "방금"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}분 전"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}시간 전"
+        return f"{hours // 24}일 전"
+
+    @staticmethod
+    def _yuri_work_review_detail(payload_text: str | None, fallback: str | None = None) -> str:
+        detail = ""
+        if payload_text:
+            try:
+                payload = json.loads(payload_text)
+                if isinstance(payload, dict):
+                    for key in ("reason", "summary", "error", "message"):
+                        value = payload.get(key)
+                        if value:
+                            detail = str(value)
+                            break
+            except Exception:
+                detail = str(payload_text)
+        if not detail and fallback:
+            detail = str(fallback)
+        detail = re.sub(r"\s+", " ", detail).strip()
+        if len(detail) > 90:
+            detail = detail[:87].rstrip() + "..."
+        return detail
+
+    def _build_yuri_work_review_snapshot(self) -> Optional[tuple[str, str]]:
+        """Return a stable fingerprint and Telegram text for Yuri work review.
+
+        The hourly review is meant to ask about real open office work, not to
+        repeat every old Kanban artifact. Scope it to Yuri/Telegram-visible
+        work and suppress duplicate snapshots with a compact fingerprint.
+        """
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.debug("Yuri work review: kanban_db unavailable", exc_info=True)
+            return None
+
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            try:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            except Exception:
+                boards = [{"slug": getattr(_kb, "DEFAULT_BOARD", "default")}]
+
+        now = int(time.time())
+        seen_db_paths: set[str] = set()
+        items: list[dict[str, Any]] = []
+        for board_meta in boards:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            db_path = board_meta.get("db_path")
+            try:
+                resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
+            except Exception:
+                resolved_db_path = f"slug:{slug}"
+            if resolved_db_path in seen_db_paths:
+                continue
+            seen_db_paths.add(resolved_db_path)
+            try:
+                conn = _kb.connect(board=slug)
+            except Exception:
+                logger.debug("Yuri work review: cannot open board %s", slug, exc_info=True)
+                continue
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT t.*
+                      FROM tasks t
+                     WHERE t.status IN ('running', 'ready', 'todo', 'review', 'blocked')
+                       AND (
+                           t.created_by LIKE 'yuri%'
+                           OR t.title LIKE '[YURI intake]%'
+                           OR EXISTS (
+                               SELECT 1
+                                 FROM kanban_notify_subs ns
+                                WHERE ns.task_id = t.id
+                                  AND lower(ns.platform) = 'telegram'
+                           )
+                       )
+                     ORDER BY
+                       CASE t.status
+                         WHEN 'blocked' THEN 0
+                         WHEN 'running' THEN 1
+                         WHEN 'review' THEN 2
+                         WHEN 'ready' THEN 3
+                         ELSE 4
+                       END,
+                       COALESCE(t.last_heartbeat_at, t.started_at, t.created_at) DESC,
+                       t.priority DESC
+                     LIMIT 30
+                    """
+                ).fetchall()
+                for row in rows:
+                    event_row = conn.execute(
+                        """
+                        SELECT kind, payload, created_at
+                          FROM task_events
+                         WHERE task_id = ?
+                           AND kind IN ('blocked', 'gave_up', 'crashed', 'timed_out', 'completed')
+                         ORDER BY id DESC
+                         LIMIT 1
+                        """,
+                        (row["id"],),
+                    ).fetchone()
+                    started = row["started_at"] or row["created_at"] or now
+                    last_seen = row["last_heartbeat_at"] or row["started_at"] or row["created_at"] or now
+                    items.append(
+                        {
+                            "board": slug,
+                            "id": row["id"],
+                            "title": re.sub(r"^\[YURI intake\]\s*", "", row["title"] or "").strip(),
+                            "status": row["status"],
+                            "assignee": row["assignee"] or "",
+                            "age": max(0, now - int(started)),
+                            "idle": max(0, now - int(last_seen)),
+                            "detail": self._yuri_work_review_detail(
+                                event_row["payload"] if event_row else None,
+                                row["last_failure_error"],
+                            ),
+                        }
+                    )
+            finally:
+                conn.close()
+
+        if not items:
+            return None
+
+        groups = {
+            "blocked": [item for item in items if item["status"] == "blocked"],
+            "running": [item for item in items if item["status"] == "running"],
+            "review": [item for item in items if item["status"] == "review"],
+            "waiting": [item for item in items if item["status"] in {"ready", "todo"}],
+        }
+        fingerprint = json.dumps(
+            [
+                (item["board"], item["id"], item["status"], item["assignee"], item["detail"])
+                for item in items
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        def _line(item: dict[str, Any]) -> str:
+            title = item["title"] or item["id"]
+            if len(title) > 54:
+                title = title[:51].rstrip() + "..."
+            suffix = ""
+            if item["status"] == "blocked" and item["detail"]:
+                suffix = f" - {item['detail']}"
+            elif item["status"] == "running":
+                suffix = f" - {self._yuri_work_review_human_age(item['idle'])} 확인"
+            return f"- {title}{suffix}"
+
+        lines = ["현재 진행/보류 업무 점검입니다."]
+        if groups["running"]:
+            lines.append("")
+            lines.append("진행 중")
+            lines.extend(_line(item) for item in groups["running"][:4])
+        if groups["blocked"]:
+            lines.append("")
+            lines.append("보류/판단 필요")
+            lines.extend(_line(item) for item in groups["blocked"][:5])
+        if groups["review"]:
+            lines.append("")
+            lines.append("검수 대기")
+            lines.extend(_line(item) for item in groups["review"][:3])
+        if groups["waiting"]:
+            lines.append("")
+            lines.append("실행 대기")
+            lines.extend(_line(item) for item in groups["waiting"][:3])
+
+        extra = len(items) - sum(
+            min(len(groups[key]), limit)
+            for key, limit in {
+                "running": 4,
+                "blocked": 5,
+                "review": 3,
+                "waiting": 3,
+            }.items()
+        )
+        if extra > 0:
+            lines.append(f"\n외 {extra}건이 더 있습니다.")
+        lines.append("")
+        lines.append("상태 점검만 기록했습니다. 우선순위 변경이 필요하면 별도로 알려주세요.")
+        return fingerprint, "\n".join(lines)
+
+    @staticmethod
+    def _yuri_work_review_status_path() -> Path:
+        try:
+            from hermes_constants import get_hermes_home
+
+            return get_hermes_home() / "state" / "yuri_work_review_status.json"
+        except Exception:
+            return Path.home() / ".hermes" / "state" / "yuri_work_review_status.json"
+
+    def _write_yuri_work_review_status(self, **fields: Any) -> None:
+        path = self._yuri_work_review_status_path()
+        status: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                status = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(status, dict):
+                    status = {}
+            except Exception:
+                status = {}
+        status.update(fields)
+        status["updated_at"] = int(time.time())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(status, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+
+    async def _yuri_work_review_watcher(self) -> None:
+        enabled = os.environ.get("HERMES_YURI_WORK_REVIEW_ENABLED", "false").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            self._write_yuri_work_review_status(enabled=False, reason="disabled_by_env")
+            logger.info("Yuri work review watcher disabled by env")
+            return
+        try:
+            interval = max(300.0, float(os.environ.get("HERMES_YURI_WORK_REVIEW_INTERVAL_SECONDS", "3600")))
+        except ValueError:
+            interval = 3600.0
+        try:
+            initial_delay = max(0.0, float(os.environ.get("HERMES_YURI_WORK_REVIEW_INITIAL_DELAY_SECONDS", str(min(300.0, interval)))))
+        except ValueError:
+            initial_delay = min(300.0, interval)
+
+        logger.info(
+            "Yuri work review watcher enabled interval=%.0fs initial_delay=%.0fs",
+            interval,
+            initial_delay,
+        )
+        self._write_yuri_work_review_status(
+            enabled=True,
+            interval_seconds=int(interval),
+            initial_delay_seconds=int(initial_delay),
+            state="initial_delay" if initial_delay else "running",
+        )
+        if initial_delay:
+            await asyncio.sleep(initial_delay)
+
+        from gateway.config import Platform as _Platform
+
+        while self._running:
+            try:
+                adapter = self.adapters.get(_Platform.TELEGRAM)
+                home = self.config.get_home_channel(_Platform.TELEGRAM) if getattr(self, "config", None) else None
+                self._write_yuri_work_review_status(
+                    enabled=True,
+                    state="tick",
+                    last_tick_at=int(time.time()),
+                    telegram_adapter_connected=adapter is not None,
+                    home_chat_configured=bool(home and home.chat_id),
+                )
+                if adapter is not None and home and home.chat_id:
+                    snapshot = await asyncio.to_thread(self._build_yuri_work_review_snapshot)
+                    self._write_yuri_work_review_status(
+                        enabled=True,
+                        state="snapshot_checked",
+                        last_snapshot_found=bool(snapshot),
+                    )
+                    if snapshot:
+                        fingerprint, message = snapshot
+                        self._write_yuri_work_review_status(
+                            enabled=True,
+                            last_snapshot_fingerprint=fingerprint,
+                            last_snapshot_preview=message[:300],
+                        )
+                        if fingerprint != getattr(self, "_yuri_work_review_last_fingerprint", None):
+                            metadata = self._thread_metadata_for_target(
+                                _Platform.TELEGRAM,
+                                home.chat_id,
+                                getattr(home, "thread_id", None),
+                                adapter=adapter,
+                            )
+                            result = await adapter.send(str(home.chat_id), message, metadata=metadata or None)
+                            if result is None or getattr(result, "success", True):
+                                self._yuri_work_review_last_fingerprint = fingerprint
+                                self._yuri_work_review_last_sent_at = time.time()
+                                self._write_yuri_work_review_status(
+                                    enabled=True,
+                                    state="sent",
+                                    last_sent_at=int(self._yuri_work_review_last_sent_at),
+                                    last_error="",
+                                )
+                            else:
+                                self._write_yuri_work_review_status(
+                                    enabled=True,
+                                    state="send_failed",
+                                    last_error=str(getattr(result, "error", "send returned success=False")),
+                                )
+                        else:
+                            self._write_yuri_work_review_status(
+                                enabled=True,
+                                state="duplicate_suppressed",
+                            )
+                else:
+                    self._write_yuri_work_review_status(
+                        enabled=True,
+                        state="waiting_for_telegram_home",
+                    )
+            except Exception:
+                self._write_yuri_work_review_status(
+                    enabled=True,
+                    state="tick_failed",
+                    last_error="tick failed; see gateway.log",
+                )
+                logger.warning("Yuri work review watcher tick failed", exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -196,6 +606,7 @@ class GatewayKanbanWatchersMixin:
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+        retry_notify_mode = os.environ.get("HERMES_KANBAN_RETRY_NOTIFY_MODE", "first_only").strip().lower()
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -350,6 +761,15 @@ class GatewayKanbanWatchersMixin:
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
                         deliver_artifacts = True
+                        retry_kind = kind in {"gave_up", "crashed", "timed_out"}
+                        if retry_kind and retry_notify_mode == "first_only" and int(d.get("old_cursor") or 0) > 0:
+                            logger.info(
+                                "kanban notifier: suppressing repeated retry event %s for %s on board %s",
+                                kind,
+                                sub["task_id"],
+                                board_slug,
+                            )
+                            continue
                         if kind == "completed":
                             if platform_str == "telegram" and await asyncio.to_thread(
                                 self._kanban_handoff_sub_to_open_child,
@@ -423,6 +843,16 @@ class GatewayKanbanWatchersMixin:
                                         continue
                                     msg = mismatch_msg
                                     deliver_artifacts = False
+                                    try:
+                                        self._record_yuri_failure_case(
+                                            user_text=task_instruction_text,
+                                            observed_behavior=mismatch_msg,
+                                            source="completion_guard_hold",
+                                            issue_code="misunderstood_intent",
+                                            task_id=str(sub["task_id"]),
+                                        )
+                                    except Exception:
+                                        pass
                                     logger.warning(
                                         "Yuri completion guard held %s: %s",
                                         sub["task_id"], mismatch_msg,
@@ -433,25 +863,80 @@ class GatewayKanbanWatchersMixin:
                                             adapter=adapter,
                                             event_payload=getattr(ev, "payload", None),
                                             task=task,
+                                            board_slug=board_slug,
                                         )
                                     except Exception:
                                         artifact_status = None
-                                    if (
-                                        self._yuri_review_gate_required(
+                                    review_required = self._yuri_review_gate_required(
+                                        task_instruction_text,
+                                        result_text or handoff_text,
+                                        artifact_status=artifact_status,
+                                    )
+                                    review_metadata = (
+                                        d.get("latest_run_metadata")
+                                        if isinstance(d.get("latest_run_metadata"), dict)
+                                        else getattr(ev, "payload", None)
+                                    )
+                                    missing_final_review_pass = self._yuri_review_pass_missing_final_text(
+                                        review_metadata
+                                    )
+                                    if missing_final_review_pass:
+                                        hold_msg = (
+                                            "검수 통과 표시는 있지만 승인된 최종 한글 문안이 없습니다. "
+                                            "approved_final_text/final_text가 있는 최종 검수까지 사용자 전송을 보류합니다."
+                                        )
+                                        if await asyncio.to_thread(
+                                            self._yuri_continue_review_cycle_on_hold,
+                                            sub,
+                                            task,
+                                            getattr(ev, "payload", None),
+                                            result_text or handoff_text,
+                                            hold_msg,
+                                            board_slug,
+                                        ):
+                                            logger.warning(
+                                                "Yuri review gate held %s because approved final text is missing",
+                                                sub["task_id"],
+                                            )
+                                            continue
+                                        msg = hold_msg
+                                        deliver_artifacts = False
+                                        try:
+                                            self._record_yuri_failure_case(
+                                                user_text=task_instruction_text,
+                                                observed_behavior=hold_msg,
+                                                source="review_gate_hold",
+                                                issue_code="completion_without_review",
+                                                task_id=str(sub["task_id"]),
+                                            )
+                                        except Exception:
+                                            pass
+                                        logger.warning(
+                                            "Yuri review gate suppressed incomplete reviewer pass for %s",
+                                            sub["task_id"],
+                                        )
+                                        continue
+                                    review_passed = self._yuri_review_gate_passed(
+                                        task_instruction_text,
+                                        payload_summary or "",
+                                        str(d.get("latest_run_summary") or ""),
+                                        approved.get("approved_final_text", "") if approved else "",
+                                        str(getattr(task, "result", "") or "") if task else "",
+                                        handoff_text,
+                                        event_payload=review_metadata,
+                                    )
+                                    data_trust_issue = (
+                                        self._yuri_data_trust_gate_issue(
                                             task_instruction_text,
                                             result_text or handoff_text,
+                                            event_payload=review_metadata,
                                             artifact_status=artifact_status,
                                         )
-                                        and not self._yuri_review_gate_passed(
-                                            payload_summary or "",
-                                            str(d.get("latest_run_summary") or ""),
-                                            approved.get("approved_final_text", "") if approved else "",
-                                            str(getattr(task, "result", "") or "") if task else "",
-                                            handoff_text,
-                                            event_payload=d.get("latest_run_metadata") if isinstance(d.get("latest_run_metadata"), dict) else getattr(ev, "payload", None),
-                                        )
-                                    ):
-                                        hold_msg = self._yuri_review_gate_hold_message(task_instruction_text)
+                                        if review_passed
+                                        else None
+                                    )
+                                    if review_required and (not review_passed or data_trust_issue):
+                                        hold_msg = data_trust_issue or self._yuri_review_gate_hold_message(task_instruction_text)
                                         if await asyncio.to_thread(
                                             self._yuri_continue_review_cycle_on_hold,
                                             sub,
@@ -467,6 +952,20 @@ class GatewayKanbanWatchersMixin:
                                             )
                                             continue
                                         msg = hold_msg
+                                        try:
+                                            self._record_yuri_failure_case(
+                                                user_text=task_instruction_text,
+                                                observed_behavior=hold_msg,
+                                                source="review_gate_hold",
+                                                issue_code=(
+                                                    "data_trust_insufficient"
+                                                    if data_trust_issue
+                                                    else "completion_without_review"
+                                                ),
+                                                task_id=str(sub["task_id"]),
+                                            )
+                                        except Exception:
+                                            pass
                                         deliver_artifacts = False
                                         logger.warning(
                                             "Yuri review gate held completion for %s",
@@ -479,10 +978,9 @@ class GatewayKanbanWatchersMixin:
                                             final_text or handoff_text or result_text or title,
                                             limit=max(len(final_text) + 32, 260) if final_text else 260,
                                         )
-                                        if clean.startswith("TID="):
-                                            msg = clean
-                                        else:
-                                            msg = f"마무리했습니다.\n{clean}" if clean else "마무리했습니다."
+                                        if platform_str == "telegram":
+                                            clean = format_yuri_telegram_report_text(clean)
+                                        msg = clean or "처리 결과를 확인했습니다."
                             else:
                                 msg = (
                                     f"✔ {tag}Kanban {sub['task_id']} done"
@@ -505,29 +1003,59 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     continue
                                 msg = "검수 중입니다. 의도 일치와 결과 검증이 끝나면 최종 보고드리겠습니다."
+                            elif platform_str == "telegram" and self._kanban_block_is_review_required(ev):
+                                handed_off = await asyncio.to_thread(
+                                    self._kanban_handoff_blocked_review_required,
+                                    sub,
+                                    task,
+                                    board_slug,
+                                )
+                                if handed_off:
+                                    logger.info(
+                                        "kanban notifier: handed off/finalized review-required block %s on board %s",
+                                        sub["task_id"],
+                                        board_slug,
+                                    )
+                                    continue
+                                msg = "검수 중입니다. 의도 일치와 결과 검증이 끝나면 최종 보고드리겠습니다."
+                            elif platform_str == "telegram":
+                                detail = reason or ""
+                                msg = (
+                                    f"작업을 잠시 보류했습니다{detail}. "
+                                    "필요한 검수나 추가 확인을 정리한 뒤 다시 보고드리겠습니다."
+                                )
                             else:
                                 msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
+                            if platform_str == "telegram":
+                                msg = "작업이 반복해서 실패해 아직 완료하지 못했습니다. 필요한 조치를 정리한 뒤 결과만 보고드리겠습니다."
+                            else:
+                                err = ""
+                                if ev.payload and ev.payload.get("error"):
+                                    err = f"\n{str(ev.payload['error'])[:200]}"
+                                msg = (
+                                    f"✖ {tag}Kanban {sub['task_id']} gave up "
+                                    f"after repeated spawn failures{err}"
+                                )
                         elif kind == "crashed":
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
+                            if platform_str == "telegram":
+                                msg = "작업이 중간에 멈췄습니다. 복구 과정은 내부에서 처리하고, 결과가 준비되면 보고드리겠습니다."
+                            else:
+                                msg = (
+                                    f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+                                    f"(pid gone); dispatcher will retry"
+                                )
                         elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
+                            if platform_str == "telegram":
+                                msg = "처리 시간이 길어져 중간 점검이 필요합니다. 내부에서 정리한 뒤 결과가 준비되면 보고드리겠습니다."
+                            else:
+                                limit = 0
+                                if ev.payload and ev.payload.get("limit_seconds"):
+                                    limit = int(ev.payload["limit_seconds"])
+                                msg = (
+                                    f"⏱ {tag}Kanban {sub['task_id']} timed out "
+                                    f"(max_runtime={limit}s); will retry"
+                                )
                         else:
                             continue
                         metadata: dict[str, Any] = {}
@@ -541,6 +1069,49 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
+                            artifact_pre_delivered = False
+                            if (
+                                kind == "completed"
+                                and deliver_artifacts
+                                and platform_str == "telegram"
+                                and self._yuri_completion_claims_file_delivery(
+                                    msg,
+                                    result_text if "result_text" in locals() else "",
+                                    payload_summary if "payload_summary" in locals() else "",
+                                )
+                            ):
+                                delivered_count = await self._deliver_kanban_artifacts(
+                                    adapter=adapter,
+                                    chat_id=sub["chat_id"],
+                                    metadata=metadata,
+                                    reply_to=reply_to,
+                                    event_payload=getattr(ev, "payload", None),
+                                    task=task,
+                                    board_slug=board_slug,
+                                )
+                                if delivered_count <= 0:
+                                    hold_msg = (
+                                        "최종 보고 전 첨부 검수를 보강하고 있습니다. "
+                                        "대화창에는 검수 통과 후 결과와 파일만 보고드리겠습니다."
+                                    )
+                                    if await asyncio.to_thread(
+                                        self._yuri_continue_review_cycle_on_hold,
+                                        sub,
+                                        task,
+                                        getattr(ev, "payload", None),
+                                        result_text if "result_text" in locals() else msg,
+                                        hold_msg,
+                                        board_slug,
+                                    ):
+                                        logger.warning(
+                                            "Yuri artifact guard held %s and started review cycle",
+                                            sub["task_id"],
+                                        )
+                                        continue
+                                    msg = hold_msg
+                                    deliver_artifacts = False
+                                else:
+                                    artifact_pre_delivered = True
                             chunks = self._kanban_split_user_message(msg) if platform_str == "telegram" else [msg]
                             for index, chunk in enumerate(chunks):
                                 send_result = await adapter.send(
@@ -565,6 +1136,37 @@ class GatewayKanbanWatchersMixin:
                                 len(chunks),
                                 "" if len(chunks) == 1 else "s",
                             )
+                            # Persist delivered Kanban completions into the
+                            # originating gateway transcript so follow-up
+                            # questions in the same chat can see the answer.
+                            if kind == "completed" and task and getattr(task, "session_id", None):
+                                store = getattr(self, "session_store", None)
+                                append = getattr(store, "append_to_transcript", None)
+                                if callable(append):
+                                    try:
+                                        append(
+                                            task.session_id,
+                                            {"role": "assistant", "content": msg},
+                                            skip_db=False,
+                                        )
+                                    except Exception as transcript_exc:
+                                        logger.debug(
+                                            "kanban notifier: transcript append failed for %s: %s",
+                                            sub["task_id"],
+                                            transcript_exc,
+                                        )
+                            if (
+                                kind == "completed"
+                                and platform_str == "telegram"
+                                and "approved" in locals()
+                                and approved
+                            ):
+                                await asyncio.to_thread(
+                                    self._yuri_record_review_delivery_learning,
+                                    task,
+                                    approved,
+                                    board_slug,
+                                )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``
@@ -574,14 +1176,16 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed" and deliver_artifacts:
+                            if kind == "completed" and deliver_artifacts and not artifact_pre_delivered:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
                                         chat_id=sub["chat_id"],
                                         metadata=metadata,
+                                        reply_to=reply_to,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
+                                        board_slug=board_slug,
                                     )
                                 except Exception as art_exc:
                                     logger.warning(
@@ -722,6 +1326,10 @@ class GatewayKanbanWatchersMixin:
         summary = ""
         if isinstance(event_payload, dict):
             summary = str(event_payload.get("summary") or "")
+        has_verified_cards = bool(
+            isinstance(event_payload, dict)
+            and (event_payload.get("verified_cards") or event_payload.get("created_cards"))
+        )
         task_text = "\n".join(
             str(part or "")
             for part in (
@@ -730,7 +1338,7 @@ class GatewayKanbanWatchersMixin:
                 summary,
             )
         )
-        if not re.search(r"(?:배정\s*완료|라우팅|분해|연결|handoff)", task_text, re.IGNORECASE):
+        if not has_verified_cards and not re.search(r"(?:배정|라우팅|분해|연결|handoff)", task_text, re.IGNORECASE):
             return False
 
         from hermes_cli import kanban_db as _kb
@@ -738,16 +1346,35 @@ class GatewayKanbanWatchersMixin:
         conn = _kb.connect(board=board)
         try:
             candidate_ids: list[str] = []
+            seen_ids: set[str] = set()
+
+            def _append_candidate(raw: Any) -> None:
+                cid = str(raw or "").strip()
+                if cid and cid not in seen_ids and cid != str(sub["task_id"]):
+                    seen_ids.add(cid)
+                    candidate_ids.append(cid)
+
             if isinstance(event_payload, dict):
                 for raw in event_payload.get("verified_cards") or []:
-                    cid = str(raw or "").strip()
-                    if cid and cid not in candidate_ids:
-                        candidate_ids.append(cid)
+                    _append_candidate(raw)
             for cid in _kb.child_ids(conn, str(sub["task_id"])):
-                if cid not in candidate_ids:
-                    candidate_ids.append(cid)
+                _append_candidate(cid)
             if not candidate_ids:
                 return False
+
+            # Parent cards sometimes only link their immediate worker lanes,
+            # while the actual user-facing report is a grandchild synthesis
+            # card. Carry the subscription to that final leaf so "I'll report
+            # back" does not end at a mid-flow routing message.
+            cursor = 0
+            while cursor < len(candidate_ids) and len(candidate_ids) < 100:
+                cid = candidate_ids[cursor]
+                cursor += 1
+                try:
+                    for child_id in _kb.child_ids(conn, cid):
+                        _append_candidate(child_id)
+                except Exception:
+                    continue
 
             placeholders = ",".join("?" for _ in candidate_ids)
             rows = conn.execute(
@@ -755,7 +1382,7 @@ class GatewayKanbanWatchersMixin:
                 SELECT id, title, assignee, status
                   FROM tasks
                  WHERE id IN ({placeholders})
-                   AND status NOT IN ('done', 'archived')
+                   AND status != 'archived'
                 """,
                 tuple(candidate_ids),
             ).fetchall()
@@ -764,10 +1391,44 @@ class GatewayKanbanWatchersMixin:
             by_id = {str(row["id"]): row for row in rows}
             ordered = [by_id[cid] for cid in candidate_ids if cid in by_id]
 
-            def _score(row: Any) -> tuple[int, int]:
+            def _has_open_children(task_id: str) -> bool:
+                try:
+                    child_ids = _kb.child_ids(conn, task_id)
+                except Exception:
+                    return False
+                if not child_ids:
+                    return False
+                child_placeholders = ",".join("?" for _ in child_ids)
+                found = conn.execute(
+                    f"""
+                    SELECT 1
+                      FROM tasks
+                     WHERE id IN ({child_placeholders})
+                       AND status NOT IN ('done', 'archived')
+                     LIMIT 1
+                    """,
+                    tuple(child_ids),
+                ).fetchone()
+                return found is not None
+
+            def _score(row: Any) -> tuple[int, int, int, int, int]:
                 text = f"{row['title'] or ''} {row['assignee'] or ''}"
+                report_leaf = bool(re.search(
+                    r"(?:최종.*(?:보고|검수)|종합\s*보고|보고문|final.*report|synthesis)",
+                    text,
+                    re.IGNORECASE,
+                ))
                 finalish = bool(re.search(r"(?:review|reviewer|검수|리뷰|최종|보고문|승인)", text, re.IGNORECASE))
-                return (1 if finalish else 0, 1 if str(row["status"]) == "ready" else 0)
+                leaf = not _has_open_children(str(row["id"]))
+                open_status = str(row["status"]) not in {"done", "archived"}
+                ready = str(row["status"]) == "ready"
+                return (
+                    1 if report_leaf else 0,
+                    1 if leaf else 0,
+                    1 if finalish else 0,
+                    1 if open_status else 0,
+                    1 if ready else 0,
+                )
 
             target = max(ordered, key=_score)
             _kb.add_notify_sub(
@@ -820,6 +1481,339 @@ class GatewayKanbanWatchersMixin:
             if part
         )
 
+    @staticmethod
+    def _yuri_completion_claims_file_delivery(*texts: str) -> bool:
+        joined = "\n".join(str(text or "") for text in texts)
+        return bool(_YURI_ARTIFACT_DELIVERY_CLAIM_RE.search(joined))
+
+    def _kanban_artifact_candidates(
+        self,
+        *,
+        adapter,
+        event_payload: Optional[dict],
+        task,
+        board_slug: Optional[str] = None,
+    ) -> tuple[list[str], int]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        declared_count = 0
+
+        def _add(path: str) -> None:
+            if not path:
+                return
+            expanded = os.path.expanduser(path)
+            if expanded in seen:
+                return
+            if not os.path.isfile(expanded):
+                return
+            seen.add(expanded)
+            candidates.append(expanded)
+
+        def _add_from_mapping(mapping: Any) -> None:
+            nonlocal declared_count
+            if not isinstance(mapping, dict):
+                return
+            raw = mapping.get("artifacts")
+            if isinstance(raw, (list, tuple)):
+                declared_count += len([p for p in raw if isinstance(p, str) and p])
+                for item in raw:
+                    if isinstance(item, str):
+                        _add(item)
+            for key in (
+                "approved_file",
+                "approved_manifest",
+                "file",
+                "output_path",
+                "manifest_path",
+            ):
+                item = mapping.get(key)
+                if isinstance(item, str):
+                    declared_count += 1
+                    _add(item)
+
+        if isinstance(event_payload, dict):
+            _add_from_mapping(event_payload)
+            summary = event_payload.get("summary")
+            if isinstance(summary, str) and summary and hasattr(adapter, "extract_local_files"):
+                paths, _ = adapter.extract_local_files(summary)
+                for path in paths:
+                    _add(path)
+
+        if (
+            task is not None
+            and getattr(task, "result", None)
+            and hasattr(adapter, "extract_local_files")
+        ):
+            paths, _ = adapter.extract_local_files(str(task.result))
+            for path in paths:
+                _add(path)
+
+        if not candidates and task is not None:
+            try:
+                from hermes_cli import kanban_db as _kb
+
+                conn = _kb.connect(board=board_slug)
+                try:
+                    task_id = str(getattr(task, "id", "") or "")
+                    try:
+                        runs = _kb.list_runs(conn, task_id)
+                    except Exception:
+                        runs = []
+                    for run in reversed(runs):
+                        metadata = getattr(run, "metadata", None)
+                        if metadata:
+                            _add_from_mapping(metadata)
+                            if candidates:
+                                break
+                    for parent_id in _kb.parent_ids(conn, task_id):
+                        row = conn.execute(
+                            """
+                            SELECT payload
+                              FROM task_events
+                             WHERE task_id = ?
+                               AND kind = 'completed'
+                               AND payload IS NOT NULL
+                             ORDER BY id DESC
+                             LIMIT 1
+                            """,
+                            (parent_id,),
+                        ).fetchone()
+                        if not row or not row["payload"]:
+                            continue
+                        try:
+                            parent_payload = json.loads(row["payload"])
+                        except Exception:
+                            continue
+                        _add_from_mapping(parent_payload)
+                        if not candidates:
+                            try:
+                                parent_runs = _kb.list_runs(conn, parent_id)
+                            except Exception:
+                                parent_runs = []
+                            for run in reversed(parent_runs):
+                                metadata = getattr(run, "metadata", None)
+                                if metadata:
+                                    _add_from_mapping(metadata)
+                                    if candidates:
+                                        break
+                finally:
+                    conn.close()
+            except Exception as exc:
+                logger.debug(
+                    "kanban notifier: parent artifact fallback failed for %s: %s",
+                    getattr(task, "id", "?"),
+                    exc,
+                )
+
+        from gateway.platforms.base import BasePlatformAdapter
+
+        return BasePlatformAdapter.filter_local_delivery_paths(candidates), declared_count
+
+    @staticmethod
+    def _telegram_user_visible_artifact_paths(paths: list[str]) -> tuple[list[str], list[str]]:
+        """Split Telegram/Yuri artifacts into user-readable uploads and internal evidence.
+
+        Mobile Telegram makes JSON evidence hard to use. Keep structured
+        evidence in metadata/logs but do not push it as a representative-facing
+        attachment when a readable companion file exists.
+        """
+        hidden_exts = {".json", ".jsonl", ".ndjson"}
+        visible: list[str] = []
+        hidden: list[str] = []
+        for path in paths:
+            if Path(path).suffix.lower() in hidden_exts:
+                hidden.append(path)
+            else:
+                visible.append(path)
+        return visible, hidden
+
+    def _kanban_artifact_status(
+        self,
+        *,
+        adapter,
+        event_payload: Optional[dict],
+        task,
+        board_slug: Optional[str] = None,
+    ) -> dict[str, Any]:
+        candidates, declared_count = self._kanban_artifact_candidates(
+            adapter=adapter,
+            event_payload=event_payload,
+            task=task,
+            board_slug=board_slug,
+        )
+        declared_paths: list[str] = []
+
+        def _collect_declared(mapping: Any) -> None:
+            if not isinstance(mapping, dict):
+                return
+            raw = mapping.get("artifacts")
+            if isinstance(raw, (list, tuple)):
+                declared_paths.extend(str(p) for p in raw if isinstance(p, str) and p)
+            for key in (
+                "approved_file",
+                "approved_manifest",
+                "file",
+                "output_path",
+                "manifest_path",
+            ):
+                value = mapping.get(key)
+                if isinstance(value, str) and value:
+                    declared_paths.append(value)
+
+        _collect_declared(event_payload)
+        if task is not None:
+            try:
+                from hermes_cli import kanban_db as _kb
+
+                conn = _kb.connect(board=board_slug)
+                try:
+                    task_id = str(getattr(task, "id", "") or "")
+                    try:
+                        runs = _kb.list_runs(conn, task_id)
+                    except Exception:
+                        runs = []
+                    for run in reversed(runs):
+                        _collect_declared(getattr(run, "metadata", None))
+                        if declared_paths:
+                            break
+                    for parent_id in _kb.parent_ids(conn, task_id):
+                        row = conn.execute(
+                            """
+                            SELECT payload
+                              FROM task_events
+                             WHERE task_id = ?
+                               AND kind = 'completed'
+                               AND payload IS NOT NULL
+                             ORDER BY id DESC
+                             LIMIT 1
+                            """,
+                            (parent_id,),
+                        ).fetchone()
+                        if row and row["payload"]:
+                            try:
+                                _collect_declared(json.loads(row["payload"]))
+                            except Exception:
+                                pass
+                        if not declared_paths:
+                            try:
+                                parent_runs = _kb.list_runs(conn, parent_id)
+                            except Exception:
+                                parent_runs = []
+                            for run in reversed(parent_runs):
+                                _collect_declared(getattr(run, "metadata", None))
+                                if declared_paths:
+                                    break
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        base_dirs: list[str] = []
+        if task is not None:
+            workspace_path = getattr(task, "workspace_path", None)
+            if isinstance(workspace_path, str) and workspace_path:
+                base_dirs.append(os.path.expanduser(workspace_path))
+            try:
+                from hermes_cli import kanban_db as _kb
+
+                conn = _kb.connect(board=board_slug)
+                try:
+                    for parent_id in _kb.parent_ids(conn, str(getattr(task, "id", "") or "")):
+                        row = conn.execute(
+                            "SELECT workspace_path FROM tasks WHERE id = ?",
+                            (parent_id,),
+                        ).fetchone()
+                        if row and row["workspace_path"]:
+                            base_dirs.append(os.path.expanduser(str(row["workspace_path"])))
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        def _declared_exists(path: str) -> bool:
+            expanded = os.path.expanduser(path)
+            if os.path.isabs(expanded):
+                return os.path.isfile(expanded)
+            for base_dir in base_dirs:
+                if base_dir and os.path.isfile(os.path.join(base_dir, expanded)):
+                    return True
+            return os.path.isfile(expanded)
+
+        unique_declared = list(dict.fromkeys(os.path.expanduser(path) for path in declared_paths))
+        existing_declared = [path for path in unique_declared if _declared_exists(path)]
+        missing = [path for path in unique_declared if path not in existing_declared]
+        return {
+            "declared": declared_count,
+            "referenced": len(unique_declared),
+            "existing": len(candidates),
+            "available": len(candidates),
+            "missing": missing,
+        }
+
+    def _yuri_record_review_delivery_learning(
+        self,
+        task,
+        approved: dict[str, Any],
+        board_slug: Optional[str] = None,
+    ) -> None:
+        if task is None or not approved:
+            return
+        assignee = str(getattr(task, "assignee", "") or "")
+        created_by = str(getattr(task, "created_by", "") or "")
+        task_text = "\n".join(
+            str(part or "")
+            for part in (
+                getattr(task, "title", ""),
+                getattr(task, "body", ""),
+                approved.get("approved_final_text", ""),
+                approved.get("intent_source", ""),
+            )
+            if part
+        )
+        if created_by not in {"planner", "yuri", "yuri-review-loop"}:
+            return
+        if assignee != "reviewer" and not _looks_like_yuri_task(
+            str(getattr(task, "title", "") or ""),
+            str(getattr(task, "body", "") or ""),
+            created_by,
+        ):
+            return
+        if not re.search(r"(?:Yuri|YURI|Telegram|Telethon|텔레쏜|검수|review_status)", task_text, re.IGNORECASE):
+            return
+
+        root_task_id = str(getattr(task, "id", "") or "")
+        reviewer_task_id = root_task_id
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            conn = _kb.connect(board=board_slug)
+            try:
+                parent_ids = _kb.parent_ids(conn, root_task_id)
+                if parent_ids and assignee == "reviewer":
+                    root_task_id = parent_ids[0]
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        if not root_task_id:
+            return
+        try:
+            from gateway.yuri_knowledge_spine import record_review_result
+
+            record_review_result(
+                root_task_id=root_task_id,
+                reviewer_task_id=reviewer_task_id,
+                approved_final_text=str(approved.get("approved_final_text") or ""),
+                intent_source=str(approved.get("intent_source") or "telethon"),
+                board=board_slug,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Yuri knowledge spine review delivery record failed for %s: %s",
+                root_task_id,
+                exc,
+            )
+
     def _yuri_continue_review_cycle_on_hold(
         self,
         sub: dict,
@@ -854,6 +1848,25 @@ class GatewayKanbanWatchersMixin:
         )
         if not yuriish:
             return False
+
+        data_trust_requirements = ""
+        try:
+            if self._yuri_data_trust_gate_required(
+                task_text,
+                f"{result_text}\n{hold_reason}",
+            ):
+                data_trust_requirements = (
+                    "\n\nData trust metadata requirements for data/evidence work:\n"
+                    "- Reviewer pass is not enough by itself.\n"
+                    "- If the result depends on data, files, counts, public sources, or extracted records, "
+                    "completion metadata must include data_trust_status=pass plus concrete evidence.\n"
+                    "- Include at least source evidence and verification evidence, for example: "
+                    "evidence_checked/source_files/source_urls/output_path, and "
+                    "verification_commands/readback_commands/counts/sample_rows/sha256_16/remaining_risks.\n"
+                    "- If any evidence is missing, complete with review_status=fail or block instead of approving."
+                )
+        except Exception:
+            data_trust_requirements = ""
 
         conn = _kb.connect(board=board)
         try:
@@ -898,6 +1911,7 @@ class GatewayKanbanWatchersMixin:
                         "- Address every blocking issue.\n"
                         "- Include concise evidence and changed artifact paths if any.\n"
                         "- Do not include user-facing final wording as approved unless the reviewer passes it."
+                        f"{data_trust_requirements}"
                     ),
                     assignee=rework_assignee,
                     created_by="yuri-review-loop",
@@ -920,6 +1934,7 @@ class GatewayKanbanWatchersMixin:
                         "and approved_final_text/final_text.\n"
                         "If it still fails, complete with review_status=fail plus blocking_issues; "
                         "the loop will create another rework pass."
+                        f"{data_trust_requirements}"
                     ),
                     assignee="reviewer",
                     created_by="yuri-review-loop",
@@ -944,6 +1959,7 @@ class GatewayKanbanWatchersMixin:
                         "or telegram-safe, and approved_final_text/final_text. "
                         "If not acceptable, complete with review_status=fail and blocking_issues; "
                         "the loop will create rework."
+                        f"{data_trust_requirements}"
                     ),
                     assignee="reviewer",
                     created_by="yuri-review-loop",
@@ -1070,6 +2086,41 @@ class GatewayKanbanWatchersMixin:
         )
 
     @staticmethod
+    def _kanban_block_is_review_required(ev: Any) -> bool:
+        payload = getattr(ev, "payload", None)
+        reason = ""
+        if isinstance(payload, dict):
+            reason = str(payload.get("reason") or "")
+        return bool(re.search(r"review-required|검수.*필요|reviewer", reason, re.IGNORECASE))
+
+    def _kanban_handoff_blocked_review_required(
+        self,
+        sub: dict,
+        task: Any,
+        board: Optional[str] = None,
+    ) -> bool:
+        if task is None:
+            return False
+        from hermes_cli import kanban_db as _kb
+
+        task_id = str(getattr(task, "id", "") or sub.get("task_id") or "")
+        if not task_id:
+            return False
+        conn = _kb.connect(board=board)
+        try:
+            if self._kanban_move_sub_to_best_open_child(conn, sub, task_id):
+                return True
+        finally:
+            conn.close()
+
+        finalized = self._yuri_finalize_review_blocked_tasks_for_board(
+            board=board,
+            task_id=task_id,
+            allow_non_yuri=True,
+        )
+        return bool(finalized)
+
+    @staticmethod
     def _yuri_review_pass_from_metadata(raw: Any) -> Optional[dict[str, Any]]:
         if not raw:
             return None
@@ -1100,10 +2151,36 @@ class GatewayKanbanWatchersMixin:
         out["approved_final_text"] = final_text
         return out
 
+    @staticmethod
+    def _yuri_review_pass_missing_final_text(raw: Any) -> bool:
+        if not raw:
+            return False
+        if isinstance(raw, dict):
+            meta = raw
+        else:
+            try:
+                meta = json.loads(str(raw))
+            except Exception:
+                return False
+        status = str(meta.get("review_status", "") or "").strip().lower()
+        source = str(meta.get("intent_source", "") or "").strip().lower()
+        if status not in {"pass", "passed", "ok"}:
+            return False
+        if source not in {"telethon", "telegram-safe", "telegram", "conversation"}:
+            return False
+        final_text = (
+            meta.get("approved_final_text")
+            or meta.get("final_text")
+            or meta.get("approved_text")
+            or ""
+        )
+        return not bool(str(final_text or "").strip())
+
     def _yuri_finalize_review_blocked_tasks_for_board(
         self,
         board: Optional[str] = None,
         task_id: Optional[str] = None,
+        allow_non_yuri: bool = False,
     ) -> list[str]:
         """Close Yuri intake roots once a reviewer pass exists.
 
@@ -1146,7 +2223,11 @@ class GatewayKanbanWatchersMixin:
             for root in roots:
                 root_id = str(root["id"])
                 root_text = f"{root['title'] or ''}\n{root['body'] or ''}"
-                if "YURI" not in root_text and "Yuri" not in root_text:
+                if (
+                    not allow_non_yuri
+                    and "YURI" not in root_text
+                    and "Yuri" not in root_text
+                ):
                     continue
 
                 needle = f"%{root_id}%"
@@ -1190,6 +2271,25 @@ class GatewayKanbanWatchersMixin:
                     continue
 
                 final_text = str(approved["approved_final_text"]).strip()
+                data_trust_issue = self._yuri_data_trust_gate_issue(
+                    root_text,
+                    final_text,
+                    event_payload=approved,
+                )
+                if data_trust_issue:
+                    try:
+                        _kb.add_comment(
+                            conn,
+                            root_id,
+                            "yuri-review-loop",
+                            (
+                                "Reviewer pass not finalized because data trust "
+                                f"evidence is incomplete: {data_trust_issue}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    continue
                 metadata = {
                     "review_status": "pass",
                     "intent_source": approved.get("intent_source", "telethon"),
@@ -1197,6 +2297,14 @@ class GatewayKanbanWatchersMixin:
                     "reviewer_task": reviewer_task_id,
                     "auto_finalized_from_review": True,
                 }
+                artifacts: list[str] = []
+                for key in ("approved_file", "approved_manifest", "file", "output_path", "manifest_path"):
+                    value = approved.get(key)
+                    if isinstance(value, str) and value:
+                        metadata[key] = value
+                        artifacts.append(value)
+                if artifacts:
+                    metadata["artifacts"] = artifacts
                 if _kb.complete_task(
                     conn,
                     root_id,
@@ -1245,7 +2353,9 @@ class GatewayKanbanWatchersMixin:
         metadata: dict,
         event_payload: Optional[dict],
         task,
-    ) -> None:
+        reply_to: Optional[str] = None,
+        board_slug: Optional[str] = None,
+    ) -> int:
         """Upload artifact files referenced by a completed kanban task.
 
         Workers passing ``kanban_complete(artifacts=[...])`` ship absolute
@@ -1257,60 +2367,18 @@ class GatewayKanbanWatchersMixin:
           1. ``event_payload['artifacts']`` (explicit list — preferred)
           2. ``event_payload['summary']`` (truncated first line)
           3. ``task.result`` (legacy fallback)
+          4. done parent tasks' completion artifacts (review-card fallback)
 
         Files are deduplicated, missing files are silently skipped (the
         path may have been mentioned for reference only), and delivery
         errors are logged but do not break the notifier loop.
         """
-        from pathlib import Path as _Path
-
-        candidates: list[str] = []
-        seen: set[str] = set()
-
-        def _add(path: str) -> None:
-            if not path:
-                return
-            expanded = os.path.expanduser(path)
-            if expanded in seen:
-                return
-            if not os.path.isfile(expanded):
-                return
-            seen.add(expanded)
-            candidates.append(expanded)
-
-        # 1. Explicit artifacts list in payload.
-        if isinstance(event_payload, dict):
-            raw = event_payload.get("artifacts")
-            if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    if isinstance(item, str):
-                        _add(item)
-
-            # 2. Paths embedded in the payload summary.
-            summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary and hasattr(adapter, "extract_local_files"):
-                paths, _ = adapter.extract_local_files(summary)
-                for p in paths:
-                    _add(p)
-
-        # 3. Legacy: paths embedded in task.result.
-        if (
-            task is not None
-            and getattr(task, "result", None)
-            and hasattr(adapter, "extract_local_files")
-        ):
-            result_text = str(task.result)
-            paths, _ = adapter.extract_local_files(result_text)
-            for p in paths:
-                _add(p)
-
-        declared_count = 0
-        if isinstance(event_payload, dict):
-            raw_artifacts = event_payload.get("artifacts")
-            if isinstance(raw_artifacts, (list, tuple)):
-                declared_count = len(
-                    [p for p in raw_artifacts if isinstance(p, str) and p]
-                )
+        candidates, declared_count = self._kanban_artifact_candidates(
+            adapter=adapter,
+            event_payload=event_payload,
+            task=task,
+            board_slug=board_slug,
+        )
 
         if not candidates:
             if declared_count:
@@ -1318,15 +2386,22 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: %d declared artifact(s) but no existing local files to upload",
                     declared_count,
                 )
-            return
-
-        from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
-        if not candidates:
-            logger.warning(
-                "kanban notifier: declared artifact candidates failed local delivery safety filter"
-            )
-            return
+            return 0
+        if str(getattr(adapter, "name", "") or "").lower() == "telegram":
+            visible_candidates, hidden_candidates = self._telegram_user_visible_artifact_paths(candidates)
+            if hidden_candidates:
+                logger.info(
+                    "kanban notifier: suppressing %d Telegram JSON artifact(s) from user-facing upload: %s",
+                    len(hidden_candidates),
+                    ", ".join(Path(p).name for p in hidden_candidates[:5]),
+                )
+            candidates = visible_candidates
+            if not candidates:
+                logger.info(
+                    "kanban notifier: all %d Telegram artifact(s) are internal evidence; skipping user-facing upload",
+                    len(hidden_candidates),
+                )
+                return 0
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -1335,36 +2410,67 @@ class GatewayKanbanWatchersMixin:
 
         # Partition images so they ride a single send_multiple_images call
         # on platforms that support batch image uploads (Signal/Slack RPCs).
-        image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
-        other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
+        image_paths = [p for p in candidates if Path(p).suffix.lower() in _IMAGE_EXTS]
+        other_paths = [p for p in candidates if Path(p).suffix.lower() not in _IMAGE_EXTS]
+        delivered_count = 0
 
         if image_paths:
             try:
-                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
+                batch = [
+                    (f"file://{_quote(p)}", f"첨부: {Path(p).name}")
+                    for p in image_paths
+                ]
                 await adapter.send_multiple_images(
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )
+                delivered_count += len(image_paths)
             except Exception as exc:
                 logger.warning(
                     "kanban notifier: image batch upload failed: %s", exc,
                 )
 
         for path in other_paths:
-            ext = _Path(path).suffix.lower()
+            ext = Path(path).suffix.lower()
             try:
+                caption = f"첨부: {Path(path).name}"
                 if ext in _VIDEO_EXTS:
-                    await adapter.send_video(
-                        chat_id=chat_id, video_path=path, metadata=metadata,
+                    result = await adapter.send_video(
+                        chat_id=chat_id,
+                        video_path=path,
+                        caption=caption,
+                        reply_to=reply_to,
+                        metadata=metadata,
                     )
+                    if result is None or getattr(result, "success", False):
+                        delivered_count += 1
+                    else:
+                        logger.warning(
+                            "kanban notifier: video artifact upload returned failure for %s: %s",
+                            path,
+                            getattr(result, "error", ""),
+                        )
                 else:
-                    await adapter.send_document(
-                        chat_id=chat_id, file_path=path, metadata=metadata,
+                    result = await adapter.send_document(
+                        chat_id=chat_id,
+                        file_path=path,
+                        caption=caption,
+                        reply_to=reply_to,
+                        metadata=metadata,
                     )
+                    if result is None or getattr(result, "success", False):
+                        delivered_count += 1
+                    else:
+                        logger.warning(
+                            "kanban notifier: document artifact upload returned failure for %s: %s",
+                            path,
+                            getattr(result, "error", ""),
+                        )
             except Exception as exc:
                 logger.warning(
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+        return delivered_count
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

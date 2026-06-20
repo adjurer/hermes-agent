@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -68,6 +69,21 @@ WORKER_COMPLETE_RE = re.compile(
 STOCK_ORCHESTRATION_RE = re.compile(
     r"(진행과\s*검증은\s*나눠\s*진행하고|결과는\s*제가\s*모아서\s*짧게\s*보고|"
     r"확인해야\s*할\s*상태,\s*실제\s*원인,\s*바로\s*할\s*조치)"
+)
+
+FALSE_BLOCKED_STATUS_RE = re.compile(
+    r"(막혀\s*있|막힘|blocked\s*\d+\s*건|계속\s*막|작업.*막)",
+    re.IGNORECASE,
+)
+
+HELD_COUNT_STATUS_RE = re.compile(
+    r"(검수\s*/?\s*판단\s*보류|검수\s*보류)\s*\d+\s*건",
+    re.IGNORECASE,
+)
+
+BLOCKED_STATUS_CONTEXT_RE = re.compile(
+    r"(현재\s*진행\s*장애는\s*아닙니다|과거\s*검수\s*보류|검수\s*보류|진행\s*중\s*worker\s*장애가\s*아니라)",
+    re.IGNORECASE,
 )
 
 SPECIFIC_INTERPRETATION_RE = re.compile(
@@ -212,39 +228,349 @@ def scan_messages(messages: Iterable[Mapping[str, Any]], *, context_window: int 
                 recommendation="고정 문구 대신 이번 업무의 구체적 해석, 맡길 팀, 완료 후 보고 방식만 짧게 말합니다.",
             ))
 
+        if _is_yuri(sender) and FALSE_BLOCKED_STATUS_RE.search(text) and not BLOCKED_STATUS_CONTEXT_RE.search(text):
+            issues.append(QualityIssue(
+                code="blocked_status_overstated",
+                severity="high",
+                message_id=mid,
+                summary="보류/검수 상태를 현재 진행 장애처럼 말했습니다.",
+                recommendation="blocked 카드는 실제 실행 장애, 검수 보류, 과거 실패 잔여물을 구분해 말하고 '막힘' 단정 표현을 피합니다.",
+            ))
+
+        if _is_yuri(sender) and HELD_COUNT_STATUS_RE.search(text):
+            recent = " ".join(_text(prev) for prev in rows[max(0, idx - 3):idx])
+            if re.search(r"(진행|하고\s*있는|하고있는|돌고|뭐가\s*있|무슨\s*일)", recent) and not re.search(r"(전체|남은|대기|보류|막힘|막혀|백로그|큐|밀린)", recent):
+                issues.append(QualityIssue(
+                    code="held_count_leaked_into_active_status",
+                    severity="high",
+                    message_id=mid,
+                    summary="진행 중 작업 질문에 보류 카운트를 섞어 답했습니다.",
+                    recommendation="현재 진행 상태 질문에는 running/review만 답하고, 대기/보류/전체 큐는 사용자가 명시적으로 물을 때만 분리해서 보여줍니다.",
+                ))
+
     return issues
+
+
+def _parse_skill_frontmatter(skill_md: Path) -> dict[str, str]:
+    try:
+        text = skill_md.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    front = text[3:end]
+    out: dict[str, str] = {}
+    for line in front.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key not in {"name", "description"}:
+            continue
+        out[key] = value.strip().strip("'\"")
+    return out
+
+
+def _skill_records(root: Path) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    if not root.exists():
+        return records
+    for skill_md in sorted(root.rglob("SKILL.md")):
+        try:
+            rel = skill_md.relative_to(root).parent
+        except ValueError:
+            rel = skill_md.parent
+        front = _parse_skill_frontmatter(skill_md)
+        declared = front.get("name") or skill_md.parent.name
+        aliases = sorted({declared, skill_md.parent.name, str(rel)})
+        key = declared
+        records[key] = {
+            "name": declared,
+            "path": str(rel),
+            "dir_name": skill_md.parent.name,
+            "description": front.get("description", ""),
+            "aliases": aliases,
+        }
+    return records
+
+
+def _merge_skill_record(
+    merged: dict[str, dict[str, Any]],
+    *,
+    source: str,
+    name: str,
+    record: Mapping[str, Any],
+) -> None:
+    item = merged.setdefault(
+        name,
+        {
+            "name": name,
+            "description": record.get("description", ""),
+            "aliases": sorted(set(record.get("aliases") or [])),
+            "sources": [],
+            "paths": {},
+        },
+    )
+    if source not in item["sources"]:
+        item["sources"].append(source)
+    item["paths"][source] = record.get("path", "")
+    item["aliases"] = sorted(set(item.get("aliases") or []) | set(record.get("aliases") or []))
+    if not item.get("description") and record.get("description"):
+        item["description"] = record.get("description", "")
+
+
+def _skill_available(records: Mapping[str, Mapping[str, Any]], skill_name: str) -> bool:
+    wanted = str(skill_name or "").strip()
+    if not wanted:
+        return False
+    for name, record in records.items():
+        aliases = set(record.get("aliases") or [])
+        if wanted == name or wanted in aliases:
+            return True
+    return False
+
+
+def _profile_dirs(home: Path) -> list[Path]:
+    profiles_dir = home / "profiles"
+    if not profiles_dir.exists():
+        return []
+    out: list[Path] = []
+    for profile in sorted(profiles_dir.iterdir()):
+        if profile.is_dir() and ((profile / "profile.yaml").exists() or (profile / "config.yaml").exists()):
+            out.append(profile)
+    return out
+
+
+def _recent_skill_usage(home: Path, *, limit: int = 500) -> dict[str, dict[str, Any]]:
+    """Return explicit Kanban skill-use evidence from recent task rows.
+
+    This intentionally counts only task.skills JSON, not passive skill-index
+    visibility. It answers "was this skill actually force-loaded recently?"
+    without pretending that every visible skill was used.
+    """
+    dbs = [home / "kanban" / "kanban.db"]
+    boards = home / "kanban" / "boards"
+    if boards.exists():
+        dbs.extend(sorted(boards.glob("*/kanban.db")))
+    usage: dict[str, dict[str, Any]] = {}
+    seen_dbs: set[Path] = set()
+    for db in dbs:
+        if not db.exists() or db in seen_dbs:
+            continue
+        seen_dbs.add(db)
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                f"{db.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=0.2,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute(
+                "SELECT id, title, skills, created_at, completed_at FROM tasks "
+                "WHERE skills IS NOT NULL AND skills != '' "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        except Exception:
+            continue
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+        board = db.parent.name if db.parent.name != "kanban" else "default"
+        for row in rows:
+            try:
+                skills = json.loads(row["skills"] or "[]")
+            except Exception:
+                continue
+            if not isinstance(skills, list):
+                continue
+            for raw in skills:
+                skill = str(raw or "").strip()
+                if not skill:
+                    continue
+                item = usage.setdefault(
+                    skill,
+                    {
+                        "count": 0,
+                        "latest_task_id": "",
+                        "latest_title": "",
+                        "latest_created_at": 0,
+                        "latest_completed_at": None,
+                        "latest_board": "",
+                    },
+                )
+                item["count"] += 1
+                created_at = int(row["created_at"] or 0)
+                if created_at >= int(item.get("latest_created_at") or 0):
+                    item["latest_task_id"] = row["id"]
+                    item["latest_title"] = row["title"]
+                    item["latest_created_at"] = created_at
+                    item["latest_completed_at"] = row["completed_at"]
+                    item["latest_board"] = board
+    return usage
 
 
 def build_inventory(*, hermes_home: str | Path | None = None, repo_root: str | Path | None = None) -> dict[str, Any]:
     """Build a lightweight inventory of skills, profiles, MCP servers, and tools."""
     home = Path(hermes_home or os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
     repo = Path(repo_root or home / "hermes-agent").expanduser()
+    root_skill_records = _skill_records(home / "skills")
+    repo_skill_records = _skill_records(repo / "skills")
+    merged_skill_records: dict[str, dict[str, Any]] = {}
+    for source, records in (("home", root_skill_records), ("repo", repo_skill_records)):
+        for name, record in records.items():
+            _merge_skill_record(merged_skill_records, source=source, name=name, record=record)
+
     inventory: dict[str, Any] = {
         "hermes_home": str(home),
         "repo_root": str(repo),
         "skills": [],
         "profiles": [],
+        "skill_visibility": [],
+        "skill_visibility_summary": {},
+        "skill_reference_gaps": [],
+        "recent_skill_usage": {},
         "mcp_servers": {},
         "tools": [],
     }
 
-    for root in (home / "skills", repo / "skills"):
-        if not root.exists():
-            continue
-        for skill_md in sorted(root.rglob("SKILL.md")):
-            try:
-                rel = skill_md.relative_to(root)
-            except ValueError:
-                rel = skill_md
-            inventory["skills"].append(str(rel.parent))
+    profile_records: dict[str, dict[str, dict[str, Any]]] = {}
+    for profile in _profile_dirs(home):
+        inventory["profiles"].append(profile.name)
+        records = _skill_records(profile / "skills")
+        profile_records[profile.name] = records
+        for name, record in records.items():
+            _merge_skill_record(
+                merged_skill_records,
+                source=f"profile:{profile.name}",
+                name=name,
+                record=record,
+            )
 
-    profiles_dir = home / "profiles"
-    if profiles_dir.exists():
-        for profile in sorted(profiles_dir.iterdir()):
-            if profile.is_dir() and (profile / "profile.yaml").exists():
-                inventory["profiles"].append(profile.name)
+    inventory["skills"] = sorted(
+        {
+            str(path)
+            for record in merged_skill_records.values()
+            for path in (record.get("paths") or {}).values()
+            if path
+        }
+    )
 
     cfg = _load_yaml(home / "config.yaml")
+    skills_cfg = cfg.get("skills") if isinstance(cfg, dict) else {}
+    disabled = set()
+    platform_disabled: dict[str, set[str]] = {}
+    auto_inject: dict[str, list[str]] = {}
+    if isinstance(skills_cfg, dict):
+        raw_disabled = skills_cfg.get("disabled", [])
+        if isinstance(raw_disabled, list):
+            disabled = {str(item) for item in raw_disabled if item}
+        raw_platform_disabled = skills_cfg.get("platform_disabled", {})
+        if isinstance(raw_platform_disabled, dict):
+            for platform, names in raw_platform_disabled.items():
+                if isinstance(names, list):
+                    platform_disabled[str(platform)] = {str(item) for item in names if item}
+        raw_auto = skills_cfg.get("auto_inject", {})
+        if isinstance(raw_auto, dict):
+            for group, data in raw_auto.items():
+                names: list[str] = []
+                enabled = False
+                if isinstance(data, list):
+                    enabled = True
+                    names = [str(item) for item in data if item]
+                elif isinstance(data, dict):
+                    enabled = bool(data.get("enabled", False))
+                    raw_names = data.get("skills", [])
+                    if isinstance(raw_names, list):
+                        names = [str(item) for item in raw_names if item]
+                if enabled:
+                    auto_inject[str(group)] = names
+
+    all_profile_names = sorted(profile_records)
+    root_names = set(root_skill_records) | set(repo_skill_records)
+    recent_usage = _recent_skill_usage(home)
+    inventory["recent_skill_usage"] = recent_usage
+    visibility_rows: list[dict[str, Any]] = []
+    missing_from_any_profile = 0
+    known_skill_refs: set[str] = set()
+    for name in sorted(merged_skill_records):
+        record = merged_skill_records[name]
+        known_skill_refs.add(name)
+        known_skill_refs.update(str(alias) for alias in (record.get("aliases") or []) if alias)
+        present_profiles = [
+            profile
+            for profile, records in sorted(profile_records.items())
+            if _skill_available(records, name)
+        ]
+        missing_profiles = [profile for profile in all_profile_names if profile not in present_profiles]
+        if missing_profiles:
+            missing_from_any_profile += 1
+        disabled_platforms = sorted(
+            platform
+            for platform, names in platform_disabled.items()
+            if name in names or any(alias in names for alias in record.get("aliases") or [])
+        )
+        auto_groups = sorted(
+            group
+            for group, names in auto_inject.items()
+            if name in names or any(alias in names for alias in record.get("aliases") or [])
+        )
+        usage = next(
+            (
+                recent_usage[alias]
+                for alias in [name, *(record.get("aliases") or [])]
+                if alias in recent_usage
+            ),
+            {},
+        )
+        visibility_rows.append(
+            {
+                "name": name,
+                "paths": record.get("paths", {}),
+                "sources": sorted(record.get("sources", [])),
+                "profiles": present_profiles,
+                "missing_profiles": missing_profiles,
+                "profile_count": len(present_profiles),
+                "root_available": name in root_names,
+                "globally_disabled": name in disabled or any(alias in disabled for alias in record.get("aliases") or []),
+                "platform_disabled": disabled_platforms,
+                "auto_inject_groups": auto_groups,
+                "recent_use": usage,
+                "description": record.get("description", ""),
+            }
+        )
+    inventory["skill_visibility"] = visibility_rows
+    inventory["skill_reference_gaps"] = [
+        {
+            "name": skill,
+            "reason": "recent_task_skill_not_installed",
+            "recent_use": recent_usage[skill],
+        }
+        for skill in sorted(recent_usage)
+        if skill not in known_skill_refs
+    ]
+    inventory["skill_visibility_summary"] = {
+        "root_skill_count": len(root_names),
+        "profile_count": len(all_profile_names),
+        "skills_visible_to_all_profiles": sum(1 for row in visibility_rows if not row["missing_profiles"]),
+        "skills_missing_from_any_profile": missing_from_any_profile,
+        "recent_skill_reference_gaps": len(inventory["skill_reference_gaps"]),
+        "auto_inject": auto_inject,
+        "recent_skill_usage_count": len(recent_usage),
+        "platform_disabled_counts": {
+            platform: len(names)
+            for platform, names in sorted(platform_disabled.items())
+        },
+    }
+
     mcp = cfg.get("mcp_servers") if isinstance(cfg, dict) else None
     if isinstance(mcp, dict):
         for name, data in sorted(mcp.items()):
@@ -326,6 +652,19 @@ def run_backtests() -> dict[str, Any]:
             "name": "stock orchestration phrases should be avoided",
             "messages": [{"id": "m8", "sender": "YURI", "text": "진행과 검증은 나눠 진행하고, 결과는 제가 모아서 짧게 보고드리겠습니다."}],
             "expect": {"stock_orchestration_phrase"},
+        },
+        {
+            "name": "blocked status must not be overstated",
+            "messages": [{"id": "m9", "sender": "YURI", "text": "지금 작업은 막힘 5건입니다."}],
+            "expect": {"blocked_status_overstated"},
+        },
+        {
+            "name": "held count must not leak into active status",
+            "messages": [
+                {"id": "m10a", "sender": "대표님", "text": "우리가 진행하고있는 작업은 뭐에요?"},
+                {"id": "m10b", "sender": "YURI", "text": "지금 실제로 돌고 있는 작업은 없습니다. 다만 준비 대기 2건, 검수 보류 5건이 남아 있습니다."},
+            ],
+            "expect": {"held_count_leaked_into_active_status"},
         },
     ]
     results = []

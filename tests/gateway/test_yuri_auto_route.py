@@ -1,10 +1,12 @@
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
+import gateway.run as gateway_run
 from gateway.run import (
     GatewayRunner,
     _kanban_text_claims_artifact_delivery,
@@ -99,19 +101,31 @@ async def test_yuri_kanban_intake_injects_knowledge_spine_context(
 
     response = await runner._yuri_kanban_intake_reply(event, event.source)
 
-    assert response == "접수했습니다. 확인 끝나면 검수 후 결과만 보고드리겠습니다."
+    assert response == ""
     conn = kb.connect()
     try:
         row = conn.execute(
             "SELECT id, body FROM tasks WHERE title LIKE '[YURI intake]%'"
         ).fetchone()
+        sub = conn.execute(
+            "SELECT reply_to_message_id FROM kanban_notify_subs WHERE task_id = ?",
+            (row["id"],),
+        ).fetchone()
     finally:
         conn.close()
     assert row is not None
+    assert sub["reply_to_message_id"] == "spine-msg-1"
     assert "YURI KNOWLEDGE SPINE CONTEXT PACK" in row["body"]
     assert "코드 오류 원인을 확인하고 수정해주세요." in row["body"]
     assert "Planner triage rule" in row["body"]
+    assert "disambiguate Yuri's active chief-of-staff/review/self-improvement loops" in row["body"]
+    assert "yuri_skill_inventory_latest.json" in row["body"]
     assert "do not fan it out into serial child tasks" in row["body"]
+    assert "create a diamond graph" in row["body"]
+    assert "one sibling reviewer lane per worker lane" in row["body"]
+    assert "Do not make item B wait for item A" in row["body"]
+    assert "Yuri usability rule" in row["body"]
+    assert "do not say settings" in row["body"]
     assert "accepted_intent_sources: telethon" in row["body"]
 
     events_path = tmp_path / "spine" / "events.jsonl"
@@ -191,17 +205,21 @@ def test_yuri_review_gate_exempts_exact_path_only_answers():
 def test_yuri_review_gate_pass_requires_intent_source_evidence():
     runner = _runner()
 
-    assert runner._yuri_review_gate_passed(
+    assert not runner._yuri_review_gate_passed(
         event_payload={"review_status": "pass", "intent_source": "telethon"}
     )
     assert runner._yuri_review_gate_passed(
-        event_payload={"review_status": "pass", "intent_source": "telegram-safe"}
+        event_payload={
+            "review_status": "pass",
+            "intent_source": "telegram-safe",
+            "approved_final_text": "승인된 최종 문안입니다.",
+        }
     )
     assert runner._yuri_review_gate_passed("검수 통과: 텔레쏜 확인 후 의도 일치")
     assert not runner._yuri_review_gate_passed("검수 통과")
     assert not runner._yuri_review_gate_passed("완료했습니다")
     assert runner._yuri_review_gate_passed(
-        "review_status=pass, intent_source=telethon: 검수된 최종 문안입니다."
+        "review_status=pass, intent_source=telethon, approved_final_text: 검수된 최종 문안입니다."
     )
 
 
@@ -321,14 +339,125 @@ async def test_yuri_kanban_intake_ack_preserves_tid_when_work_must_route(tmp_pat
     kb.init_db()
 
     runner = _runner()
+    event = _event("TID=WORK-A1 코드 오류 원인을 확인하고 수정해주세요.")
+    event.message_id = "work-a1-msg"
+    response = await runner._yuri_kanban_intake_reply(event, event.source)
+
+    assert response == ""
+    conn = kb.connect()
+    try:
+        sub = conn.execute("SELECT reply_to_message_id FROM kanban_notify_subs").fetchone()
+    finally:
+        conn.close()
+    assert sub["reply_to_message_id"] == "work-a1-msg"
+
+
+@pytest.mark.asyncio
+async def test_yuri_busy_kanban_intake_empty_ack_stops_without_text_bubble():
+    class BusyAdapter:
+        def __init__(self):
+            self.sent = []
+
+        async def _send_with_retry(self, **kwargs):
+            self.sent.append(kwargs)
+
+    async def no_fast_lookup(event):
+        return None
+
+    async def empty_kanban_ack(event, source):
+        return ""
+
+    runner = _runner()
+    adapter = BusyAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._draining = False
+    runner._running_agents = {"busy-session": object()}
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    runner._is_user_authorized = lambda source: True
+    runner._reply_anchor_for_event = lambda event: event.message_id
+    runner._thread_metadata_for_source = lambda source, reply_anchor=None: {}
+    runner._yuri_literal_only_reply = lambda event: None
+    runner._yuri_recent_raw_intake_reply = lambda event: None
+    runner._yuri_fast_lookup_reply = no_fast_lookup
+    runner._yuri_kanban_intake_reply = empty_kanban_ack
+
+    handled = await runner._handle_active_session_busy_message(
+        _event("인터넷 검색해서 확인해줘"),
+        "busy-session",
+    )
+
+    assert handled is True
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_yuri_queued_followup_kanban_intake_stops_recursive_agent_replay():
+    class FollowupAdapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+
+    async def no_fast_lookup(event):
+        return None
+
+    async def empty_kanban_ack(event, source):
+        return ""
+
+    runner = _runner()
+    adapter = FollowupAdapter()
+    runner._yuri_platform_is_frontdesk = lambda event=None, source=None: True
+    runner._yuri_is_frontdesk_profile = lambda: True
+    runner._record_yuri_raw_intake = lambda event: None
+    runner._yuri_literal_only_reply = lambda event: None
+    runner._yuri_recent_raw_intake_reply = lambda event: None
+    runner._yuri_fast_lookup_reply = no_fast_lookup
+    runner._yuri_kanban_intake_reply = empty_kanban_ack
+    runner._thread_metadata_for_source = lambda source, reply_to_message_id=None: {}
+
+    handled = await runner._yuri_handle_queued_followup_shortcut(
+        _event("경기도 당선인 전체정당 파일 다시 채워서 리턴해줘"),
+        _event("x").source,
+        adapter=adapter,
+        reply_to_message_id="msg-queued",
+    )
+
+    assert handled is True
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_yuri_usability_complaint_intake_requires_live_evidence(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setenv("HERMES_YURI_KNOWLEDGE_SPINE_DIR", str(tmp_path / "spine"))
+    kb.init_db()
+
+    runner = _runner()
     response = await runner._yuri_kanban_intake_reply(
-        _event("TID=WORK-A1 코드 오류 원인을 확인하고 수정해주세요."),
+        _event("유리가 줄바꿈 했다고 안했는데도 말하고 있어요. 왜 그런지 확인해주세요."),
         _event("x").source,
     )
 
-    assert response.startswith("TID=WORK-A1 ")
-    assert "접수했습니다" in response
-    assert "검수 후 결과" in response
+    assert response == ""
+    conn = kb.connect()
+    try:
+        body = conn.execute("SELECT body FROM tasks WHERE title LIKE '[YURI intake]%'").fetchone()["body"]
+    finally:
+        conn.close()
+    assert "latest Telegram/Telethon conversation" in body
+    assert "Do not assume the requested fix is already done" in body
+    failures_path = tmp_path / "spine" / "failures.jsonl"
+    assert failures_path.is_file()
+    failures = [
+        json.loads(line)
+        for line in failures_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert failures[-1]["source"] == "telegram_intake"
+    assert failures[-1]["category"] == "misunderstood_intent"
 
 
 def test_yuri_work_type_prompt_with_payload_summary_word_routes_to_kanban():
@@ -448,6 +577,97 @@ async def test_yuri_fast_lookup_personal_operating_preferences(text, expected):
     assert expected in response
 
 
+def _prepare_memory_home(tmp_path, monkeypatch, *, auto_extract: bool = False):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / "memories").mkdir()
+    (tmp_path / "shadow_memory").mkdir()
+    (tmp_path / "memories" / "MEMORY.md").write_text("핵심 기억입니다.", encoding="utf-8")
+    (tmp_path / "memories" / "USER.md").write_text("대표님 선호입니다.", encoding="utf-8")
+    db_path = tmp_path / "shadow_memory" / "holographic_memory.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE facts (content TEXT)")
+        conn.executemany("INSERT INTO facts (content) VALUES (?)", [("a",), ("b",), ("c",)])
+        conn.commit()
+    finally:
+        conn.close()
+    (tmp_path / "config.yaml").write_text(
+        "\n".join(
+            [
+                "memory:",
+                "  memory_enabled: true",
+                "  user_profile_enabled: true",
+                "  memory_char_limit: 2200",
+                "  user_char_limit: 4200",
+                "  provider: holographic",
+                "plugins:",
+                "  hermes-memory-store:",
+                "    db_path: $HERMES_HOME/shadow_memory/holographic_memory.sqlite3",
+                f"    auto_extract: {str(auto_extract).lower()}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_yuri_memory_settings_question_answers_directly(tmp_path, monkeypatch):
+    _prepare_memory_home(tmp_path, monkeypatch)
+
+    response = await _runner()._yuri_fast_lookup_reply(_event("기억관련된 설정은 뭐가있어요?"))
+
+    assert response is not None
+    assert "현재 기억 설정입니다." in response
+    assert "provider: holographic" in response
+    assert "fact_store: 3개" in response
+    assert "auto_extract: False" in response
+    assert not _runner()._yuri_should_route_to_kanban_intake(_event("기억관련된 설정은 뭐가있어요?"))
+
+
+@pytest.mark.asyncio
+async def test_yuri_memory_effect_question_explains_provider_limits(tmp_path, monkeypatch):
+    _prepare_memory_home(tmp_path, monkeypatch)
+
+    response = await _runner()._yuri_fast_lookup_reply(_event("메모리 관련 깃이 왜 효과가 없는것 같죠?"))
+
+    assert response is not None
+    assert "auto_extract=False" in response
+    assert "자동학습이 아닙니다" in response
+    assert "fact_store 검색" in response
+
+
+@pytest.mark.asyncio
+async def test_yuri_memory_status_does_not_capture_plain_git_status(tmp_path, monkeypatch):
+    _prepare_memory_home(tmp_path, monkeypatch)
+    event = _event("깃 상태 뭐야?")
+
+    response = await _runner()._yuri_fast_lookup_reply(event)
+
+    assert response is None
+    assert _runner()._yuri_should_route_to_kanban_intake(event)
+
+
+@pytest.mark.asyncio
+async def test_yuri_memory_status_distinguishes_auto_extract_from_model_learning(tmp_path, monkeypatch):
+    _prepare_memory_home(tmp_path, monkeypatch, auto_extract=True)
+
+    response = await _runner()._yuri_fast_lookup_reply(_event("메모리 설정 상태는 뭐야?"))
+
+    assert response is not None
+    assert "auto_extract: True" in response
+    assert "fact 후보 자동 추출은 켜져" in response
+    assert "모델 자체가 자동학습되는 구조는 아닙니다" in response
+
+
+@pytest.mark.asyncio
+async def test_yuri_memory_change_request_still_routes_to_workflow(tmp_path, monkeypatch):
+    _prepare_memory_home(tmp_path, monkeypatch)
+    event = _event("메모리 설정 정리 진행해주세요")
+
+    assert await _runner()._yuri_fast_lookup_reply(event) is None
+    assert _runner()._yuri_should_route_to_kanban_intake(event)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -496,7 +716,7 @@ async def test_yuri_fast_lookup_does_not_replace_kg_progress_questions_with_gene
 @pytest.mark.asyncio
 async def test_yuri_progress_status_question_returns_status_without_new_intake():
     runner = _runner()
-    runner._yuri_current_work_status = lambda: "네, 현재 작업 상태는 진행 중 1건입니다."
+    runner._yuri_current_work_status = lambda **_: "네, 현재 작업 상태는 진행 중 1건입니다."
 
     response = await runner._yuri_fast_lookup_reply(_event("지금 진행중인건가요?"))
 
@@ -504,27 +724,41 @@ async def test_yuri_progress_status_question_returns_status_without_new_intake()
     assert not runner._yuri_should_route_to_kanban_intake(_event("지금 진행중인건가요?"))
 
 
+@pytest.mark.asyncio
+async def test_yuri_ai_processing_source_question_does_not_become_work_status():
+    runner = _runner()
+    runner._yuri_current_work_status = lambda **_: "지금 실제로 진행 중인 작업은 없습니다."
+    event = _event("ai 처리가 로컬로 돌고있니? 아님 내 gpt로 진행중이니?")
+
+    response = await runner._yuri_fast_lookup_reply(event)
+
+    assert response is None
+    assert runner._yuri_should_route_to_kanban_intake(event)
+
+
 def test_yuri_work_status_does_not_describe_blocked_only_queue_as_active_work():
     response = GatewayRunner._yuri_format_work_status(
         {"running": 0, "review": 0, "ready": 0, "todo": 0, "blocked": 5},
         [("blocked", "create verified openable link for target file")],
+        include_backlog=True,
     )
 
     assert "지금 실제로 돌고 있는 작업은 없습니다" in response
-    assert "막힘 5건" in response
-    assert "막힘은 진행 중 worker가 아니라" in response
-    assert "막힌 항목 예시: create verified openable link" in response
+    assert "검수/판단 보류 5건" in response
+    assert "보류 항목은 진행 중 worker 장애가 아니라" in response
+    assert "최근 보류 항목: create verified openable link" in response
 
 
 def test_yuri_work_status_prioritizes_active_work_over_blocked_samples():
     response = GatewayRunner._yuri_format_work_status(
         {"running": 1, "review": 0, "ready": 0, "todo": 2, "blocked": 5},
         [("blocked", "old blocked task"), ("running", "current task")],
+        include_backlog=True,
     )
 
     assert "진행 중 1건" in response
     assert "준비 대기 2건" in response
-    assert "막힘 5건" in response
+    assert "검수/판단 보류 5건" in response
     assert "지금 도는 항목: current task" in response
     assert "old blocked task" not in response
 
@@ -533,13 +767,14 @@ def test_yuri_work_status_separates_waiting_queue_from_running_work():
     response = GatewayRunner._yuri_format_work_status(
         {"running": 0, "review": 0, "ready": 0, "todo": 2, "blocked": 5},
         [("blocked", "old blocked task"), ("todo", "queued review task")],
+        include_backlog=True,
     )
 
     assert "지금 실제로 돌고 있는 작업은 없습니다" in response
     assert "준비 대기 2건" in response
-    assert "막힘 5건" in response
+    assert "검수/판단 보류 5건" in response
     assert "다음 대기 항목: queued review task" in response
-    assert "막힘은 진행 중 worker가 아니라" in response
+    assert "보류 항목은 진행 중 worker 장애가 아니라" in response
 
 
 @pytest.mark.asyncio
@@ -614,7 +849,8 @@ def test_yuri_protocol_prompt_is_injected_for_telegram_default_profile():
     assert "와다다다" in prompt
     assert "말하지 않아도" in prompt
     assert "기획실/planner 루트 Kanban 카드" in prompt
-    assert "마무리했습니다" in prompt
+    assert "intake acknowledgement should normally be a reaction" in prompt
+    assert "actual conclusion" in prompt
     assert "페이커, 올리비아" in prompt
     assert "명시적으로 대량/장기 분배" not in prompt
 

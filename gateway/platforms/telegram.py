@@ -749,13 +749,13 @@ class TelegramAdapter(BasePlatformAdapter):
            mentions topic/thread routing, we retry without routing rather
            than dropping the message.
         """
-        if not (metadata and metadata.get("telegram_dm_topic_reply_fallback")):
-            return False
         if not cls._is_bad_request_error(error):
             return False
         err_lower = str(error).lower()
         if reply_to_message_id is not None and "message to be replied not found" in err_lower:
             return True
+        if not (metadata and metadata.get("telegram_dm_topic_reply_fallback")):
+            return False
         # Synthetic / resumed sends route via ``direct_messages_topic_id``
         # instead of a reply anchor. If Telegram rejects the topic id, fall
         # back to a plain DM send.
@@ -4618,7 +4618,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning("[%s] Failed to send document: %s", self.name, e, exc_info=True)
-            return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+            return SendResult(success=False, error=str(e), retryable=False)
 
     async def send_video(
         self,

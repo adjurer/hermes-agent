@@ -66,6 +66,22 @@ def _fake_warning():
     )
 
 
+def _fake_gemma4_switch_result():
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    return ModelSwitchResult(
+        success=True,
+        new_model="gemma-4-12b-it-Q4_K_M.gguf",
+        target_provider="custom:local-gemma4-emergency",
+        provider_changed=True,
+        api_key="local-gemma4-emergency",
+        base_url="http://127.0.0.1:18080/v1",
+        api_mode="chat_completions",
+        provider_label="local-gemma4-emergency",
+        resolved_via_alias="gemma4-emergency",
+    )
+
+
 def _setup_isolated_home(tmp_path, monkeypatch, *, warn):
     import gateway.run as gateway_run
 
@@ -184,3 +200,66 @@ async def test_typed_model_cheap_switches_without_prompt(tmp_path, monkeypatch):
     assert "gpt-5.5-pro" in result
     overrides = list(runner._session_model_overrides.values())
     assert len(overrides) == 1
+
+
+@pytest.mark.asyncio
+async def test_typed_gemma4_switch_starts_local_server_before_applying(
+    tmp_path, monkeypatch
+):
+    """Local Gemma 4 alias starts its prerequisite server before switching."""
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kw: _fake_gemma4_switch_result(),
+    )
+    calls = []
+
+    async def _fake_ensure(result):
+        calls.append(result)
+        return True, "Local Gemma 4 server started."
+
+    monkeypatch.setattr(
+        "gateway.slash_commands._ensure_local_model_server_for_switch",
+        _fake_ensure,
+    )
+
+    runner = _make_runner()
+    runner._evict_cached_agent = lambda session_key: None
+
+    result = await runner._handle_model_command(_make_event("/model gemma4-emergency"))
+
+    assert "gemma-4-12b-it-Q4_K_M.gguf" in result
+    assert "Local Gemma 4 server started." in result
+    assert len(calls) == 1
+    overrides = list(runner._session_model_overrides.values())
+    assert len(overrides) == 1
+    assert overrides[0]["provider"] == "custom:local-gemma4-emergency"
+    assert overrides[0]["base_url"] == "http://127.0.0.1:18080/v1"
+
+
+@pytest.mark.asyncio
+async def test_typed_gemma4_switch_failure_does_not_apply_override(
+    tmp_path, monkeypatch
+):
+    """If the local server cannot start, do not claim the model switched."""
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kw: _fake_gemma4_switch_result(),
+    )
+
+    async def _fake_ensure(_result):
+        return False, "Local Gemma 4 server start command failed: boom"
+
+    monkeypatch.setattr(
+        "gateway.slash_commands._ensure_local_model_server_for_switch",
+        _fake_ensure,
+    )
+
+    runner = _make_runner()
+    runner._evict_cached_agent = lambda session_key: None
+
+    result = await runner._handle_model_command(_make_event("/model gemma4-emergency"))
+
+    assert "boom" in result
+    assert runner._session_model_overrides == {}
