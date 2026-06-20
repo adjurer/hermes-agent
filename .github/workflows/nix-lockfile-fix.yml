@@ -39,27 +39,36 @@ jobs:
   #   3. Job-level concurrency with cancel-in-progress: true ensures
   #      back-to-back pushes collapse to the newest; ref: main checkout
   #      always operates on the latest branch state.
-  #   4. Uses a GitHub App token (not GITHUB_TOKEN) so the fix commit
-  #      triggers downstream nix.yml verification.
+  #   4. Uses a GitHub App token when configured so the fix commit triggers
+  #      downstream nix.yml verification. Falls back to GITHUB_TOKEN in forks
+  #      or personal mirrors that do not configure APP_ID/APP_PRIVATE_KEY.
   auto-fix-main:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      HAS_APP_TOKEN: ${{ secrets.APP_ID != '' && secrets.APP_PRIVATE_KEY != '' }}
     concurrency:
       group: auto-fix-main
       cancel-in-progress: true
     steps:
       - name: Generate GitHub App token
+        if: env.HAS_APP_TOKEN == 'true'
         id: app-token
         uses: actions/create-github-app-token@7bfa3a4717ef143a604ee0a99d859b8886a96d00  # v1.9.3
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
+      - name: Use default token fallback
+        if: env.HAS_APP_TOKEN != 'true'
+        run: |
+          echo "::notice::APP_ID/APP_PRIVATE_KEY are not configured; using GITHUB_TOKEN fallback. The auto-fix commit may not trigger downstream workflows."
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           ref: main
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
 
       - uses: ./.github/actions/nix-setup
         with:
