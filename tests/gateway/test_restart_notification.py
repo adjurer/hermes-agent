@@ -666,7 +666,7 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
 
 @pytest.mark.asyncio
-async def test_restart_shutdown_notification_anchors_telegram_dm_topic():
+async def test_restart_shutdown_notification_suppressed_for_telegram_dm_topic():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     source = make_restart_source(chat_id="123456", thread_id="20197")
@@ -679,12 +679,4 @@ async def test_restart_shutdown_notification_anchors_telegram_dm_topic():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    call = adapter.send.await_args
-    assert call.args[0] == "123456"
-    assert "Gateway restarting" in call.args[1]
-    assert call.kwargs["metadata"] == {
-        "thread_id": "20197",
-        "telegram_dm_topic_reply_fallback": True,
-        "direct_messages_topic_id": "20197",
-        "telegram_reply_to_message_id": "462",
-    }
+    adapter.send.assert_not_awaited()

@@ -1277,29 +1277,24 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 
 # ---------------------------------------------------------------------------
-# Shutdown banner wording
+# Restart shutdown-banner suppression
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_restart_banner_uses_try_to_resume_wording():
-    """The notification sent before drain should hedge the resume promise
-    — the session-continuity fix is best-effort (stuck-loop counter can
-    still escalate to suspended)."""
+async def test_restart_suppresses_pre_shutdown_banner():
+    """Restart flows use the post-start wake notice instead of a pre-shutdown ping."""
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
-    msg = adapter.sent[0]
-    assert "restarting" in msg
-    assert "try to resume" in msg
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+async def test_restart_suppresses_home_channel_pre_shutdown_ping_without_active_sessions():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -1310,14 +1305,11 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_dedupes_active_chat():
+async def test_restart_suppresses_home_channel_pre_shutdown_ping_for_active_chat():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
@@ -1329,11 +1321,11 @@ async def test_restart_home_channel_notification_dedupes_active_chat():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_suppresses_threaded_home_channel_pre_shutdown_pings():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
@@ -1355,13 +1347,12 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 2
-    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    assert adapter.sent == []
+    assert adapter.sent_calls == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_ignores_false_send_result():
+async def test_restart_home_channel_pre_shutdown_suppression_does_not_send():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -1373,7 +1364,7 @@ async def test_restart_home_channel_notification_ignores_false_send_result():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    adapter.send.assert_called_once()
+    adapter.send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

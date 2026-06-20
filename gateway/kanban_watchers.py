@@ -2678,6 +2678,20 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
+        def _board_dispatch_disabled(slug: str) -> bool:
+            fingerprint = _board_db_fingerprint(slug)
+            disabled_entry = disabled_corrupt_boards.get(slug)
+            if disabled_entry is None:
+                return False
+            disabled_fingerprint, disabled_at = disabled_entry
+            age = time.monotonic() - disabled_at
+            if (
+                disabled_fingerprint == fingerprint
+                and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+            ):
+                return True
+            return False
+
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
@@ -2812,6 +2826,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _board_dispatch_disabled(slug):
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -2865,6 +2881,8 @@ class GatewayKanbanWatchersMixin:
             successes = 0
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _board_dispatch_disabled(slug):
+                    continue
                 if attempted >= auto_decompose_per_tick:
                     break
                 # Pin this board for the duration of the call — same

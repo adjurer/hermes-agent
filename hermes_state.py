@@ -269,6 +269,12 @@ def apply_wal_with_fallback(
         msg = str(exc).lower()
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
             # Unrelated OperationalError — don't silently swallow.
+            logger.error(
+                "%s: SQLite OperationalError while enabling WAL (%s) is not being treated "
+                "as WAL-incompatible filesystem fallback; re-raising.",
+                db_label,
+                exc,
+            )
             raise
         # Don't downgrade if another process already set WAL on disk.
         existing = _on_disk_journal_mode(conn)

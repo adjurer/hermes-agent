@@ -16,6 +16,7 @@ import socket as _socket
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -63,18 +64,19 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     ``direct_messages_topic_id`` when the Bot API supports it.
     """
     thread_id = getattr(source, "thread_id", None)
-    if thread_id is None:
-        return None
-    metadata = {"thread_id": thread_id}
-    if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
-        metadata["telegram_dm_topic_reply_fallback"] = True
-        tid = str(thread_id)
-        if tid and tid not in {"", "1"}:
-            metadata["direct_messages_topic_id"] = tid
+    metadata: dict = {}
+    if thread_id is not None:
+        metadata["thread_id"] = thread_id
+    if _platform_name(getattr(source, "platform", None)) == "telegram":
+        if thread_id is not None and getattr(source, "chat_type", None) == "dm":
+            metadata["telegram_dm_topic_reply_fallback"] = True
+            tid = str(thread_id)
+            if tid and tid not in {"", "1"}:
+                metadata["direct_messages_topic_id"] = tid
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
-    return metadata
+    return metadata or None
 
 
 def _reply_anchor_for_event(event) -> str | None:
@@ -1237,6 +1239,117 @@ def get_document_cache_dir() -> Path:
     return DOCUMENT_CACHE_DIR
 
 
+TEXT_DOCUMENT_EXTS = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".csv",
+        ".log",
+        ".json",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+    }
+)
+
+OUTBOUND_TEXT_NORMALIZE_EXTS = frozenset({".md", ".markdown", ".txt", ".csv", ".log"})
+
+_TEXT_DOCUMENT_ENCODINGS = (
+    "utf-8-sig",
+    "utf-8",
+    "cp949",
+    "euc-kr",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+)
+
+
+def _text_document_encoding_order(data: bytes) -> tuple[str, ...]:
+    """Choose a strict decode order based on BOM/null-byte hints."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return ("utf-16", "utf-16-le", "utf-16-be", "utf-8-sig", "utf-8", "cp949", "euc-kr")
+    sample = data[:512]
+    if sample.count(b"\x00") > max(2, len(sample) // 10):
+        return ("utf-16", "utf-16-le", "utf-16-be", "utf-8-sig", "utf-8", "cp949", "euc-kr")
+    return _TEXT_DOCUMENT_ENCODINGS
+
+
+def normalize_document_filename(filename: str | os.PathLike | None, fallback: str = "document") -> str:
+    """Return a safe, NFC-normalized filename for user-visible documents."""
+    fallback_name = unicodedata.normalize("NFC", str(fallback or "document")).strip() or "document"
+    safe_name = Path(str(filename or "")).name
+    safe_name = safe_name.replace("\x00", "")
+    safe_name = "".join(ch for ch in safe_name if ch.isprintable() and ch not in "\r\n\t")
+    safe_name = unicodedata.normalize("NFC", safe_name).strip()
+    if not safe_name or safe_name in {".", ".."}:
+        safe_name = fallback_name
+    return safe_name
+
+
+def ensure_outbound_document_filename_policy(filename: str, today: str | None = None) -> str:
+    """Apply user-visible outbound naming rules to generated attachments."""
+    safe_name = normalize_document_filename(filename)
+    stem = Path(safe_name).stem
+    if re.match(r"^\d{6}(?:[_-]|$)", stem):
+        return safe_name
+    if today is None:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%y%m%d")
+    return f"{today}_{safe_name}"
+
+
+def decode_text_document_bytes(data: bytes) -> tuple[str, str]:
+    """Decode Korean-friendly text documents without assuming UTF-8 only."""
+    last_error: UnicodeDecodeError | None = None
+    for encoding in _text_document_encoding_order(data):
+        try:
+            return data.decode(encoding), encoding
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
+def prepare_outbound_document_for_send(
+    file_path: str | os.PathLike,
+    file_name: str | os.PathLike | None = None,
+) -> tuple[str, str]:
+    """Prepare an attachment path and display name for reliable document sending."""
+    display_name = ensure_outbound_document_filename_policy(
+        normalize_document_filename(file_name or os.path.basename(str(file_path)))
+    )
+    source_path = Path(file_path)
+    ext = Path(display_name).suffix.lower() or source_path.suffix.lower()
+    if ext not in OUTBOUND_TEXT_NORMALIZE_EXTS:
+        return str(source_path), display_name
+
+    raw = source_path.read_bytes()
+    try:
+        text, encoding = decode_text_document_bytes(raw)
+    except UnicodeDecodeError:
+        logger.warning("Could not decode outbound text document, sending original bytes: %s", source_path)
+        return str(source_path), display_name
+    normalized_text = unicodedata.normalize("NFC", text)
+    encoded = normalized_text.encode("utf-8-sig")
+    if raw == encoded and encoding == "utf-8-sig":
+        return str(source_path), display_name
+
+    cache_dir = get_document_cache_dir()
+    outbound_name = f"send_{uuid.uuid4().hex[:12]}_{display_name}"
+    outbound_path = cache_dir / outbound_name
+    if not outbound_path.resolve().is_relative_to(cache_dir.resolve()):
+        raise ValueError(f"Path traversal rejected: {file_name!r}")
+    outbound_path.write_bytes(encoded)
+    return str(outbound_path), display_name
+
+
 def cache_document_from_bytes(data: bytes, filename: str) -> str:
     """
     Save raw document bytes to the cache and return the absolute file path.
@@ -1255,11 +1368,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
         ValueError: If the sanitized path escapes the cache directory.
     """
     cache_dir = get_document_cache_dir()
-    # Sanitize: strip directory components, null bytes, and control characters
-    safe_name = Path(filename).name if filename else "document"
-    safe_name = safe_name.replace("\x00", "").strip()
-    if not safe_name or safe_name in {".", ".."}:
-        safe_name = "document"
+    safe_name = normalize_document_filename(filename)
     cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
     filepath = cache_dir / cached_name
     # Final safety check: ensure path stays inside cache dir

@@ -207,7 +207,10 @@ _YURI_TID_RE = re.compile(r"\bTID=([A-Za-z0-9_.:-]{1,64})\b", re.IGNORECASE)
 _YURI_PATH_RE = re.compile(r"(?:루트|경로|위치|절대경로|root|path|folder)", re.IGNORECASE)
 _YURI_HUMAN_RE = re.compile(r"(?:kg\s*human|human\s*(?:folder|폴더|root|루트|경로|위치)|휴먼|사람\s*폴더)", re.IGNORECASE)
 _YURI_HUMAN_CONTENT_RE = re.compile(r"(?:안에|내용|내용물|리스트|뭐뭐|어떤어떤|파악|보여)", re.IGNORECASE)
-_YURI_LIVENESS_QUERY_RE = re.compile(r"(?:살아있|작동|동작|응답|온라인|켜져|alive|ping)", re.IGNORECASE)
+_YURI_LIVENESS_QUERY_RE = re.compile(
+    r"(?:살아있|작동|동작|응답|대답|온라인|켜져|정신\s*차렸|alive|ping)",
+    re.IGNORECASE,
+)
 _YURI_WORK_STATUS_QUERY_RE = re.compile(
     r"(?:진행\s*중|하고\s*있|하고있|돌고\s*있|돌아가|상태|어디까지|칸반|kanban|큐)",
     re.IGNORECASE,
@@ -2085,6 +2088,33 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+def _format_agent_completion_notification(
+    *,
+    session_id: str,
+    exit_code: Any,
+    command: str,
+    output: str,
+) -> str:
+    """Format a background completion event as an internal continuation."""
+    return (
+        f"[IMPORTANT: Background process {session_id} completed "
+        f"(exit code {exit_code}).\n\n"
+        "This is an internal continuation event, not a user request.\n"
+        "User-facing response rules:\n"
+        "- Reply in Korean with a short status report only.\n"
+        "- Do not quote raw commands, tracebacks, stack traces, local paths, "
+        "JSON, tokens, URL query parameters, or pasted terminal output.\n"
+        "- If the process hit errors, summarize only: cause, impact, and next action.\n"
+        "- If files were produced, mention only clean Korean display filenames.\n"
+        "- If more work is needed, continue the work or route it to kanban instead of "
+        "asking the user to interpret logs.\n\n"
+        "Internal command for diagnosis only, do not quote:\n"
+        f"{command}\n\n"
+        "Internal output for diagnosis only, do not quote:\n"
+        f"{output}]"
+    )
+
+
 # Module-level weak reference to the active GatewayRunner instance.
 # Used by tools (e.g. send_message) that need to route through a live
 # adapter for plugin platforms.  Set in GatewayRunner.__init__().
@@ -2727,7 +2757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
             )
 
-    async def _safe_adapter_disconnect(self, adapter, platform) -> None:
+    async def _safe_adapter_disconnect(self, adapter, platform) -> bool:
         """Call adapter.disconnect() defensively, swallowing any error.
 
         Used when adapter.connect() failed or raised — the adapter may
@@ -2736,7 +2766,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         as "Unclosed client session" warnings at process exit.
 
         Must tolerate partial-init state and never raise, since callers
-        use it inside error-handling blocks.
+        use it inside error-handling blocks. Returns True when the adapter
+        completed disconnect() cleanly, otherwise False.
         """
         timeout = self._adapter_disconnect_timeout_secs()
         try:
@@ -2744,18 +2775,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.disconnect()
             else:
                 await asyncio.wait_for(adapter.disconnect(), timeout=timeout)
+            return True
         except asyncio.TimeoutError:
             logger.warning(
                 "Timed out after %.1fs while disconnecting %s adapter; continuing shutdown",
                 timeout,
                 platform.value if platform is not None else "adapter",
             )
+            return False
         except Exception as e:
             logger.debug(
                 "Defensive %s disconnect after failed connect raised: %s",
                 platform.value if platform is not None else "adapter",
                 e,
             )
+            return False
+
+    @staticmethod
+    def _background_review_summary_enabled() -> bool:
+        return os.getenv("HERMES_GATEWAY_REVIEW_SUMMARY", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    @staticmethod
+    def _normalize_telegram_notifications_mode(raw) -> Optional[str]:
+        if raw in {None, ""}:
+            return None
+        if isinstance(raw, bool):
+            return "all" if raw else "important"
+        mode = str(raw).strip().lower()
+        if mode in {"1", "true", "yes", "on", "all"}:
+            return "all"
+        if mode in {"0", "false", "no", "off", "silent", "important"}:
+            return "important"
+        return mode
 
     def _adapter_disconnect_timeout_secs(self) -> float:
         """Return the per-adapter disconnect timeout used during shutdown."""
@@ -3284,6 +3340,296 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
+    def _build_restart_wake_summary(self, reason: str = "") -> str:
+        """Snapshot useful pre-restart work state for the post-restart wake notice."""
+        try:
+            from tools.process_registry import format_uptime_short, process_registry
+        except Exception:
+            process_registry = None
+
+            def format_uptime_short(seconds: int) -> str:
+                return f"{int(seconds)}s"
+
+        now = time.time()
+        lines: list[str] = []
+        if reason:
+            lines.append(f"• 재시작 사유: {reason}")
+            lines.append("")
+
+        running_agents: dict = getattr(self, "_running_agents", {}) or {}
+        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
+        agent_lines: list[str] = []
+        ledger_rows = list((self._load_active_work_ledger().get("items") or {}).values())
+        for session_key, agent in sorted(
+            running_agents.items(),
+            key=lambda item: running_started.get(item[0], now),
+        )[:5]:
+            elapsed = max(0, int(now - float(running_started.get(session_key, now))))
+            is_pending = agent is _AGENT_PENDING_SENTINEL
+            model = "" if is_pending else str(getattr(agent, "model", "") or "")
+            title = ""
+            try:
+                if getattr(self, "session_store", None) is not None:
+                    self.session_store._ensure_loaded()  # noqa: SLF001
+                    entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+                    if entry and getattr(entry, "session_id", None) and getattr(self, "_session_db", None):
+                        title = self._session_db.get_session_title(entry.session_id) or ""
+            except Exception:
+                title = ""
+            label = title or session_key
+            state = "시작 중" if is_pending else "실행 중"
+            suffix = f" · {model}" if model else ""
+            agent_lines.append(f"- {label} · {state} · {format_uptime_short(elapsed)}{suffix}")
+
+        if agent_lines:
+            lines.append("• 진행중인 대화/업무:")
+            lines.extend(f"   {line}" for line in agent_lines)
+            if len(running_agents) > len(agent_lines):
+                lines.append(f"   - 외 {len(running_agents) - len(agent_lines)}개")
+            if ledger_rows:
+                lines.append("   - 재시작 후 자동 재개 장부에 기록됨")
+        elif ledger_rows:
+            lines.append("• 진행중인 대화/업무:")
+            lines.extend(f"   {line}" for line in self._format_active_work_rows(ledger_rows))
+            lines.append("   - 재시작 후 자동 재개 장부에 기록됨")
+        else:
+            lines.append("• 진행중인 대화/업무: 없음")
+        lines.append("")
+
+        process_lines: list[str] = []
+        if process_registry is not None:
+            try:
+                running_processes = [
+                    p for p in process_registry.list_sessions()
+                    if p.get("status") == "running"
+                ]
+            except Exception:
+                running_processes = []
+            for proc in running_processes[:5]:
+                cmd = " ".join(str(proc.get("command", "")).split())
+                if len(cmd) > 80:
+                    cmd = cmd[:77] + "..."
+                uptime = format_uptime_short(int(proc.get("uptime_seconds", 0) or 0))
+                process_lines.append(f"- {proc.get('session_id', '?')} · {uptime} · {cmd}")
+            if len(running_processes) > len(process_lines):
+                process_lines.append(f"- 외 {len(running_processes) - len(process_lines)}개")
+
+        background_tasks = [
+            task for task in (getattr(self, "_background_tasks", set()) or set())
+            if hasattr(task, "done") and not task.done()
+        ]
+        if process_lines or background_tasks:
+            lines.append("• 백그라운드에서 진행 중인 업무:")
+            lines.extend(f"   {line}" for line in process_lines)
+            if background_tasks:
+                lines.append(f"   - gateway 내부 비동기 작업 {len(background_tasks)}개")
+        else:
+            lines.append("• 백그라운드에서 진행 중인 업무:")
+            lines.append("   - 별도 장기 프로세스 확인 안 됨")
+        lines.append("")
+
+        kanban_lines = self._format_kanban_assignment_rows()
+        if kanban_lines:
+            lines.append("• 칸반 배치 현황:")
+            lines.extend(f"   {line}" for line in kanban_lines)
+        else:
+            lines.append("• 칸반 배치 현황: 없음")
+        lines.append("")
+
+        try:
+            from cron.jobs import list_jobs
+
+            cron_jobs = list_jobs(include_disabled=False)
+        except Exception:
+            cron_jobs = []
+        if cron_jobs:
+            names = [
+                str(job.get("name") or job.get("id") or "예약 작업")
+                for job in cron_jobs[:5]
+            ]
+            lines.append("• 예약 업무:")
+            lines.extend(f"   - {name}" for name in names)
+            if len(cron_jobs) > len(names):
+                lines.append(f"   - 외 {len(cron_jobs) - len(names)}개")
+        else:
+            lines.append("• 예약 업무: 없음")
+
+        return "\n".join(lines)
+
+    def _ensure_restart_wake_notice_marker(self, reason: str) -> bool:
+        """Persist a post-startup wake notice for service-level restarts."""
+        notify_path = _hermes_home / ".restart_notify.json"
+        if notify_path.exists():
+            return True
+
+        platform = Platform.TELEGRAM
+        try:
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                return False
+
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                return False
+
+            data: dict[str, Any] = {
+                "platform": platform.value,
+                "chat_id": str(home.chat_id),
+                "summary": self._build_restart_wake_summary(reason),
+                "requested_at": time.time(),
+                "source": "gateway_shutdown",
+            }
+            if home.thread_id:
+                data["thread_id"] = str(home.thread_id)
+            atomic_json_write(notify_path, data, indent=None)
+            logger.info(
+                "Queued post-restart wake notification for %s:%s",
+                platform.value,
+                home.chat_id,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("Failed to queue post-restart wake notification: %s", exc)
+            return False
+
+    def _active_work_ledger_path(self) -> Path:
+        return _hermes_home / ".active_work.json"
+
+    def _load_active_work_ledger(self) -> dict[str, Any]:
+        path = self._active_work_ledger_path()
+        if not path.exists():
+            return {"version": 1, "items": {}}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"version": 1, "items": {}}
+            items = data.get("items")
+            if not isinstance(items, dict):
+                data["items"] = {}
+            return data
+        except Exception as exc:
+            logger.debug("Failed to read active-work ledger: %s", exc)
+            return {"version": 1, "items": {}}
+
+    def _write_active_work_ledger(self, data: dict[str, Any]) -> None:
+        try:
+            atomic_json_write(self._active_work_ledger_path(), data, indent=None)
+        except Exception as exc:
+            logger.debug("Failed to write active-work ledger: %s", exc)
+
+    def _record_active_work_ledger_entry(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        source: SessionSource,
+        message: str,
+    ) -> None:
+        if not session_key:
+            return
+        now_iso = datetime.now().isoformat()
+        preview = " ".join(str(message or "").split())
+        if len(preview) > 180:
+            preview = preview[:177].rstrip() + "..."
+        data = self._load_active_work_ledger()
+        items = data.setdefault("items", {})
+        items[session_key] = {
+            "session_key": session_key,
+            "session_id": session_id,
+            "platform": source.platform.value if source.platform else "",
+            "chat_id": source.chat_id,
+            "thread_id": source.thread_id,
+            "chat_type": source.chat_type,
+            "user_id": source.user_id,
+            "user_name": source.user_name,
+            "chat_name": source.chat_name,
+            "message_id": source.message_id,
+            "message_preview": preview or "(첨부/시스템 이벤트)",
+            "started_at": items.get(session_key, {}).get("started_at") or now_iso,
+            "updated_at": now_iso,
+        }
+        self._write_active_work_ledger(data)
+
+    def _clear_active_work_ledger_entry(self, session_key: str) -> None:
+        if not session_key:
+            return
+        data = self._load_active_work_ledger()
+        items = data.get("items")
+        if not isinstance(items, dict) or session_key not in items:
+            return
+        items.pop(session_key, None)
+        self._write_active_work_ledger(data)
+
+    def _format_active_work_rows(self, rows: list[dict[str, Any]], *, limit: int = 5) -> list[str]:
+        formatted: list[str] = []
+        for row in rows[:limit]:
+            platform = str(row.get("platform") or "?")
+            chat = str(row.get("chat_name") or row.get("chat_id") or "?")
+            preview = str(row.get("message_preview") or "진행 중 업무")
+            if len(preview) > 90:
+                preview = preview[:87].rstrip() + "..."
+            formatted.append(f"- {platform}:{chat} · {preview}")
+        if len(rows) > limit:
+            formatted.append(f"- 외 {len(rows) - limit}개")
+        return formatted
+
+    def _format_kanban_assignment_rows(self, *, limit: int = 8) -> list[str]:
+        """Return active Kanban tasks with status + assignee for restart briefs."""
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            return []
+
+        try:
+            conn = _kb.connect()
+        except Exception:
+            return []
+
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, title, status, assignee
+                  FROM tasks
+                 WHERE status IN ('triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review')
+                 ORDER BY
+                   CASE status
+                     WHEN 'running' THEN 0
+                     WHEN 'ready' THEN 1
+                     WHEN 'todo' THEN 2
+                     WHEN 'triage' THEN 3
+                     WHEN 'review' THEN 4
+                     WHEN 'blocked' THEN 5
+                     ELSE 6
+                   END,
+                   created_at ASC
+                 LIMIT ?
+                """,
+                (max(1, int(limit)) + 1,),
+            ).fetchall()
+        except Exception:
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        lines: list[str] = []
+        for row in rows[:limit]:
+            try:
+                task_id = str(row["id"])
+                title = str(row["title"] or "업무")
+                status = str(row["status"] or "?")
+                assignee = str(row["assignee"] or "미배정")
+            except Exception:
+                continue
+            if len(title) > 70:
+                title = title[:67].rstrip() + "..."
+            lines.append(f"- {title} · {status} · 배치: {assignee} ({task_id})")
+        if len(rows) > limit:
+            lines.append(f"- 외 {len(rows) - limit}개")
+        return lines
+
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
         # to be lost during restart — queue them for the newly-spawned gateway
@@ -3797,6 +4143,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile = "default"
         return str(profile or "default").strip().lower() in {"", "default", "yuri", "main"}
 
+    def _yuri_should_intercept_live_message(self, event: MessageEvent) -> bool:
+        """Return True when Yuri shortcuts should intercept the generic gateway path."""
+        if not self._yuri_platform_is_frontdesk(event=event) or not self._yuri_is_frontdesk_profile():
+            return False
+        src = getattr(event, "source", None)
+        chat_id = str(getattr(src, "chat_id", "") or "")
+        if not chat_id:
+            return False
+        configured: set[str] = set()
+        raw_home = os.getenv("TELEGRAM_HOME_CHANNEL", "").strip()
+        if raw_home:
+            configured.add(raw_home)
+        try:
+            home = self.config.get_home_channel(Platform.TELEGRAM)
+            if home and home.chat_id:
+                configured.add(str(home.chat_id))
+        except Exception:
+            pass
+        try:
+            cfg = _load_gateway_config()
+            raw_cfg_home = cfg_get(cfg, "TELEGRAM_HOME_CHANNEL", default="") or ""
+            if raw_cfg_home:
+                configured.add(str(raw_cfg_home))
+            prompts = cfg_get(cfg, "telegram", "channel_prompts", default={}) or {}
+            if isinstance(prompts, dict):
+                configured.update(str(key) for key in prompts)
+        except Exception:
+            pass
+        return chat_id in configured
+
     def _classify_yuri_telegram_intent(self, event: MessageEvent) -> _YuriTelegramIntent:
         text = _yuri_clean_shortcut_text(getattr(event, "text", "") or "")
         lowered = text.lower()
@@ -4157,7 +4533,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return literal
         intent = self._classify_yuri_telegram_intent(event)
         if intent.kind == "liveness":
-            return "네, 대기 중입니다."
+            running_agent = getattr(self, "_running_agents", {}).get(session_key)
+            if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
+                lines = ["이전 작업 처리 중입니다."]
+                if hasattr(running_agent, "get_activity_summary"):
+                    try:
+                        summary = running_agent.get_activity_summary() or {}
+                    except Exception:
+                        summary = {}
+                    current = int(summary.get("api_call_count", 0) or 0)
+                    maximum = int(summary.get("max_iterations", 0) or 0)
+                    tool = str(summary.get("current_tool") or "").strip()
+                    if current or maximum:
+                        lines.append(f"- 반복 {current}/{maximum}")
+                    if tool:
+                        lines.append(f"- 현재 도구: {tool}")
+                return "\n".join(lines)
+            return "네, 살아있습니다. 대기 중입니다."
         return None
 
     @staticmethod
@@ -5278,6 +5670,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
+        pending_restart_notice_for_home = False
+        if _restart_notification_pending():
+            try:
+                data = json.loads((_hermes_home / ".restart_notify.json").read_text())
+                platform = Platform(str(data.get("platform")))
+                home = self.config.get_home_channel(platform)
+                pending_restart_notice_for_home = bool(
+                    home
+                    and str(home.chat_id) == str(data.get("chat_id"))
+                    and str(home.thread_id or "") == str(data.get("thread_id") or "")
+                )
+            except Exception:
+                pending_restart_notice_for_home = False
+
+        if self._restart_requested or pending_restart_notice_for_home:
+            logger.info(
+                "Shutdown notification suppressed: restart wake notification is pending",
+            )
+            return
+
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
@@ -5822,8 +6234,149 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {"restart_timeout", "shutdown_timeout", "restart_interrupted", "pinned_message_recovery"}
     )
+
+    def _mark_session_resume_pending_with_origin(
+        self,
+        session_key: str,
+        *,
+        reason: str,
+        source: SessionSource,
+    ):
+        """Mark a session resumable and refresh its origin to a recovered trigger."""
+        store = getattr(self, "session_store", None)
+        if store is None or not session_key:
+            return None
+
+        def _mark_locked():
+            entries = getattr(store, "_entries", {})
+            entry = entries.get(session_key) if isinstance(entries, dict) else None
+            if entry is None or getattr(entry, "suspended", False):
+                return None
+            entry.resume_pending = True
+            entry.resume_reason = reason
+            entry.last_resume_marked_at = datetime.now()
+            entry.origin = source
+            if getattr(entry, "platform", None) is None:
+                entry.platform = source.platform
+            entry.chat_type = source.chat_type or getattr(entry, "chat_type", "dm")
+            save = getattr(store, "_save", None)
+            if callable(save):
+                save()
+            return entry
+
+        lock = getattr(store, "_lock", None)
+        ensure_loaded = getattr(store, "_ensure_loaded_locked", None)
+        if lock is not None:
+            try:
+                with lock:
+                    if callable(ensure_loaded):
+                        ensure_loaded()
+                    return _mark_locked()
+            except Exception as exc:
+                logger.debug("Pinned-message recovery mark failed for %s: %s", session_key, exc)
+                return None
+        return _mark_locked()
+
+    async def _recover_telegram_pinned_work(self) -> list[dict[str, Any]]:
+        """Use Telegram's active pinned message as a restart-recovery hint."""
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        if adapter is None or not hasattr(adapter, "get_pinned_work_refs"):
+            return []
+
+        ledger = self._load_active_work_ledger()
+        items = ledger.get("items") if isinstance(ledger, dict) else {}
+        if not isinstance(items, dict) or not items:
+            return []
+
+        telegram_rows = [
+            row for row in items.values()
+            if isinstance(row, dict)
+            and str(row.get("platform") or "").lower() == "telegram"
+            and row.get("chat_id")
+        ]
+        if not telegram_rows:
+            return []
+
+        rows_by_pin: dict[tuple[str, str], dict[str, Any]] = {}
+        rows_by_chat: dict[str, list[dict[str, Any]]] = {}
+        chat_ids: set[str] = set()
+        for row in telegram_rows:
+            chat_id = str(row.get("chat_id") or "")
+            message_id = str(row.get("message_id") or "")
+            if not chat_id:
+                continue
+            chat_ids.add(chat_id)
+            rows_by_chat.setdefault(chat_id, []).append(row)
+            if message_id:
+                rows_by_pin[(chat_id, message_id)] = row
+
+        home = self.config.get_home_channel(Platform.TELEGRAM)
+        if home and home.chat_id:
+            chat_ids.add(str(home.chat_id))
+
+        try:
+            refs = await adapter.get_pinned_work_refs(sorted(chat_ids))
+        except Exception as exc:
+            logger.debug("Telegram pinned-message recovery scan failed: %s", exc)
+            return []
+
+        recovered: list[dict[str, Any]] = []
+        for ref in refs:
+            chat_id = str(ref.get("chat_id") or "")
+            message_id = str(ref.get("message_id") or "")
+            if not chat_id or not message_id:
+                continue
+            row = rows_by_pin.get((chat_id, message_id))
+            if row is None:
+                chat_rows = rows_by_chat.get(chat_id) or []
+                if len(chat_rows) == 1 and not str(chat_rows[0].get("message_id") or ""):
+                    row = chat_rows[0]
+            if row is None:
+                continue
+
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=chat_id,
+                chat_name=ref.get("chat_name") or row.get("chat_name"),
+                chat_type=str(ref.get("chat_type") or row.get("chat_type") or "dm"),
+                user_id=str(ref.get("user_id") or row.get("user_id") or "") or None,
+                user_name=ref.get("user_name") or row.get("user_name"),
+                thread_id=str(ref.get("thread_id") or row.get("thread_id") or "") or None,
+                message_id=message_id,
+            )
+            session_key = str(row.get("session_key") or "") or self._session_key_for_source(source)
+            entry = self._mark_session_resume_pending_with_origin(
+                session_key,
+                reason="pinned_message_recovery",
+                source=source,
+            )
+            if entry is None:
+                continue
+
+            try:
+                self._record_active_work_ledger_entry(
+                    session_key=session_key,
+                    session_id=getattr(entry, "session_id", row.get("session_id") or ""),
+                    source=source,
+                    message=ref.get("text") or row.get("message_preview") or "",
+                )
+            except Exception:
+                logger.debug("Pinned-message recovery ledger refresh failed", exc_info=True)
+            recovered.append({
+                "session_key": session_key,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "message_preview": ref.get("text") or row.get("message_preview") or "",
+            })
+
+        if recovered:
+            logger.warning(
+                "Recovered %d Telegram pinned active-work message(s) as resume_pending",
+                len(recovered),
+            )
+        return recovered
 
     async def _run_startup_resume_event(
         self,
@@ -8082,6 +8635,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
 
+        _quick_liveness_reply = self._quick_liveness_response(event, _quick_key)
+        if _quick_liveness_reply is not None:
+            return _quick_liveness_reply
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -8991,13 +9548,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _yuri_recent_raw_reply is not None:
             return _yuri_recent_raw_reply
 
-        _yuri_fast_lookup_reply = await self._yuri_fast_lookup_reply(event)
-        if _yuri_fast_lookup_reply is not None:
-            return _yuri_fast_lookup_reply
+        if self._yuri_should_intercept_live_message(event):
+            _yuri_fast_lookup_reply = await self._yuri_fast_lookup_reply(event)
+            if _yuri_fast_lookup_reply is not None:
+                return _yuri_fast_lookup_reply
 
-        _yuri_kanban_intake_reply = await self._yuri_kanban_intake_reply(event, source)
-        if _yuri_kanban_intake_reply is not None:
-            return _yuri_kanban_intake_reply
+        if self._yuri_should_intercept_live_message(event):
+            _yuri_kanban_intake_reply = await self._yuri_kanban_intake_reply(event, source)
+            if _yuri_kanban_intake_reply is not None:
+                return _yuri_kanban_intake_reply
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -13574,11 +14133,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
-                    synth_text = (
-                        f"[IMPORTANT: Background process {session_id} completed "
-                        f"(exit code {session.exit_code}).\n"
-                        f"Command: {session.command}\n"
-                        f"Output:\n{_out}]"
+                    synth_text = _format_agent_completion_notification(
+                        session_id=session_id,
+                        exit_code=session.exit_code,
+                        command=session.command,
+                        output=_out,
                     )
                     source = self._build_process_event_source({
                         "session_id": session_id,

@@ -3794,11 +3794,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + one ready-work probe per watcher pass.
-    # The second dispatch tick skips the dispatch connect because the corrupt
-    # board fingerprint is disabled, but the lightweight ready-work probe still
-    # verifies that the board should remain quiet.
-    assert calls["connect"] == 3
+    # First tick probes the board once during auto-decompose and once during
+    # dispatch. After dispatch quarantines the unchanged corrupt fingerprint,
+    # dispatch, ready-work, and auto-decompose probes all skip the board.
+    assert calls["connect"] == 2
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(

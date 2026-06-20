@@ -176,7 +176,7 @@ async def test_unknown_slash_command_underscored_form_also_guarded(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_command_gets_human_onboarding(monkeypatch):
+async def test_start_command_is_noop_platform_ping(monkeypatch):
     import gateway.run as gateway_run
 
     runner = _make_runner()
@@ -190,8 +190,7 @@ async def test_start_command_gets_human_onboarding(monkeypatch):
 
     result = await runner._handle_message(_make_event("/start"))
 
-    assert result is not None
-    assert "준비되어 있습니다" in result
+    assert result == ""
     assert "Unknown command" not in result
     runner._run_agent.assert_not_called()
 

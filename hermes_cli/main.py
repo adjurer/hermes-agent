@@ -8669,6 +8669,41 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
+        local_result = subprocess.run(
+            git_cmd + ["rev-list", f"origin/{branch}..HEAD", "--count"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        local_commit_count = int(local_result.stdout.strip())
+        if local_commit_count:
+            print(
+                f"✗ Update blocked: this checkout has {local_commit_count} local commit(s) "
+                f"and {commit_count} upstream commit(s) pending."
+            )
+            print("  Refusing to reset or overwrite local Hermes hardening.")
+            print(
+                "  Update in a separate branch/worktree, then re-apply and test local changes."
+            )
+            if auto_stash_ref is not None:
+                _restore_stashed_changes(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=prompt_for_restore,
+                    input_fn=gw_input_fn,
+                )
+            if current_branch not in {branch, "HEAD"}:
+                subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            sys.exit(1)
+
         print(f"→ Found {commit_count} new commit(s)")
 
         # Snapshot critical state (state.db, config, pairing JSONs, etc.)
