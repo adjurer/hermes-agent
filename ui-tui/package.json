@@ -39,7 +39,7 @@
     "eslint-plugin-unused-imports": "^4",
     "globals": "^16",
     "prettier": "^3",
-    "tsx": "^4.19.0",
+    "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.3"
   }

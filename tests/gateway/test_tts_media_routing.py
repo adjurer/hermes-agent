@@ -63,7 +63,7 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
 
 
 def _reply_metadata():
-    return {"telegram_reply_to_message_id": "msg-1"}
+    return {"notify": True, "telegram_reply_to_message_id": "msg-1"}
 
 
 @pytest.mark.asyncio
